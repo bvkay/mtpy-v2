@@ -165,6 +165,8 @@ CLAUDE.local.md
 .claude/logs/
 .claude/settings.local.json
 .claude/
+CLAUDE.md
 
 # Scratch (per OPERATIONAL.md)
 scratch/
+CLAUDE.md
