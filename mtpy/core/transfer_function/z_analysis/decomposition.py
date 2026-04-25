@@ -51,6 +51,7 @@ from typing import Any, TYPE_CHECKING
 
 import numpy as np
 import xarray as xr
+from scipy.optimize import least_squares
 
 
 if TYPE_CHECKING:
@@ -119,12 +120,24 @@ class DecompositionResult:
         Provenance: software versions, input identifier, RNG seed,
         coordinate frame, strike convention, timestamp.
 
+    frame : str, default ``"measurement"``
+        Coordinate frame of ``regional_z``. ``"measurement"`` means
+        ``regional_z`` is in the same frame as the input ``z``;
+        rotating it by ``-strike`` per period recovers the
+        anti-diagonal strike-frame regional tensor. ``"strike"``
+        means ``regional_z`` is already in the strike frame
+        (anti-diagonal). Public callers receive ``"measurement"``
+        by default so plotting and downstream tools behave
+        consistently with the input ``z``.
+
     Notes
     -----
-    The 90-degree strike branch is folded into the canonical range
-    ``[0, 180)``. Two fits differing by ``(strike + 90 mod 180,
-    -shear, twist)`` represent the same physical solution; the
-    canonicalisation chooses one branch consistently.
+    The 90-degree strike branch is folded into a canonical form:
+    each band's ``(strike, twist, shear)`` is mapped through the
+    ``(strike + 90 mod 180, -shear, twist)`` symmetry so that
+    ``strike`` lands in ``[0, 90)`` after the fold. The shear sign
+    is flipped together with the strike shift; twist is unchanged.
+    See :func:`_canonicalise_solution`.
 
     The static-shift convention of ``gain`` matches that of
     :meth:`mtpy.core.mt.MT.remove_static_shift`. Applying
@@ -148,6 +161,7 @@ class DecompositionResult:
     method: str
     options: dict[str, Any] = field(default_factory=dict)
     metadata: dict[str, Any] = field(default_factory=dict)
+    frame: str = "measurement"
 
 
 def decompose(
@@ -217,14 +231,379 @@ def decompose(
     -----
     Strike convention: clockwise from the x-axis defined by
     ``mt.coordinate_reference_frame`` of the parent station, in
-    degrees, in the canonical range ``[0, 180)``.
+    degrees. Each band is canonicalised through the
+    ``(strike + 90 mod 180, -shear, twist)`` symmetry so that the
+    reported ``strike`` lands in ``[0, 90)`` (see
+    :func:`_canonicalise_solution`).
+
+    Per-band-independent fitting. Each band of periods is optimised
+    separately. Joint cross-band fitting and geological-domain
+    grouping are planned future work, not implemented in this
+    contribution.
+
+    Regional impedance frame. ``regional_z`` is rotated back to the
+    measurement frame so it is directly comparable to the input
+    ``z`` (e.g., for plotting). The strike-frame anti-diagonal
+    representation is recoverable by rotating each period by its
+    own ``-strike``.
 
     For the McNeice-Jones multi-site joint decomposition, see
     :func:`decompose_joint`.
     """
-    raise NotImplementedError(
-        "Groom-Bailey decomposition implementation lands in a "
-        "subsequent contribution session. See the project roadmap."
+    from mtpy.core.transfer_function.z import Z as _Z
+
+    if realisations > 0:
+        raise NotImplementedError(
+            "Bootstrap realisations are planned for a future "
+            "contribution; pass realisations=0."
+        )
+
+    frequencies = np.asarray(z.frequency, dtype=np.float64)
+    all_periods = 1.0 / frequencies
+    if periods is not None:
+        permin, permax = periods
+        period_mask = (all_periods >= permin) & (all_periods <= permax)
+    else:
+        period_mask = np.ones(len(all_periods), dtype=bool)
+    if not period_mask.any():
+        raise ValueError(f"decompose: no periods in window {periods}")
+
+    selected_periods = all_periods[period_mask]
+    z_full = np.asarray(z.z, dtype=np.complex128)[period_mask]
+    z_err_attr = z.z_error
+    if z_err_attr is None:
+        raise ValueError(
+            "decompose: z.z_error is None; cannot run weighted "
+            "least squares without per-component errors."
+        )
+    sigma_full = np.asarray(z_err_attr, dtype=np.float64)[period_mask]
+    if np.any(sigma_full <= 0):
+        raise ValueError(
+            "decompose: z.z_error contains non-positive entries in "
+            "the selected period range"
+        )
+
+    sort_idx = np.argsort(selected_periods)
+    selected_periods = selected_periods[sort_idx]
+    z_selected = z_full[sort_idx]
+    sigma_selected = sigma_full[sort_idx]
+
+    bands = _extract_bands(selected_periods, bandwidth=bandwidth, overlap=overlap)
+
+    band_results = []
+    for band_idx in bands:
+        z_obs_b = z_selected[band_idx]
+        sigma_b = sigma_selected[band_idx]
+        periods_b = selected_periods[band_idx]
+        result = _solve_band(
+            z_obs=z_obs_b,
+            sigma=sigma_b,
+            periods=periods_b,
+            bounds_override=bounds_override,
+        )
+        band_results.append((band_idx, result))
+
+    n_periods = len(selected_periods)
+    strike_pp = np.full(n_periods, np.nan)
+    twist_pp = np.full(n_periods, np.nan)
+    shear_pp = np.full(n_periods, np.nan)
+    gain_pp = np.full(n_periods, np.nan)
+    aniso_pp = np.zeros(n_periods)
+    strike_err_pp = np.full(n_periods, np.nan)
+    twist_err_pp = np.full(n_periods, np.nan)
+    shear_err_pp = np.full(n_periods, np.nan)
+    gain_err_pp = np.full(n_periods, np.nan)
+    aniso_err_pp = np.full(n_periods, np.nan)
+
+    log10_rho_a_pp = np.full(n_periods, np.nan)
+    phase_a_pp = np.full(n_periods, np.nan)
+    log10_rho_b_pp = np.full(n_periods, np.nan)
+    phase_b_pp = np.full(n_periods, np.nan)
+    log10_rho_a_err_pp = np.full(n_periods, np.nan)
+    phase_a_err_pp = np.full(n_periods, np.nan)
+    log10_rho_b_err_pp = np.full(n_periods, np.nan)
+    phase_b_err_pp = np.full(n_periods, np.nan)
+
+    chi_squared_pp = np.full(n_periods, np.nan)
+
+    # Inverse-variance weights at the band level. Single weight per
+    # band, applied to all four scalar parameters (strike, twist,
+    # shear, log10_gain). See decomposition.py module notes for the
+    # rationale (band-fit-quality weighting vs per-parameter
+    # weighting).
+    band_weight = {}
+    for i, (band_idx, br) in enumerate(band_results):
+        n_band = len(band_idx)
+        rms = max(br.rms_misfit, 1e-15)
+        band_weight[i] = 1.0 / (rms * rms * n_band)
+
+    period_band_indices: dict[int, list[int]] = {i: [] for i in range(n_periods)}
+    for i, (band_idx, _br) in enumerate(band_results):
+        for global_i in band_idx:
+            period_band_indices[int(global_i)].append(i)
+
+    canon_per_band = []
+    for band_idx, br in band_results:
+        theta_c, twist_c, shear_c = _canonicalise_solution(
+            br.x_opt[0], br.x_opt[1], br.x_opt[2]
+        )
+        canon_per_band.append((theta_c, twist_c, shear_c))
+
+    for global_i in range(n_periods):
+        b_idxs = period_band_indices[global_i]
+        if not b_idxs:
+            continue
+
+        ws = np.array([band_weight[i] for i in b_idxs])
+        w_sum = float(np.sum(ws))
+
+        thetas = np.array([canon_per_band[i][0] for i in b_idxs])
+        twists = np.array([canon_per_band[i][1] for i in b_idxs])
+        shears = np.array([canon_per_band[i][2] for i in b_idxs])
+        log10_gains = np.array([band_results[i][1].x_opt[3] for i in b_idxs])
+
+        # Circular weighted mean for strike (mod-180 ambiguity is
+        # already collapsed by canonicalisation, so a circular mean
+        # of 2*strike is appropriate)
+        strike_pp[global_i] = (
+            np.arctan2(
+                np.sum(ws * np.sin(2.0 * thetas)),
+                np.sum(ws * np.cos(2.0 * thetas)),
+            )
+            / 2.0
+        )
+        twist_pp[global_i] = float(np.average(twists, weights=ws))
+        shear_pp[global_i] = float(np.average(shears, weights=ws))
+        log10_gain_avg = float(np.average(log10_gains, weights=ws))
+        gain_pp[global_i] = 10.0**log10_gain_avg
+
+        # Errors: combine per-band optimiser errors using the
+        # inverse-variance combination formula. Use raw (un-canonical)
+        # x_err entries since canonicalisation is a sign flip on shear
+        # and a 90-degree shift on strike — neither changes variance.
+        strike_errs = np.array([band_results[i][1].x_err[0] for i in b_idxs])
+        twist_errs = np.array([band_results[i][1].x_err[1] for i in b_idxs])
+        shear_errs = np.array([band_results[i][1].x_err[2] for i in b_idxs])
+        log10_gain_errs = np.array([band_results[i][1].x_err[3] for i in b_idxs])
+
+        def _combine(errs: np.ndarray) -> float:
+            finite = np.isfinite(errs) & (errs > 0)
+            if not finite.any():
+                return float("inf")
+            inv_var = np.zeros_like(errs)
+            inv_var[finite] = 1.0 / (errs[finite] ** 2)
+            denom = float(np.sum(inv_var))
+            if denom <= 0.0:
+                return float("inf")
+            return float(np.sqrt(1.0 / denom))
+
+        strike_err_pp[global_i] = _combine(strike_errs)
+        twist_err_pp[global_i] = _combine(twist_errs)
+        shear_err_pp[global_i] = _combine(shear_errs)
+        log10_gain_err_combined = _combine(log10_gain_errs)
+        # gain = 10**log10_gain; sigma_gain = gain * ln(10) * sigma_log10
+        if np.isfinite(log10_gain_err_combined):
+            gain_err_pp[global_i] = (
+                gain_pp[global_i] * np.log(10.0) * log10_gain_err_combined
+            )
+        else:
+            gain_err_pp[global_i] = float("inf")
+
+        # Per-frequency regional impedance: pull from each band that
+        # contains this period. If multiple bands contain it,
+        # inverse-variance combine the (rho, phase) values.
+        log10_rho_as = []
+        phase_as = []
+        log10_rho_bs = []
+        phase_bs = []
+        log10_rho_a_errs = []
+        phase_a_errs = []
+        log10_rho_b_errs = []
+        phase_b_errs = []
+        chi_sq_at_period = []
+        for i in b_idxs:
+            band_idx_i, br_i = band_results[i]
+            local_i = int(np.where(band_idx_i == global_i)[0][0])
+            n_band_i = len(band_idx_i)
+            log10_rho_as.append(br_i.x_opt[5 + 0 * n_band_i + local_i])
+            phase_as.append(br_i.x_opt[5 + 1 * n_band_i + local_i])
+            log10_rho_bs.append(br_i.x_opt[5 + 2 * n_band_i + local_i])
+            phase_bs.append(br_i.x_opt[5 + 3 * n_band_i + local_i])
+            log10_rho_a_errs.append(br_i.x_err[5 + 0 * n_band_i + local_i])
+            phase_a_errs.append(br_i.x_err[5 + 1 * n_band_i + local_i])
+            log10_rho_b_errs.append(br_i.x_err[5 + 2 * n_band_i + local_i])
+            phase_b_errs.append(br_i.x_err[5 + 3 * n_band_i + local_i])
+            # 8 residuals per period, packed as
+            # [Re/Im of XX, XY, YX, YY] / sigma.
+            resid_slice = br_i.residuals[8 * local_i : 8 * (local_i + 1)]
+            chi_sq_at_period.append(float(np.sum(resid_slice**2)))
+
+        log10_rho_a_pp[global_i] = float(np.average(log10_rho_as, weights=ws))
+        phase_a_pp[global_i] = float(np.average(phase_as, weights=ws))
+        log10_rho_b_pp[global_i] = float(np.average(log10_rho_bs, weights=ws))
+        phase_b_pp[global_i] = float(np.average(phase_bs, weights=ws))
+        log10_rho_a_err_pp[global_i] = _combine(np.array(log10_rho_a_errs))
+        phase_a_err_pp[global_i] = _combine(np.array(phase_a_errs))
+        log10_rho_b_err_pp[global_i] = _combine(np.array(log10_rho_b_errs))
+        phase_b_err_pp[global_i] = _combine(np.array(phase_b_errs))
+        # Average chi-squared across bands containing this period
+        chi_squared_pp[global_i] = float(np.mean(chi_sq_at_period))
+
+    # Build regional Z in strike frame, then rotate to measurement
+    # frame.
+    z_regional_strike, z_regional_strike_err = _band_arrays_to_z(
+        log10_rho_a_pp,
+        phase_a_pp,
+        log10_rho_b_pp,
+        phase_b_pp,
+        log10_rho_a_err_pp,
+        phase_a_err_pp,
+        log10_rho_b_err_pp,
+        phase_b_err_pp,
+        selected_periods,
+    )
+    z_regional_meas = np.empty_like(z_regional_strike)
+    z_regional_meas_err = np.empty_like(z_regional_strike_err)
+    for k in range(n_periods):
+        theta_k = strike_pp[k]
+        if not np.isfinite(theta_k):
+            z_regional_meas[k] = z_regional_strike[k]
+            z_regional_meas_err[k] = z_regional_strike_err[k]
+            continue
+        c, s = np.cos(theta_k), np.sin(theta_k)
+        R = np.array([[c, -s], [s, c]])
+        z_regional_meas[k] = R @ z_regional_strike[k] @ R.T
+        # Variance propagation through orthogonal rotation: each
+        # measurement-frame entry is a linear combination of strike-
+        # frame entries with coefficients in {c^2, s^2, +/- c*s}.
+        # Use the conservative diagonal-only propagation.
+        c2, s2 = c * c, s * s
+        cs = abs(c * s)
+        sigma_strike = z_regional_strike_err[k]
+        z_regional_meas_err[k, 0, 0] = np.sqrt(
+            (s2 * sigma_strike[0, 1]) ** 2
+            + (cs * sigma_strike[0, 0]) ** 2
+            + (cs * sigma_strike[1, 1]) ** 2
+            + (s2 * sigma_strike[1, 0]) ** 2
+        )
+        z_regional_meas_err[k, 0, 1] = np.sqrt(
+            (c2 * sigma_strike[0, 1]) ** 2
+            + (cs * sigma_strike[0, 0]) ** 2
+            + (cs * sigma_strike[1, 1]) ** 2
+            + (s2 * sigma_strike[1, 0]) ** 2
+        )
+        z_regional_meas_err[k, 1, 0] = np.sqrt(
+            (c2 * sigma_strike[1, 0]) ** 2
+            + (cs * sigma_strike[0, 0]) ** 2
+            + (cs * sigma_strike[1, 1]) ** 2
+            + (s2 * sigma_strike[0, 1]) ** 2
+        )
+        z_regional_meas_err[k, 1, 1] = np.sqrt(
+            (s2 * sigma_strike[1, 0]) ** 2
+            + (cs * sigma_strike[0, 0]) ** 2
+            + (cs * sigma_strike[1, 1]) ** 2
+            + (s2 * sigma_strike[0, 1]) ** 2
+        )
+
+    regional_frequencies = 1.0 / selected_periods
+    regional_z_obj = _Z(
+        z=z_regional_meas,
+        z_error=z_regional_meas_err,
+        frequency=regional_frequencies,
+    )
+
+    params = xr.Dataset(
+        {
+            "strike": ("period", np.degrees(strike_pp)),
+            "twist": ("period", np.degrees(twist_pp)),
+            "shear": ("period", np.degrees(shear_pp)),
+            "gain": ("period", gain_pp),
+            "anisotropy": ("period", aniso_pp),
+            "strike_error": ("period", np.degrees(strike_err_pp)),
+            "twist_error": ("period", np.degrees(twist_err_pp)),
+            "shear_error": ("period", np.degrees(shear_err_pp)),
+            "gain_error": ("period", gain_err_pp),
+            "anisotropy_error": ("period", aniso_err_pp),
+        },
+        coords={"period": selected_periods},
+    )
+    params["strike"].attrs.update(
+        units="degrees",
+        range="[0, 90)",
+        convention="clockwise from x-axis",
+    )
+    params["twist"].attrs.update(units="degrees")
+    params["shear"].attrs.update(units="degrees")
+    params["gain"].attrs.update(units="dimensionless")
+    params["anisotropy"].attrs.update(units="dimensionless", non_identifiable=True)
+    params["period"].attrs.update(units="seconds")
+
+    total_chi_sq = sum(br.chi_squared for _, br in band_results)
+    total_n_resid = sum(len(br.residuals) for _, br in band_results)
+    rms_misfit = float(np.sqrt(total_chi_sq / max(total_n_resid, 1)))
+
+    chi_squared_da = xr.DataArray(
+        chi_squared_pp,
+        coords={"period": selected_periods},
+        dims=["period"],
+        attrs={
+            "degrees_of_freedom": 8,
+            "description": (
+                "Per-period chi-squared = sum of 8 sigma-weighted "
+                "squared residuals (Re/Im of XX, XY, YX, YY). For "
+                "periods in multiple bands, averaged across bands."
+            ),
+        },
+    )
+
+    per_band_metadata = []
+    for band_idx, br in band_results:
+        per_band_metadata.append(
+            {
+                "band_period_indices": band_idx.tolist(),
+                "band_periods": selected_periods[band_idx].tolist(),
+                "x_opt": br.x_opt.tolist(),
+                "x_err": br.x_err.tolist(),
+                "chi_squared": br.chi_squared,
+                "rms_misfit": br.rms_misfit,
+                "converged": br.converged,
+                "n_iter": br.n_iter,
+            }
+        )
+    metadata = {
+        "convention": "clockwise from x-axis",
+        "strike_range_degrees": "[0, 90)",
+        "canonicalisation": (
+            "(strike + 90 mod 180, -shear, twist) symmetry folded "
+            "so strike in [0, 90); shear sign flipped if pre-fold "
+            "strike was in [90, 180)"
+        ),
+        "static_shift_convention": ("gain consistent with MT.remove_static_shift"),
+        "regional_z_frame": "measurement",
+        "per_band": per_band_metadata,
+        "n_bands": len(band_results),
+    }
+
+    options_record = {
+        "periods": periods,
+        "bandwidth": bandwidth,
+        "overlap": overlap,
+        "norm_type": norm_type,
+        "bounds_override": bounds_override,
+        "initial_guess": initial_guess,
+        "realisations": realisations,
+        "seed": seed,
+    }
+
+    return DecompositionResult(
+        parameters=params,
+        regional_z=regional_z_obj,
+        chi_squared=chi_squared_da,
+        rms_misfit=rms_misfit,
+        method="groom_bailey",
+        options=options_record,
+        metadata=metadata,
+        frame="measurement",
     )
 
 
@@ -991,3 +1370,488 @@ def _objfun(
         jacobian[row_start:row_end, 5 + 3 * n_freqs + k] = pack_dz(dz_dphase_b)
 
     return residuals, jacobian
+
+
+# ---------------------------------------------------------------------------
+# Banded driver and Z<->band-array translation. These are the pieces that
+# turn _objfun into a working public decompose() entrypoint. Private; the
+# public API is decompose() above.
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class _BandResult:
+    """Result of a single-band optimisation. Internal type."""
+
+    x_opt: np.ndarray
+    x_err: np.ndarray
+    residuals: np.ndarray
+    chi_squared: float
+    rms_misfit: float
+    n_iter: int
+    converged: bool
+    cost_at_opt: float
+
+
+def _canonicalise_solution(
+    strike: float, twist: float, shear: float
+) -> tuple[float, float, float]:
+    """Apply the GB 90-degree / shear-sign symmetry to fold a
+    solution to a canonical branch.
+
+    The Groom-Bailey decomposition has a discrete symmetry: the
+    triple ``(strike, twist, shear)`` and ``(strike + 90 mod 180,
+    twist, -shear)`` represent the same physical solution (twist is
+    invariant; the strike shift by 90 degrees is paired with a sign
+    flip on shear). This function chooses the branch with strike in
+    ``[0, 90)``, which matches the strike_py reference's
+    ``symmetry.compare_band_against_dcmp`` convention.
+
+    Parameters
+    ----------
+    strike, twist, shear : float
+        Radians.
+
+    Returns
+    -------
+    strike_c, twist_c, shear_c : float
+        Canonicalised values, with ``strike_c in [0, pi/2)``.
+    """
+    half_pi = np.pi / 2.0
+    # Tolerance for the boundary at strike = pi/2 (90 deg). Without
+    # this, a strike that lands exactly at pi/2 can be rounded to one
+    # ULP below pi/2 by ``% np.pi`` and miss the fold.
+    fold_tol = 1e-9
+    strike_mod_pi = strike % np.pi
+    if strike_mod_pi >= half_pi - fold_tol:
+        strike_c = strike_mod_pi - half_pi
+        shear_c = -shear
+        # Re-fold strike_c into [0, pi/2): if the input was very close
+        # to pi/2 from below, strike_c is a tiny negative; map to 0.
+        if strike_c < 0.0:
+            strike_c = 0.0
+    else:
+        strike_c = strike_mod_pi
+        shear_c = shear
+    return float(strike_c), float(twist), float(shear_c)
+
+
+def _extract_bands(
+    periods: np.ndarray,
+    bandwidth: float = 1.0,
+    overlap: float = 0.0,
+) -> list[np.ndarray]:
+    """Partition periods into (possibly overlapping) bands.
+
+    Each band is described by the array of indices into ``periods``
+    that fall within the band. Bands span ``bandwidth`` decades in
+    ``log10(period)`` and successive bands shift by
+    ``bandwidth - overlap`` decades.
+
+    Parameters
+    ----------
+    periods : (n_periods,) float64
+        Strictly positive periods in seconds. Need not be sorted;
+        the returned indices index the input array as given.
+    bandwidth : float, default 1.0
+        Band width in ``log10(period)`` decades.
+    overlap : float, default 0.0
+        Overlap between adjacent bands. Must satisfy
+        ``0 <= overlap < bandwidth``.
+
+    Returns
+    -------
+    list[ndarray]
+        One ``int`` ndarray of indices per band. Bands containing
+        fewer than 2 periods are dropped (under-determined).
+    """
+    if periods.size == 0:
+        raise ValueError("_extract_bands: periods is empty")
+    if np.any(periods <= 0):
+        raise ValueError("_extract_bands: periods must be strictly positive")
+    if overlap >= bandwidth:
+        raise ValueError(
+            f"_extract_bands: overlap ({overlap}) must be less "
+            f"than bandwidth ({bandwidth})"
+        )
+
+    log_periods = np.log10(periods)
+    log_min = float(log_periods.min())
+    log_max = float(log_periods.max())
+    step = bandwidth - overlap
+    eps = 1e-12
+
+    bands: list[np.ndarray] = []
+    band_start = log_min
+    while band_start < log_max + eps:
+        band_end = band_start + bandwidth
+        in_band = (log_periods >= band_start - eps) & (log_periods < band_end - eps)
+        # Include the maximum period in the band whose band_end is
+        # at-or-past it (right-open elsewhere, right-closed at the
+        # global maximum). Without this, a period exactly on a band
+        # boundary that is also log_max can fall through the cracks.
+        if band_end >= log_max - eps:
+            in_band = in_band | (np.abs(log_periods - log_max) < eps)
+        idx = np.where(in_band)[0]
+        if idx.size >= 2:
+            bands.append(idx)
+        band_start += step
+
+    if not bands:
+        raise ValueError(
+            "_extract_bands: no band has 2 or more periods. "
+            "Reduce bandwidth or use a wider period range."
+        )
+    return bands
+
+
+def _z_to_band_arrays(
+    z: "Z", band_idx: np.ndarray
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Extract per-band ``(z_obs, sigma, periods)`` arrays from a Z.
+
+    Reads through the public ``Z.z`` and ``Z.z_error`` attributes
+    (the unit-corrected, user-facing values), per CLAUDE.md
+    invariant 4. Never via internal storage attributes.
+
+    Parameters
+    ----------
+    z : Z
+        Full impedance object.
+    band_idx : (n_band_freqs,) int ndarray
+        Indices into ``z.frequency`` of the periods in this band.
+
+    Returns
+    -------
+    z_obs : (n_band_freqs, 2, 2) complex128
+    sigma : (n_band_freqs, 2, 2) float64
+    periods : (n_band_freqs,) float64
+
+    Raises
+    ------
+    ValueError
+        If ``z.z_error`` is None or contains non-positive entries.
+    """
+    z_full = np.asarray(z.z, dtype=np.complex128)
+    z_err = z.z_error
+    if z_err is None:
+        raise ValueError(
+            "_z_to_band_arrays: z.z_error is None; cannot run "
+            "weighted least squares without per-component errors."
+        )
+    sigma_full = np.asarray(z_err, dtype=np.float64)
+    if np.any(sigma_full <= 0):
+        raise ValueError(
+            "_z_to_band_arrays: z.z_error contains non-positive " "entries"
+        )
+
+    z_obs = z_full[band_idx]
+    sigma = sigma_full[band_idx]
+    frequencies = np.asarray(z.frequency, dtype=np.float64)[band_idx]
+    periods = 1.0 / frequencies
+    return z_obs, sigma, periods
+
+
+def _band_arrays_to_z(
+    log10_rho_a: np.ndarray,
+    phase_a: np.ndarray,
+    log10_rho_b: np.ndarray,
+    phase_b: np.ndarray,
+    log10_rho_a_err: np.ndarray,
+    phase_a_err: np.ndarray,
+    log10_rho_b_err: np.ndarray,
+    phase_b_err: np.ndarray,
+    periods: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Build a strike-frame regional impedance and error arrays from
+    the recovered ``(log10_rho, phase)`` parameters.
+
+    The regional impedance is the canonical anti-diagonal 2D tensor
+    in the strike frame: ``Z_2D = [[0, a], [-b, 0]]`` where ``a``
+    is the TE-mode impedance and ``b`` the TM-mode impedance.
+
+    Parameters
+    ----------
+    log10_rho_a, phase_a, log10_rho_b, phase_b : (n_periods,) float64
+        Recovered regional parameters per period.
+    log10_rho_a_err, phase_a_err, log10_rho_b_err, phase_b_err
+        : (n_periods,) float64. 1-sigma uncertainties.
+    periods : (n_periods,) float64
+        Periods in seconds.
+
+    Returns
+    -------
+    z_regional : (n_periods, 2, 2) complex128
+        Strike-frame regional tensors.
+    z_regional_error : (n_periods, 2, 2) float64
+        Per-component 1-sigma propagated uncertainties.
+    """
+    n_periods = len(periods)
+    mu0 = 4.0 * np.pi * 1.0e-7
+    factor = 2.0 * np.pi * mu0
+    ln10 = np.log(10.0)
+
+    rho_a = 10.0**log10_rho_a
+    rho_b = 10.0**log10_rho_b
+    abs_a = np.sqrt(rho_a * factor / periods)
+    abs_b = np.sqrt(rho_b * factor / periods)
+    a = abs_a * np.exp(1j * phase_a)
+    b = abs_b * np.exp(1j * phase_b)
+
+    z_regional = np.zeros((n_periods, 2, 2), dtype=np.complex128)
+    z_regional[:, 0, 1] = a
+    z_regional[:, 1, 0] = -b
+
+    abs_a_err = np.sqrt(
+        (abs_a * ln10 / 2.0) ** 2
+        * np.where(np.isfinite(log10_rho_a_err), log10_rho_a_err, 0.0) ** 2
+        + abs_a**2 * np.where(np.isfinite(phase_a_err), phase_a_err, 0.0) ** 2
+    )
+    abs_b_err = np.sqrt(
+        (abs_b * ln10 / 2.0) ** 2
+        * np.where(np.isfinite(log10_rho_b_err), log10_rho_b_err, 0.0) ** 2
+        + abs_b**2 * np.where(np.isfinite(phase_b_err), phase_b_err, 0.0) ** 2
+    )
+
+    z_regional_error = np.zeros((n_periods, 2, 2), dtype=np.float64)
+    z_regional_error[:, 0, 1] = abs_a_err
+    z_regional_error[:, 1, 0] = abs_b_err
+    return z_regional, z_regional_error
+
+
+def _build_initial_guess(
+    z_obs: np.ndarray,
+    sigma: np.ndarray,
+    periods: np.ndarray,
+) -> np.ndarray:
+    """Heuristic starting point for the GB optimisation.
+
+    Strategy:
+      - Strike: circular median of per-period phase-tensor azimuths
+        (folds the 90-degree ambiguity by averaging ``2*az``).
+      - Twist, shear, log10_gain, anisotropy: zero (no a priori
+        distortion, gain = 1).
+      - Per-period ``(rho_a, phase_a, rho_b, phase_b)``: derived
+        from the rotated tensor assuming no distortion.
+
+    Parameters
+    ----------
+    z_obs : (n_freqs, 2, 2) complex128
+    sigma : (n_freqs, 2, 2) float64
+    periods : (n_freqs,) float64
+
+    Returns
+    -------
+    x0 : (5 + 4*n_freqs,) float64
+    """
+    n_freqs = len(periods)
+    mu0 = 4.0 * np.pi * 1.0e-7
+    factor = 2.0 * np.pi * mu0
+
+    azimuths = np.empty(n_freqs)
+    for k in range(n_freqs):
+        X = z_obs[k].real
+        Y = z_obs[k].imag
+        try:
+            phi = np.linalg.solve(X, Y)
+        except np.linalg.LinAlgError:
+            azimuths[k] = 0.0
+            continue
+        phi_sym = (phi + phi.T) / 2.0
+        num = phi_sym[0, 1] + phi_sym[1, 0]
+        den = phi_sym[0, 0] - phi_sym[1, 1]
+        azimuths[k] = 0.5 * np.arctan2(num, den)
+    median_2az = np.arctan2(
+        np.median(np.sin(2.0 * azimuths)),
+        np.median(np.cos(2.0 * azimuths)),
+    )
+    theta0 = median_2az / 2.0
+
+    c, s = np.cos(theta0), np.sin(theta0)
+    R = np.array([[c, -s], [s, c]])
+    log10_rho_a = np.empty(n_freqs)
+    phase_a = np.empty(n_freqs)
+    log10_rho_b = np.empty(n_freqs)
+    phase_b = np.empty(n_freqs)
+    for k in range(n_freqs):
+        z_rot = R.T @ z_obs[k] @ R
+        a_k = z_rot[0, 1]
+        b_k = -z_rot[1, 0]
+        log10_rho_a[k] = np.log10(max(abs(a_k), 1e-15) ** 2 * periods[k] / factor)
+        phase_a[k] = np.arctan2(a_k.imag, a_k.real)
+        log10_rho_b[k] = np.log10(max(abs(b_k), 1e-15) ** 2 * periods[k] / factor)
+        phase_b[k] = np.arctan2(b_k.imag, b_k.real)
+
+    x0 = np.concatenate(
+        [
+            [theta0, 0.0, 0.0, 0.0, 0.0],
+            log10_rho_a,
+            phase_a,
+            log10_rho_b,
+            phase_b,
+        ]
+    )
+    return x0
+
+
+def _build_bounds(
+    n_freqs: int,
+    bounds_override: dict[str, tuple[float, float]] | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Default parameter bounds for the GB state vector.
+
+    Defaults (radians, log10 units):
+      - strike:        ``[0, pi)``
+      - twist:         ``[-pi/4, pi/4]``
+      - shear:         ``[-pi/4, pi/4]``
+      - log10_gain:    ``[-2, 2]``
+      - anisotropy:    ``[-2, 2]`` (immaterial; J-column is zero)
+      - log10_rho_a/b: ``[-3, 6]``
+      - phase_a/b:     ``[-pi/4, 3*pi/4]``
+
+    Phase bounds are wider than the textbook causal first quadrant
+    so that real data near the high-frequency edge (where phases dip
+    below 0 deg) and processing-convention shifts don't pin the
+    solution at the boundary.
+
+    Overrides accept the keys listed above as ``(lower, upper)``
+    tuples.
+
+    Returns
+    -------
+    lower, upper : (5 + 4*n_freqs,) float64
+    """
+    PI_4 = np.pi / 4.0
+    defaults = {
+        "strike": (0.0, np.pi),
+        "twist": (-PI_4, PI_4),
+        "shear": (-PI_4, PI_4),
+        "log10_gain": (-2.0, 2.0),
+        "anisotropy": (-2.0, 2.0),
+        "log10_rho_a": (-3.0, 6.0),
+        "phase_a": (-PI_4, 3.0 * PI_4),
+        "log10_rho_b": (-3.0, 6.0),
+        "phase_b": (-PI_4, 3.0 * PI_4),
+    }
+    if bounds_override:
+        for key, val in bounds_override.items():
+            if key not in defaults:
+                raise ValueError(f"_build_bounds: unknown override key {key!r}")
+            defaults[key] = val
+
+    lower = np.empty(5 + 4 * n_freqs)
+    upper = np.empty(5 + 4 * n_freqs)
+    lower[0], upper[0] = defaults["strike"]
+    lower[1], upper[1] = defaults["twist"]
+    lower[2], upper[2] = defaults["shear"]
+    lower[3], upper[3] = defaults["log10_gain"]
+    lower[4], upper[4] = defaults["anisotropy"]
+
+    base = 5
+    lower[base : base + n_freqs] = defaults["log10_rho_a"][0]
+    upper[base : base + n_freqs] = defaults["log10_rho_a"][1]
+    lower[base + n_freqs : base + 2 * n_freqs] = defaults["phase_a"][0]
+    upper[base + n_freqs : base + 2 * n_freqs] = defaults["phase_a"][1]
+    lower[base + 2 * n_freqs : base + 3 * n_freqs] = defaults["log10_rho_b"][0]
+    upper[base + 2 * n_freqs : base + 3 * n_freqs] = defaults["log10_rho_b"][1]
+    lower[base + 3 * n_freqs : base + 4 * n_freqs] = defaults["phase_b"][0]
+    upper[base + 3 * n_freqs : base + 4 * n_freqs] = defaults["phase_b"][1]
+    return lower, upper
+
+
+def _solve_band(
+    z_obs: np.ndarray,
+    sigma: np.ndarray,
+    periods: np.ndarray,
+    x0: np.ndarray | None = None,
+    bounds: tuple[np.ndarray, np.ndarray] | None = None,
+    bounds_override: dict | None = None,
+    max_nfev: int = 1000,
+    ftol: float = 1e-10,
+    xtol: float = 1e-10,
+) -> _BandResult:
+    """Solve the GB optimisation for one period band.
+
+    Wraps :func:`scipy.optimize.least_squares` with the analytic
+    Jacobian computed by :func:`_objfun`. Method is TRF
+    (Trust-Region Reflective), which respects bounds.
+
+    Parameters
+    ----------
+    z_obs, sigma, periods : ndarrays
+        Per-band observation arrays. See :func:`_objfun`.
+    x0 : (5 + 4*n_freqs,) float64, optional
+        Initial parameter vector. Default: :func:`_build_initial_guess`,
+        clipped into the bounds.
+    bounds : tuple of (lower, upper), optional
+        Parameter bounds. Default: :func:`_build_bounds`.
+    bounds_override : dict, optional
+        Per-parameter bounds overrides; passed to
+        :func:`_build_bounds` if ``bounds`` is None.
+    max_nfev : int
+    ftol, xtol : float
+
+    Returns
+    -------
+    _BandResult
+    """
+    n_freqs = len(periods)
+
+    if bounds is None:
+        bounds = _build_bounds(n_freqs, bounds_override)
+    lower, upper = bounds
+
+    if x0 is None:
+        x0 = _build_initial_guess(z_obs, sigma, periods)
+    # Clip x0 into the bounds: scipy's TRF rejects out-of-bounds x0.
+    x0 = np.clip(x0, lower, upper)
+
+    def fun(x):
+        r, _ = _objfun(x, z_obs, sigma, periods, compute_jacobian=False)
+        return r
+
+    def jac(x):
+        _, j = _objfun(x, z_obs, sigma, periods, compute_jacobian=True)
+        return j
+
+    result = least_squares(
+        fun=fun,
+        x0=x0,
+        jac=jac,
+        bounds=(lower, upper),
+        method="trf",
+        ftol=ftol,
+        xtol=xtol,
+        max_nfev=max_nfev,
+    )
+
+    x_opt = result.x
+    residuals = result.fun
+    chi_squared = float(np.sum(residuals**2))
+    n_resid = len(residuals)
+    rms_misfit = float(np.sqrt(chi_squared / n_resid))
+
+    # Parameter errors from the final Jacobian.
+    # cov = (J^T J)^{-1}; sigma_i = sqrt(diag(cov)). Detect zero-norm
+    # columns explicitly so structurally non-identifiable parameters
+    # report inf (truthful) rather than 0 (misleading).
+    J = result.jac
+    col_norms = np.linalg.norm(J, axis=0)
+    zero_cols = col_norms < 1e-15
+    try:
+        cov = np.linalg.pinv(J.T @ J, rcond=1e-12)
+        x_err = np.sqrt(np.maximum(np.diag(cov), 0.0))
+        x_err[zero_cols] = np.inf
+    except np.linalg.LinAlgError:
+        x_err = np.full_like(x_opt, np.nan)
+
+    return _BandResult(
+        x_opt=x_opt,
+        x_err=x_err,
+        residuals=residuals,
+        chi_squared=chi_squared,
+        rms_misfit=rms_misfit,
+        n_iter=int(result.nfev),
+        converged=int(result.status) > 0,
+        cost_at_opt=float(result.cost),
+    )

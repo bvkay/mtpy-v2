@@ -20,19 +20,129 @@ import xarray as xr
 
 from mtpy.core.transfer_function.z import Z
 from mtpy.core.transfer_function.z_analysis.decomposition import (
+    _band_arrays_to_z,
+    _BandResult,
+    _build_bounds,
+    _build_initial_guess,
     _calc_error,
+    _canonicalise_solution,
     _convz2p,
     _convz2r,
     _estim_imp,
+    _extract_bands,
     _extreme,
     _jkvar,
     _mat_multiply,
     _objfun,
+    _solve_band,
     _unpack_x,
+    _z_to_band_arrays,
     decompose,
     decompose_joint,
     DecompositionResult,
 )
+
+
+def _build_synthetic_band(
+    theta_deg=30.0,
+    twist_deg=10.0,
+    shear_deg=5.0,
+    log10_gain=0.0,
+    n_freqs=5,
+    seed=0,
+    noise_level=0.0,
+    period_lo=0.0,
+    period_hi=1.0,
+):
+    """Synthetic single-band ``(z_obs, sigma, periods)`` arrays.
+
+    Truth parameters are recoverable by ``_objfun`` / ``_solve_band``
+    to machine precision when ``noise_level == 0``.
+    """
+    rng = np.random.default_rng(seed)
+    periods = np.logspace(period_lo, period_hi, n_freqs)
+    log10_rho_a = rng.uniform(0.5, 2.5, n_freqs)
+    phase_a = rng.uniform(0.3, 1.4, n_freqs)
+    log10_rho_b = rng.uniform(0.5, 2.5, n_freqs)
+    phase_b = rng.uniform(0.3, 1.4, n_freqs)
+
+    theta = np.radians(theta_deg)
+    twist = np.radians(twist_deg)
+    shear = np.radians(shear_deg)
+
+    mu0 = 4.0 * np.pi * 1.0e-7
+    factor = 2.0 * np.pi * mu0
+    rho_a = 10.0**log10_rho_a
+    rho_b = 10.0**log10_rho_b
+    abs_a = np.sqrt(rho_a * factor / periods)
+    abs_b = np.sqrt(rho_b * factor / periods)
+    a = abs_a * np.exp(1j * phase_a)
+    b = abs_b * np.exp(1j * phase_b)
+    gain = 10.0**log10_gain
+    t = np.tan(twist)
+    e = np.tan(shear)
+
+    z_obs = np.empty((n_freqs, 2, 2), dtype=np.complex128)
+    for k in range(n_freqs):
+        z_obs[k] = gain * _estim_imp(a[k], b[k], t, e, theta)
+
+    if noise_level > 0:
+        sigma = noise_level * np.maximum(
+            np.abs(z_obs),
+            np.max(np.abs(z_obs), axis=(1, 2), keepdims=True) * 0.1,
+        )
+        noise = rng.normal(scale=sigma) + 1j * rng.normal(scale=sigma)
+        z_obs = z_obs + noise
+    else:
+        sigma = np.maximum(
+            0.01 * np.abs(z_obs),
+            0.01 * np.max(np.abs(z_obs), axis=(1, 2), keepdims=True),
+        )
+
+    return {
+        "z_obs": z_obs,
+        "sigma": sigma,
+        "periods": periods,
+        "true_theta": theta,
+        "true_twist": twist,
+        "true_shear": shear,
+        "true_log10_gain": log10_gain,
+    }
+
+
+def _build_synthetic_z(
+    theta_deg=30.0,
+    twist_deg=10.0,
+    shear_deg=5.0,
+    log10_gain=0.0,
+    n_freqs=12,
+    seed=0,
+):
+    """Synthetic ``Z`` object spanning ~3 decades, single distortion
+    triple. Used by the end-to-end decompose() tests."""
+    d = _build_synthetic_band(
+        theta_deg=theta_deg,
+        twist_deg=twist_deg,
+        shear_deg=shear_deg,
+        log10_gain=log10_gain,
+        n_freqs=n_freqs,
+        seed=seed,
+        noise_level=0.0,
+        period_lo=-1.0,
+        period_hi=2.0,
+    )
+    frequencies = 1.0 / d["periods"]
+    z = Z(
+        z=d["z_obs"],
+        z_error=d["sigma"],
+        frequency=frequencies,
+    )
+    return z, {
+        "true_strike_deg": theta_deg,
+        "true_twist_deg": twist_deg,
+        "true_shear_deg": shear_deg,
+        "true_log10_gain": log10_gain,
+    }
 
 
 class TestImports:
@@ -180,12 +290,8 @@ class TestZTypeRoundTrip:
 
 
 class TestDecomposeStubs:
-    """The stub functions raise NotImplementedError with informative
-    messages."""
-
-    def test_decompose_raises(self, mt_with_impedance):
-        with pytest.raises(NotImplementedError, match="subsequent"):
-            decompose(mt_with_impedance.Z)
+    """``decompose_joint`` is still a stub; ``decompose`` is
+    implemented (its contract tests live in TestDecomposeEndToEnd)."""
 
     def test_decompose_joint_raises(self, mt_with_impedance):
         # Pass a list with a single MT-like; decompose_joint takes
@@ -702,3 +808,407 @@ class TestObjfunJacobian:
                 rtol=1e-4,
                 err_msg=f"seed={seed}, column {j}",
             )
+
+
+class TestCanonicaliseSolution:
+    """The 90-degree / shear-sign symmetry fold reduces solutions to
+    a canonical branch with strike in [0, pi/2)."""
+
+    def test_in_canonical_range_already(self):
+        s, t, sh = _canonicalise_solution(
+            np.radians(30.0), np.radians(10.0), np.radians(5.0)
+        )
+        assert np.isclose(np.degrees(s), 30.0)
+        assert np.isclose(np.degrees(t), 10.0)
+        assert np.isclose(np.degrees(sh), 5.0)
+
+    def test_folds_upper_half(self):
+        # strike=120 deg, shear=+5 deg should fold to strike=30 deg,
+        # shear=-5 deg.
+        s, t, sh = _canonicalise_solution(
+            np.radians(120.0), np.radians(10.0), np.radians(5.0)
+        )
+        assert np.isclose(np.degrees(s), 30.0, atol=1e-9)
+        assert np.isclose(np.degrees(t), 10.0)
+        assert np.isclose(np.degrees(sh), -5.0, atol=1e-9)
+
+    def test_handles_pi_over_two_exactly(self):
+        # The boundary case: floating-point % np.pi can drop strike
+        # one ULP below pi/2; the tolerance in the fold should still
+        # send it to ~0.
+        s, _, _ = _canonicalise_solution(np.pi / 2.0, 0.0, 0.0)
+        assert s < 1e-8
+
+    def test_negative_strike(self):
+        # strike=-30 deg = +150 deg mod 180; should fold to 60 deg
+        # with shear sign flipped.
+        s, _, sh = _canonicalise_solution(np.radians(-30.0), 0.0, np.radians(7.0))
+        assert np.isclose(np.degrees(s), 60.0, atol=1e-9)
+        assert np.isclose(np.degrees(sh), -7.0, atol=1e-9)
+
+    def test_strike_above_pi(self):
+        # strike=200 deg = 20 deg mod 180. Below pi/2; no fold.
+        s, _, sh = _canonicalise_solution(np.radians(200.0), 0.0, np.radians(3.0))
+        assert np.isclose(np.degrees(s), 20.0, atol=1e-9)
+        assert np.isclose(np.degrees(sh), 3.0, atol=1e-9)
+
+    def test_twist_unchanged(self):
+        # Twist is the symmetry-invariant; should never change.
+        for strike_deg in [10, 50, 90, 130, 170]:
+            _, t_out, _ = _canonicalise_solution(
+                np.radians(strike_deg),
+                np.radians(7.5),
+                np.radians(2.0),
+            )
+            assert np.isclose(np.degrees(t_out), 7.5, atol=1e-9)
+
+
+class TestExtractBands:
+    """_extract_bands partitions periods into log10-decade bands."""
+
+    def test_single_decade_one_band(self):
+        periods = np.logspace(0, 1, 5)
+        bands = _extract_bands(periods, bandwidth=1.0, overlap=0.0)
+        assert len(bands) == 1
+        np.testing.assert_array_equal(bands[0], np.arange(5))
+
+    def test_three_decades_three_bands(self):
+        periods = np.logspace(-1, 2, 12)
+        bands = _extract_bands(periods, bandwidth=1.0, overlap=0.0)
+        assert len(bands) == 3
+        all_idx = sorted(set(int(i) for b in bands for i in b))
+        assert all_idx == list(range(12))
+
+    def test_overlap_creates_duplicates(self):
+        periods = np.logspace(0, 2, 10)
+        bands = _extract_bands(periods, bandwidth=1.0, overlap=0.5)
+        all_idx = np.concatenate(bands)
+        assert len(all_idx) > len(periods)
+
+    def test_invalid_overlap_raises(self):
+        periods = np.logspace(0, 2, 10)
+        with pytest.raises(ValueError, match="overlap"):
+            _extract_bands(periods, bandwidth=1.0, overlap=1.5)
+
+    def test_empty_raises(self):
+        with pytest.raises(ValueError, match="empty"):
+            _extract_bands(np.array([]))
+
+    def test_negative_periods_raises(self):
+        with pytest.raises(ValueError, match="positive"):
+            _extract_bands(np.array([1.0, -2.0, 3.0]))
+
+    def test_too_narrow_raises(self):
+        # Single period: no band has 2+ entries
+        with pytest.raises(ValueError, match="2 or more"):
+            _extract_bands(np.array([1.0]), bandwidth=1.0)
+
+
+class TestBuildInitialGuess:
+    """_build_initial_guess produces a valid x0 vector."""
+
+    def test_shape(self):
+        d = _build_synthetic_band(n_freqs=5)
+        x0 = _build_initial_guess(d["z_obs"], d["sigma"], d["periods"])
+        assert x0.shape == (5 + 4 * 5,)
+
+    def test_distortion_starts_at_zero(self):
+        d = _build_synthetic_band(n_freqs=4)
+        x0 = _build_initial_guess(d["z_obs"], d["sigma"], d["periods"])
+        assert x0[1] == 0.0  # twist
+        assert x0[2] == 0.0  # shear
+        assert x0[3] == 0.0  # log10_gain
+        assert x0[4] == 0.0  # anisotropy
+
+
+class TestBuildBounds:
+    """_build_bounds produces ordered, overridable bounds."""
+
+    def test_default_shape(self):
+        n = 5
+        lo, up = _build_bounds(n)
+        assert lo.shape == (5 + 4 * n,)
+        assert up.shape == (5 + 4 * n,)
+
+    def test_lower_below_upper(self):
+        lo, up = _build_bounds(5)
+        assert np.all(lo < up)
+
+    def test_phase_bound_loosened(self):
+        # Per the design decision, phase bounds are wider than the
+        # textbook causal first quadrant.
+        lo, up = _build_bounds(3)
+        # phase_a band: indices 5+1*n .. 5+2*n
+        assert lo[5 + 3] < 0.0
+        assert up[5 + 3] > np.pi / 2.0
+
+    def test_override(self):
+        lo, up = _build_bounds(5, bounds_override={"twist": (-0.1, 0.1)})
+        assert lo[1] == -0.1
+        assert up[1] == 0.1
+
+    def test_unknown_override_raises(self):
+        with pytest.raises(ValueError, match="unknown override key"):
+            _build_bounds(5, bounds_override={"theta_typo": (0, 1)})
+
+
+class TestSolveBand:
+    """_solve_band recovers known parameters from synthetic data."""
+
+    def test_recovers_realistic_distortion(self):
+        d = _build_synthetic_band(
+            theta_deg=30.0,
+            twist_deg=10.0,
+            shear_deg=5.0,
+            log10_gain=0.0,
+        )
+        result = _solve_band(d["z_obs"], d["sigma"], d["periods"])
+        assert isinstance(result, _BandResult)
+        assert result.converged
+        # Strike: handle the 90-deg branch by checking against both.
+        rec = result.x_opt[0] % np.pi
+        truth = d["true_theta"] % np.pi
+        diff = min(
+            abs(rec - truth),
+            abs(rec - truth - np.pi / 2),
+            abs(rec - truth + np.pi / 2),
+        )
+        assert diff < np.radians(5.0)
+        assert result.rms_misfit < 0.01
+
+    def test_recovers_no_distortion(self):
+        d = _build_synthetic_band(
+            theta_deg=0.0,
+            twist_deg=0.0,
+            shear_deg=0.0,
+        )
+        result = _solve_band(d["z_obs"], d["sigma"], d["periods"])
+        assert result.converged
+        # No-distortion: rms should be near machine epsilon.
+        assert result.rms_misfit < 1e-3
+
+    def test_recovers_with_noise(self):
+        d = _build_synthetic_band(
+            theta_deg=30.0,
+            twist_deg=10.0,
+            shear_deg=5.0,
+            log10_gain=0.0,
+            noise_level=0.02,
+        )
+        result = _solve_band(d["z_obs"], d["sigma"], d["periods"])
+        assert result.converged
+        rec = result.x_opt[0] % np.pi
+        truth = d["true_theta"] % np.pi
+        diff = min(
+            abs(rec - truth),
+            abs(rec - truth - np.pi / 2),
+            abs(rec - truth + np.pi / 2),
+        )
+        # With 2% noise on a 5-frequency band, expect <15 deg.
+        assert diff < np.radians(15.0)
+
+    def test_x0_clipped_to_bounds(self):
+        # Pass an x0 deliberately outside bounds; _solve_band should
+        # clip and run rather than letting scipy raise.
+        d = _build_synthetic_band(theta_deg=30.0)
+        n = len(d["periods"])
+        bad_x0 = np.zeros(5 + 4 * n)
+        bad_x0[3] = 100.0  # log10_gain way above bound (default 2)
+        # Should not raise: clip happens before scipy.
+        result = _solve_band(d["z_obs"], d["sigma"], d["periods"], x0=bad_x0)
+        assert result.x_opt[3] <= 2.0 + 1e-9
+
+    def test_anisotropy_error_is_inf(self):
+        # Anisotropy column is identically zero in the Jacobian; its
+        # formal variance is infinite. The error should report inf.
+        d = _build_synthetic_band(theta_deg=30.0)
+        result = _solve_band(d["z_obs"], d["sigma"], d["periods"])
+        assert not np.isfinite(result.x_err[4])
+
+
+class TestZBandArrayRoundTrip:
+    """_z_to_band_arrays / _band_arrays_to_z form the Z<->array
+    boundary."""
+
+    def test_z_to_band_arrays_basic(self, mt_with_impedance):
+        z = mt_with_impedance.Z
+        n_total = z.z.shape[0]
+        band_idx = np.arange(min(5, n_total))
+        z_obs, sigma, periods = _z_to_band_arrays(z, band_idx)
+        assert z_obs.shape == (len(band_idx), 2, 2)
+        assert sigma.shape == z_obs.shape
+        assert periods.shape == (len(band_idx),)
+        np.testing.assert_array_equal(z_obs, z.z[band_idx])
+
+    def test_band_arrays_to_z_anti_diagonal(self):
+        # Strike-frame regional tensor: Z = [[0, a], [-b, 0]]
+        n = 4
+        periods = np.logspace(0, 1, n)
+        log10_rho_a = np.full(n, 2.0)
+        phase_a = np.full(n, np.pi / 4)
+        log10_rho_b = np.full(n, 2.0)
+        phase_b = np.full(n, np.pi / 4)
+        z_reg, z_err = _band_arrays_to_z(
+            log10_rho_a,
+            phase_a,
+            log10_rho_b,
+            phase_b,
+            np.zeros(n),
+            np.zeros(n),
+            np.zeros(n),
+            np.zeros(n),
+            periods,
+        )
+        assert z_reg.shape == (n, 2, 2)
+        # Anti-diagonal: diagonals are zero
+        np.testing.assert_array_equal(z_reg[:, 0, 0], 0)
+        np.testing.assert_array_equal(z_reg[:, 1, 1], 0)
+        # Z[1, 0] = -b (sign flip on second component)
+        assert np.all(z_reg[:, 1, 0].real < 0) | np.all(z_reg[:, 1, 0].imag != 0)
+
+    def test_z_to_band_arrays_no_z_error_raises(self):
+        # Z without z_error: raises ValueError before producing arrays.
+        rng = np.random.default_rng(0)
+        n = 3
+        z_arr = rng.normal(size=(n, 2, 2)) + 1j * rng.normal(size=(n, 2, 2))
+        z = Z(z=z_arr, frequency=np.logspace(0, 1, n))
+        # mtpy-v2 may auto-populate z_error to zeros; either path
+        # raises (None or non-positive entries).
+        with pytest.raises(ValueError, match="None|non-positive"):
+            _z_to_band_arrays(z, np.arange(n))
+
+
+class TestDecomposeEndToEnd:
+    """End-to-end decompose() recovers known parameters from synthetic
+    Z spanning 3 decades."""
+
+    def test_returns_decomposition_result(self):
+        z, _ = _build_synthetic_z()
+        result = decompose(z)
+        assert isinstance(result, DecompositionResult)
+        assert result.method == "groom_bailey"
+        assert result.frame == "measurement"
+
+    def test_dataset_has_documented_variables(self):
+        z, _ = _build_synthetic_z()
+        result = decompose(z)
+        for name in (
+            "strike",
+            "twist",
+            "shear",
+            "gain",
+            "anisotropy",
+            "strike_error",
+            "twist_error",
+            "shear_error",
+            "gain_error",
+            "anisotropy_error",
+        ):
+            assert name in result.parameters.data_vars
+        assert "period" in result.parameters.coords
+
+    def test_strike_attrs(self):
+        z, _ = _build_synthetic_z()
+        result = decompose(z)
+        assert result.parameters["strike"].attrs.get("units") == "degrees"
+        assert result.parameters["strike"].attrs.get("range") == "[0, 90)"
+
+    def test_chi_squared_attrs(self):
+        z, _ = _build_synthetic_z()
+        result = decompose(z)
+        assert result.chi_squared.attrs.get("degrees_of_freedom") == 8
+
+    def test_regional_z_is_z_instance(self):
+        z, _ = _build_synthetic_z()
+        result = decompose(z)
+        assert isinstance(result.regional_z, Z)
+        assert len(result.regional_z.frequency) == len(z.frequency)
+
+    def test_regional_z_in_measurement_frame(self):
+        # Build with theta=30 deg and verify regional_z has all four
+        # entries non-zero (i.e. not strike-frame anti-diagonal).
+        z, _ = _build_synthetic_z(theta_deg=30.0)
+        result = decompose(z)
+        # In measurement frame, all four entries should be non-zero
+        # for a non-zero strike. (Strike-frame regional_z has zero
+        # diagonals.)
+        diag_max = np.max(np.abs(result.regional_z.z[:, 0, 0]))
+        offdiag_max = np.max(np.abs(result.regional_z.z[:, 0, 1]))
+        assert diag_max > 0.01 * offdiag_max
+
+    def test_recovers_strike_realistic(self):
+        z, truth = _build_synthetic_z(
+            theta_deg=30.0,
+            twist_deg=10.0,
+            shear_deg=5.0,
+        )
+        result = decompose(z)
+        # Median strike across periods (avoid bands that fall into
+        # alternative local minima)
+        median_strike = float(np.nanmedian(result.parameters["strike"].values))
+        # Truth (30 deg) is already in the canonical [0, 90) range
+        diff = min(
+            abs(median_strike - 30.0),
+            abs(median_strike - 30.0 - 90.0),
+            abs(median_strike - 30.0 + 90.0),
+        )
+        assert diff < 5.0
+
+    def test_recovers_no_distortion(self):
+        z, _ = _build_synthetic_z(
+            theta_deg=0.0,
+            twist_deg=0.0,
+            shear_deg=0.0,
+        )
+        result = decompose(z)
+        # No-distortion should canonicalise to strike=0 across all
+        # bands
+        median_strike = float(np.nanmedian(result.parameters["strike"].values))
+        # Either 0 or near-90 (folded to 0) — check against [0, 5]
+        # since canonicalisation maps both to 0
+        assert median_strike < 5.0
+
+    def test_metadata_present(self):
+        z, _ = _build_synthetic_z()
+        result = decompose(z)
+        assert "convention" in result.metadata
+        assert "n_bands" in result.metadata
+        assert "per_band" in result.metadata
+        assert result.metadata["n_bands"] >= 1
+        assert result.metadata.get("regional_z_frame") == "measurement"
+        assert "canonicalisation" in result.metadata
+
+    def test_options_recorded(self):
+        z, _ = _build_synthetic_z()
+        result = decompose(z, bandwidth=1.5, overlap=0.5)
+        assert result.options["bandwidth"] == 1.5
+        assert result.options["overlap"] == 0.5
+
+    def test_realisations_raises_not_implemented(self):
+        z, _ = _build_synthetic_z()
+        with pytest.raises(NotImplementedError, match="Bootstrap"):
+            decompose(z, realisations=10)
+
+    def test_no_z_error_raises(self):
+        rng = np.random.default_rng(0)
+        n = 5
+        z_arr = rng.normal(scale=1e-3, size=(n, 2, 2)) + 1j * rng.normal(
+            scale=1e-3, size=(n, 2, 2)
+        )
+        frequencies = np.logspace(-1, 1, n)
+        z = Z(z=z_arr, frequency=frequencies)
+        with pytest.raises(ValueError, match="None|non-positive"):
+            decompose(z)
+
+    def test_period_window(self):
+        z, _ = _build_synthetic_z(n_freqs=12)
+        # Window that selects the middle decade only
+        result = decompose(z, periods=(1.0, 10.0))
+        assert result.parameters["period"].values.min() >= 1.0
+        assert result.parameters["period"].values.max() <= 10.0
+
+    def test_period_window_too_narrow_raises(self):
+        z, _ = _build_synthetic_z()
+        with pytest.raises(ValueError):
+            # An empty window (no periods inside it)
+            decompose(z, periods=(1e10, 1e11))
