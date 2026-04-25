@@ -22,11 +22,13 @@ from mtpy.core.transfer_function.z import Z
 from mtpy.core.transfer_function.z_analysis.decomposition import (
     _band_arrays_to_z,
     _BandResult,
+    _bootstrap_decompose,
     _build_bounds,
     _calc_error,
     _canonical_initial_guess,
     _canonicalise_solution,
     _cluster_modes,
+    _compute_ci_percentile,
     _compute_mode_probabilities,
     _convz2p,
     _convz2r,
@@ -41,6 +43,8 @@ from mtpy.core.transfer_function.z_analysis.decomposition import (
     _mat_multiply,
     _objfun,
     _perturbed_initial_guess,
+    _predict_z_from_primary_modes,
+    _resample_residuals,
     _rotated_initial_guess,
     _solve_band,
     _solve_band_multistart,
@@ -1193,11 +1197,6 @@ class TestDecomposeEndToEnd:
         assert result.options["bandwidth"] == 1.5
         assert result.options["overlap"] == 0.5
 
-    def test_realisations_raises_not_implemented(self):
-        z, _ = _build_synthetic_z()
-        with pytest.raises(NotImplementedError, match="Bootstrap"):
-            decompose(z, realisations=10)
-
     def test_no_z_error_raises(self):
         rng = np.random.default_rng(0)
         n = 5
@@ -1691,3 +1690,359 @@ class TestDecomposeMultistart:
         z, _ = _build_synthetic_z(theta_deg=30.0, n_freqs=12)
         result = decompose(z)
         assert "band_disagreement" not in result.metadata
+
+
+class TestResampleResiduals:
+    """_resample_residuals generates correct synthetic Z."""
+
+    def test_shape_matches_input(self):
+        rng = np.random.default_rng(0)
+        n_freqs = 5
+        z_pred = rng.normal(size=(n_freqs, 2, 2)) + 1j * rng.normal(
+            size=(n_freqs, 2, 2)
+        )
+        z_obs = z_pred * 1.1
+        sigma = np.abs(z_pred) * 0.05 + 1e-12
+        replica = _resample_residuals(z_obs, sigma, z_pred, rng)
+        assert replica.shape == z_pred.shape
+        assert replica.dtype == z_pred.dtype
+
+    def test_reproducibility(self):
+        n_freqs = 3
+        rng_a = np.random.default_rng(42)
+        rng_b = np.random.default_rng(42)
+        z_pred = np.ones((n_freqs, 2, 2), dtype=np.complex128)
+        sigma = np.full((n_freqs, 2, 2), 0.01)
+        z_obs = z_pred.copy()
+        a = _resample_residuals(z_obs, sigma, z_pred, rng_a)
+        b = _resample_residuals(z_obs, sigma, z_pred, rng_b)
+        np.testing.assert_array_equal(a, b)
+
+    def test_centered_on_z_predicted(self):
+        """Many replicas: empirical mean ~ z_predicted."""
+        rng = np.random.default_rng(0)
+        n_freqs = 4
+        z_pred = np.arange(n_freqs * 4).reshape(n_freqs, 2, 2).astype(np.complex128)
+        sigma = np.full((n_freqs, 2, 2), 0.5)
+        z_obs = z_pred.copy()
+        n_replicas = 1000
+        replicas = np.array(
+            [_resample_residuals(z_obs, sigma, z_pred, rng) for _ in range(n_replicas)]
+        )
+        empirical_mean = replicas.mean(axis=0)
+        # 3-sigma at n=1000: 3 * 0.5/sqrt(1000) = 0.047
+        np.testing.assert_allclose(empirical_mean, z_pred, atol=0.05)
+
+    def test_variance_matches_sigma(self):
+        rng = np.random.default_rng(0)
+        n_freqs = 4
+        z_pred = np.zeros((n_freqs, 2, 2), dtype=np.complex128)
+        sigma = np.full((n_freqs, 2, 2), 0.5)
+        z_obs = z_pred.copy()
+        n_replicas = 5000
+        replicas = np.array(
+            [_resample_residuals(z_obs, sigma, z_pred, rng) for _ in range(n_replicas)]
+        )
+        empirical_std_real = replicas.real.std(axis=0)
+        np.testing.assert_allclose(empirical_std_real, sigma, rtol=0.05)
+
+    def test_shape_mismatch_raises(self):
+        rng = np.random.default_rng(0)
+        z_pred = np.zeros((3, 2, 2), dtype=np.complex128)
+        sigma = np.ones((4, 2, 2))
+        z_obs = z_pred.copy()
+        with pytest.raises(ValueError, match="shape"):
+            _resample_residuals(z_obs, sigma, z_pred, rng)
+
+    def test_non_positive_sigma_raises(self):
+        rng = np.random.default_rng(0)
+        z_pred = np.zeros((3, 2, 2), dtype=np.complex128)
+        sigma = np.zeros((3, 2, 2))
+        z_obs = z_pred.copy()
+        with pytest.raises(ValueError, match="non-positive"):
+            _resample_residuals(z_obs, sigma, z_pred, rng)
+
+
+class TestComputeCiPercentile:
+    """_compute_ci_percentile produces correct percentile-based CIs."""
+
+    def test_normal_distribution_95(self):
+        rng = np.random.default_rng(42)
+        replicates = rng.normal(loc=10.0, scale=2.0, size=(20000,))
+        lower, upper = _compute_ci_percentile(replicates, level=0.95)
+        # 95% CI of N(10, 2) is approximately [6.08, 13.92]
+        np.testing.assert_allclose(float(lower), 6.08, atol=0.2)
+        np.testing.assert_allclose(float(upper), 13.92, atol=0.2)
+
+    def test_complex_split_real_imag(self):
+        rng = np.random.default_rng(0)
+        replicates = rng.normal(size=(2000,)) + 1j * rng.normal(size=(2000,))
+        lower, upper = _compute_ci_percentile(replicates, level=0.95)
+        assert np.iscomplexobj(lower)
+        assert np.iscomplexobj(upper)
+        np.testing.assert_allclose(float(lower.real), -1.96, atol=0.2)
+        np.testing.assert_allclose(float(upper.real), 1.96, atol=0.2)
+
+    def test_axis_argument(self):
+        rng = np.random.default_rng(0)
+        replicates = rng.normal(size=(100, 5))
+        lower, upper = _compute_ci_percentile(replicates, level=0.95, axis=0)
+        assert lower.shape == (5,)
+        assert upper.shape == (5,)
+        assert np.all(lower <= upper)
+
+    def test_invalid_level_raises(self):
+        with pytest.raises(ValueError, match="level"):
+            _compute_ci_percentile(np.zeros(10), level=1.5)
+        with pytest.raises(ValueError, match="level"):
+            _compute_ci_percentile(np.zeros(10), level=0.0)
+
+    def test_nan_aware(self):
+        # NaN entries should be ignored, not propagate to CI bounds
+        rng = np.random.default_rng(0)
+        x = rng.normal(size=1000)
+        x[::10] = np.nan
+        lower, upper = _compute_ci_percentile(x, level=0.95)
+        assert np.isfinite(lower)
+        assert np.isfinite(upper)
+
+
+class TestPredictZFromPrimaryModes:
+    """_predict_z_from_primary_modes reconstructs Z correctly."""
+
+    def test_round_trip_from_synthetic(self):
+        # Build a single-band synthetic, fit it, and verify the
+        # forward-model prediction at the primary mode reproduces
+        # the input Z within machine precision (since the primary
+        # mode converged to the truth on this clean problem).
+        d = _build_synthetic_band(theta_deg=30.0, n_freqs=5)
+        from mtpy.core.transfer_function.z_analysis.decomposition import (
+            _solve_band_multistart,
+        )
+
+        rng = np.random.default_rng(0)
+        modes = _solve_band_multistart(
+            d["z_obs"], d["sigma"], d["periods"], n_starts=2, rng=rng
+        )
+        band_idx = np.arange(5)
+        z_pred = _predict_z_from_primary_modes([(band_idx, modes)], d["periods"])
+        # Clean fit: forward model at primary should reproduce z_obs
+        # up to numerical noise
+        np.testing.assert_allclose(z_pred, d["z_obs"], atol=1e-9, rtol=1e-9)
+
+    def test_shape(self):
+        d = _build_synthetic_band(theta_deg=30.0, n_freqs=5)
+        from mtpy.core.transfer_function.z_analysis.decomposition import (
+            _solve_band_multistart,
+        )
+
+        rng = np.random.default_rng(0)
+        modes = _solve_band_multistart(
+            d["z_obs"], d["sigma"], d["periods"], n_starts=1, rng=rng
+        )
+        band_idx = np.arange(5)
+        z_pred = _predict_z_from_primary_modes([(band_idx, modes)], d["periods"])
+        assert z_pred.shape == (5, 2, 2)
+        assert z_pred.dtype == np.complex128
+
+
+class TestBootstrapDecompose:
+    """_bootstrap_decompose returns the documented array shapes."""
+
+    def test_shapes_and_keys(self):
+        d = _build_synthetic_band(theta_deg=30.0, n_freqs=5)
+        from mtpy.core.transfer_function.z_analysis.decomposition import (
+            _solve_band_multistart,
+        )
+
+        rng_fit = np.random.default_rng(0)
+        modes = _solve_band_multistart(
+            d["z_obs"], d["sigma"], d["periods"], n_starts=2, rng=rng_fit
+        )
+        band_idx = np.arange(5)
+        z_pred = _predict_z_from_primary_modes([(band_idx, modes)], d["periods"])
+
+        rng = np.random.default_rng(1)
+        replicates = _bootstrap_decompose(
+            z_obs_full=d["z_obs"],
+            sigma_full=d["sigma"],
+            selected_periods=d["periods"],
+            bands=[band_idx],
+            z_predicted=z_pred,
+            realisations=5,
+            n_starts=2,
+            bounds_override=None,
+            rng=rng,
+            mode_tolerance=None,
+            perturbation_scale=0.1,
+            mode_warning_threshold=1.5,
+        )
+        assert replicates["strike"].shape == (5, 5)
+        assert replicates["regional_z"].shape == (5, 5, 2, 2)
+        assert replicates["rms_misfit"].shape == (5,)
+        assert replicates["mode_warning"].shape == (5,)
+        # No catastrophic failures on clean synthetic
+        assert np.sum(np.isnan(replicates["rms_misfit"])) == 0
+
+    def test_realisations_zero_raises(self):
+        d = _build_synthetic_band(n_freqs=3)
+        rng = np.random.default_rng(0)
+        with pytest.raises(ValueError, match=">= 1"):
+            _bootstrap_decompose(
+                z_obs_full=d["z_obs"],
+                sigma_full=d["sigma"],
+                selected_periods=d["periods"],
+                bands=[np.arange(3)],
+                z_predicted=d["z_obs"].copy(),
+                realisations=0,
+                n_starts=1,
+                bounds_override=None,
+                rng=rng,
+                mode_tolerance=None,
+                perturbation_scale=0.1,
+                mode_warning_threshold=1.5,
+            )
+
+
+class TestDecomposeBootstrap:
+    """End-to-end decompose() with bootstrap."""
+
+    def test_realisations_zero_no_ci_fields(self):
+        z, _ = _build_synthetic_z()
+        result = decompose(z, realisations=0)
+        assert "strike_ci_lower" not in result.parameters
+        assert "strike_ci_upper" not in result.parameters
+        assert "bootstrap_replicates" not in result.metadata
+
+    def test_realisations_positive_adds_ci_fields(self):
+        z, _ = _build_synthetic_z()
+        result = decompose(z, realisations=5, n_starts=2, seed=42)
+        for name in ("strike", "twist", "shear", "gain"):
+            assert f"{name}_ci_lower" in result.parameters
+            assert f"{name}_ci_upper" in result.parameters
+
+    def test_ci_lower_le_upper(self):
+        z, _ = _build_synthetic_z()
+        result = decompose(z, realisations=10, n_starts=2, seed=42)
+        for name in ("strike", "twist", "shear", "gain"):
+            lower = result.parameters[f"{name}_ci_lower"].values
+            upper = result.parameters[f"{name}_ci_upper"].values
+            finite = np.isfinite(lower) & np.isfinite(upper)
+            assert np.all(lower[finite] <= upper[finite] + 1e-10)
+
+    def test_metadata_populated(self):
+        z, _ = _build_synthetic_z()
+        result = decompose(z, realisations=10, n_starts=2, seed=42)
+        assert result.metadata["bootstrap_realisations"] == 10
+        assert result.metadata["bootstrap_ci_method"] == "percentile"
+        assert result.metadata["bootstrap_ci_level"] == 0.95
+        assert "bootstrap_replicates" in result.metadata
+        assert "bootstrap_caveats" in result.metadata
+        assert "bootstrap_n_failed" in result.metadata
+        assert "bootstrap_mode_warning_fraction" in result.metadata
+
+    def test_replicates_shapes(self):
+        z, _ = _build_synthetic_z(n_freqs=12)
+        result = decompose(z, realisations=10, n_starts=2, seed=42)
+        replicas = result.metadata["bootstrap_replicates"]
+        n_periods = len(z.frequency)
+        assert replicas["strike"].shape == (10, n_periods)
+        assert replicas["regional_z"].shape == (10, n_periods, 2, 2)
+        assert replicas["rms_misfit"].shape == (10,)
+        assert replicas["mode_warning"].shape == (10,)
+
+    def test_seed_reproducibility(self):
+        z, _ = _build_synthetic_z()
+        a = decompose(z, realisations=5, n_starts=2, seed=42)
+        b = decompose(z, realisations=5, n_starts=2, seed=42)
+        np.testing.assert_array_equal(
+            a.parameters["strike_ci_lower"].values,
+            b.parameters["strike_ci_lower"].values,
+        )
+        np.testing.assert_array_equal(
+            a.parameters["strike_ci_upper"].values,
+            b.parameters["strike_ci_upper"].values,
+        )
+
+    def test_invalid_ci_method_raises(self):
+        z, _ = _build_synthetic_z()
+        with pytest.raises(NotImplementedError, match="ci_method"):
+            decompose(z, realisations=5, n_starts=2, ci_method="bca")
+
+    def test_ci_level_recorded(self):
+        z, _ = _build_synthetic_z()
+        result = decompose(z, realisations=5, n_starts=2, seed=42, ci_level=0.90)
+        assert result.metadata["bootstrap_ci_level"] == 0.90
+        assert result.options["ci_level"] == 0.90
+
+    def test_options_record_includes_bootstrap_params(self):
+        z, _ = _build_synthetic_z()
+        result = decompose(
+            z,
+            realisations=5,
+            n_starts=2,
+            seed=42,
+            ci_level=0.90,
+            ci_method="percentile",
+        )
+        assert result.options["ci_level"] == 0.90
+        assert result.options["ci_method"] == "percentile"
+
+    def test_ci_units_attrs(self):
+        z, _ = _build_synthetic_z()
+        result = decompose(z, realisations=5, n_starts=2, seed=42)
+        assert result.parameters["strike_ci_lower"].attrs.get("units") == "degrees"
+        assert result.parameters["gain_ci_lower"].attrs.get("units") == "dimensionless"
+
+    @pytest.mark.slow
+    def test_empirical_coverage(self):
+        """Empirical 95% coverage on synthetic noisy data should be
+        at least 85% on a 20-outer sample (allowing for Monte Carlo
+        noise). Marked slow: ~100 seconds.
+        """
+        truth_strike = 30.0
+        truth_twist = 10.0
+        truth_shear = 5.0
+        n_outer = 20
+        cov_strike = 0
+        cov_twist = 0
+        cov_shear = 0
+        for outer_seed in range(n_outer):
+            d = _build_synthetic_band(
+                theta_deg=truth_strike,
+                twist_deg=truth_twist,
+                shear_deg=truth_shear,
+                n_freqs=8,
+                seed=outer_seed,
+                noise_level=0.02,
+            )
+            frequencies = 1.0 / d["periods"]
+            z = Z(z=d["z_obs"], z_error=d["sigma"], frequency=frequencies)
+            result = decompose(
+                z,
+                realisations=50,
+                n_starts=2,
+                seed=outer_seed + 1000,
+                bandwidth=2.0,  # single band for this synthetic
+            )
+            ci_l_strike = float(
+                np.nanmedian(result.parameters["strike_ci_lower"].values)
+            )
+            ci_u_strike = float(
+                np.nanmedian(result.parameters["strike_ci_upper"].values)
+            )
+            ci_l_twist = float(np.nanmedian(result.parameters["twist_ci_lower"].values))
+            ci_u_twist = float(np.nanmedian(result.parameters["twist_ci_upper"].values))
+            ci_l_shear = float(np.nanmedian(result.parameters["shear_ci_lower"].values))
+            ci_u_shear = float(np.nanmedian(result.parameters["shear_ci_upper"].values))
+            if ci_l_strike <= truth_strike <= ci_u_strike:
+                cov_strike += 1
+            if ci_l_twist <= truth_twist <= ci_u_twist:
+                cov_twist += 1
+            if ci_l_shear <= truth_shear <= ci_u_shear:
+                cov_shear += 1
+        # Allow [85%, 100%] coverage for a 20-sample assessment of
+        # a nominal-95% interval (Monte Carlo binomial noise).
+        assert cov_strike >= 17, f"strike coverage {cov_strike}/{n_outer} below 85%"
+        assert cov_twist >= 17, f"twist coverage {cov_twist}/{n_outer} below 85%"
+        assert cov_shear >= 17, f"shear coverage {cov_shear}/{n_outer} below 85%"

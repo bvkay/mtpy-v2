@@ -180,6 +180,8 @@ def decompose(
     return_all_modes: bool = False,
     mode_warning_threshold: float = 1.5,
     perturbation_scale: float = 0.1,
+    ci_level: float = 0.95,
+    ci_method: str = "percentile",
 ) -> DecompositionResult:
     """Single-site Groom-Bailey decomposition with multi-start.
 
@@ -213,11 +215,16 @@ def decompose(
         ``bounds_override``.
 
     realisations : int, default 0
-        Number of bootstrap realisations for parameter uncertainty.
-        ``0`` disables bootstrap (analytic-Jacobian errors are still
-        reported). Note: bootstrap is reliable for direct GB
-        parameters but unreliable for invariant-derived quantities
-        per Chave (2014); see module documentation.
+        Number of parametric bootstrap replicas. ``0`` disables
+        bootstrap and reports only the analytical Jacobian-based
+        errors. ``> 0`` enables bootstrap; CIs appear in additional
+        Dataset fields (``<name>_ci_lower`` / ``<name>_ci_upper``).
+        Recommended values: 100 for default quality, 500 for
+        publication-quality. Cost scales as
+        ``realisations × n_starts × n_bands`` optimisations. Note:
+        bootstrap is reliable for direct GB parameters but
+        unreliable for invariant-derived quantities per Chave
+        (2014); see ``metadata['bootstrap_caveats']``.
 
     seed : int, optional
         RNG seed. Used both for bootstrap (when implemented) and
@@ -261,6 +268,16 @@ def decompose(
         Standard deviation of the Gaussian perturbation for random
         starting points, as a fraction of the per-parameter bound
         width.
+
+    ci_level : float, default 0.95
+        Nominal coverage level for bootstrap CIs. Only used when
+        ``realisations > 0``.
+
+    ci_method : str, default 'percentile'
+        Bootstrap CI computation method. Currently only
+        ``'percentile'`` is implemented; passing anything else
+        raises :class:`NotImplementedError`. BCa (bias-corrected
+        and accelerated) is planned for a future session.
 
     Returns
     -------
@@ -307,15 +324,36 @@ def decompose(
     alternatives. To access all modes as parallel arrays, set
     ``return_all_modes=True``.
 
+    Parametric bootstrap. When ``realisations > 0``, decompose()
+    generates ``realisations`` synthetic-data replicas by adding
+    parametric Gaussian noise to the primary-mode-fitted Z (with
+    sigma per component matching ``z.z_error``). Each replica runs
+    the full multi-start machinery; per-replica primary-mode
+    parameters form the bootstrap distribution and the
+    ``ci_level``-percentile bounds are stored as additional
+    ``parameters`` Dataset fields. The full per-replica arrays are
+    available in ``metadata['bootstrap_replicates']`` for custom
+    analysis.
+
+    Bootstrap reliability. Parametric bootstrap measures sensitivity
+    under the assumption that the noise model and the GB89 forward
+    model are correct; model-misspecification uncertainty is not
+    captured. Replicas that hit a different primary mode than the
+    original-data fit are counted via
+    ``metadata['bootstrap_mode_warning_fraction']``; if that
+    exceeds 50%, ``metadata['bootstrap_robustness_warning']`` flags
+    that single-mode CIs are unreliable for this dataset.
+
     For the McNeice-Jones multi-site joint decomposition, see
     :func:`decompose_joint`.
     """
     from mtpy.core.transfer_function.z import Z as _Z
 
-    if realisations > 0:
+    if ci_method != "percentile":
         raise NotImplementedError(
-            "Bootstrap realisations are planned for a future "
-            "contribution; pass realisations=0."
+            f"ci_method={ci_method!r} not implemented; only "
+            f"'percentile' is currently supported. BCa is planned "
+            f"for a future session."
         )
 
     frequencies = np.asarray(z.frequency, dtype=np.float64)
@@ -352,22 +390,17 @@ def decompose(
 
     rng = np.random.default_rng(42 if seed is None else seed)
 
-    band_modes_list: list[tuple[np.ndarray, list[_Mode]]] = []
-    for band_idx in bands:
-        z_obs_b = z_selected[band_idx]
-        sigma_b = sigma_selected[band_idx]
-        periods_b = selected_periods[band_idx]
-        modes = _solve_band_multistart(
-            z_obs=z_obs_b,
-            sigma=sigma_b,
-            periods=periods_b,
-            n_starts=n_starts,
-            bounds_override=bounds_override,
-            rng=rng,
-            mode_tolerance=mode_tolerance,
-            perturbation_scale=perturbation_scale,
-        )
-        band_modes_list.append((band_idx, modes))
+    band_modes_list = _decompose_bands_with_modes(
+        z_obs_full=z_selected,
+        sigma_full=sigma_selected,
+        selected_periods=selected_periods,
+        bands=bands,
+        n_starts=n_starts,
+        bounds_override=bounds_override,
+        rng=rng,
+        mode_tolerance=mode_tolerance,
+        perturbation_scale=perturbation_scale,
+    )
 
     # Pick primary mode per band for the existing aggregation logic.
     band_results = [
@@ -689,6 +722,88 @@ def decompose(
     if return_all_modes:
         params = _build_per_mode_parameters_dataset(band_modes_list, selected_periods)
 
+    if realisations > 0:
+        z_predicted = _predict_z_from_primary_modes(band_modes_list, selected_periods)
+        bootstrap_rng = np.random.default_rng(int(rng.integers(0, 2**32)))
+        bootstrap_replicates = _bootstrap_decompose(
+            z_obs_full=z_selected,
+            sigma_full=sigma_selected,
+            selected_periods=selected_periods,
+            bands=bands,
+            z_predicted=z_predicted,
+            realisations=realisations,
+            n_starts=n_starts,
+            bounds_override=bounds_override,
+            rng=bootstrap_rng,
+            mode_tolerance=mode_tolerance,
+            perturbation_scale=perturbation_scale,
+            mode_warning_threshold=mode_warning_threshold,
+        )
+
+        ci_strike_lower, ci_strike_upper = _compute_ci_percentile(
+            bootstrap_replicates["strike"], level=ci_level
+        )
+        ci_twist_lower, ci_twist_upper = _compute_ci_percentile(
+            bootstrap_replicates["twist"], level=ci_level
+        )
+        ci_shear_lower, ci_shear_upper = _compute_ci_percentile(
+            bootstrap_replicates["shear"], level=ci_level
+        )
+        ci_gain_lower, ci_gain_upper = _compute_ci_percentile(
+            bootstrap_replicates["gain"], level=ci_level
+        )
+
+        params["strike_ci_lower"] = (("period",), ci_strike_lower)
+        params["strike_ci_upper"] = (("period",), ci_strike_upper)
+        params["twist_ci_lower"] = (("period",), ci_twist_lower)
+        params["twist_ci_upper"] = (("period",), ci_twist_upper)
+        params["shear_ci_lower"] = (("period",), ci_shear_lower)
+        params["shear_ci_upper"] = (("period",), ci_shear_upper)
+        params["gain_ci_lower"] = (("period",), ci_gain_lower)
+        params["gain_ci_upper"] = (("period",), ci_gain_upper)
+        for k in (
+            "strike_ci_lower",
+            "strike_ci_upper",
+            "twist_ci_lower",
+            "twist_ci_upper",
+            "shear_ci_lower",
+            "shear_ci_upper",
+        ):
+            params[k].attrs["units"] = "degrees"
+        for k in ("gain_ci_lower", "gain_ci_upper"):
+            params[k].attrs["units"] = "dimensionless"
+
+        metadata["bootstrap_replicates"] = bootstrap_replicates
+        metadata["bootstrap_realisations"] = realisations
+        metadata["bootstrap_ci_method"] = ci_method
+        metadata["bootstrap_ci_level"] = ci_level
+        metadata["bootstrap_n_failed"] = int(
+            np.sum(np.isnan(bootstrap_replicates["rms_misfit"]))
+        )
+        metadata["bootstrap_caveats"] = (
+            "Parametric bootstrap CIs assume the GB89 forward model "
+            "is correct and the noise model (independent Gaussian "
+            "real and imaginary parts per tensor component) is "
+            "correct. Model-misspecification uncertainty is not "
+            "captured. CIs are reliable for direct GB parameters "
+            "(strike, twist, shear, gain, regional Z components). "
+            "Per Chave (2014), CIs derived from these via phase-"
+            "tensor invariants or Mohr-circle quantities are "
+            "formally meaningless — those derived quantities have "
+            "infinite asymptotic variance and are not amenable to "
+            "bootstrap CI methods."
+        )
+        mode_warning_fraction = float(np.mean(bootstrap_replicates["mode_warning"]))
+        metadata["bootstrap_mode_warning_fraction"] = mode_warning_fraction
+        if mode_warning_fraction > 0.5:
+            metadata["bootstrap_robustness_warning"] = (
+                f"More than half of bootstrap replicas "
+                f"({100*mode_warning_fraction:.0f}%) triggered the "
+                f"primary-mode warning. Single-mode CIs may be "
+                f"misleading; the data does not strongly distinguish "
+                f"between competing physical solutions."
+            )
+
     options_record = {
         "periods": periods,
         "bandwidth": bandwidth,
@@ -703,6 +818,8 @@ def decompose(
         "return_all_modes": return_all_modes,
         "mode_warning_threshold": mode_warning_threshold,
         "perturbation_scale": perturbation_scale,
+        "ci_level": ci_level,
+        "ci_method": ci_method,
     }
 
     return DecompositionResult(
@@ -2456,6 +2573,56 @@ def _solve_band_multistart(
     return modes
 
 
+def _decompose_bands_with_modes(
+    z_obs_full: np.ndarray,
+    sigma_full: np.ndarray,
+    selected_periods: np.ndarray,
+    bands: list[np.ndarray],
+    n_starts: int,
+    bounds_override: dict | None,
+    rng: np.random.Generator,
+    mode_tolerance: dict | None,
+    perturbation_scale: float,
+) -> list[tuple[np.ndarray, list[_Mode]]]:
+    """Run multi-start optimisation per band; return per-band mode lists.
+
+    Used both by :func:`decompose` on the original data and by
+    :func:`_bootstrap_decompose` per replica. Pure orchestrator: each
+    band is independently optimised via :func:`_solve_band_multistart`.
+
+    Parameters
+    ----------
+    z_obs_full : (n_periods, 2, 2) complex128
+    sigma_full : (n_periods, 2, 2) float64
+    selected_periods : (n_periods,) float64
+    bands : list of int ndarrays
+        Output of :func:`_extract_bands`.
+    n_starts, bounds_override, rng, mode_tolerance, perturbation_scale
+        Passed through to :func:`_solve_band_multistart`.
+
+    Returns
+    -------
+    list of (band_idx, list[_Mode])
+    """
+    band_modes_list: list[tuple[np.ndarray, list[_Mode]]] = []
+    for band_idx in bands:
+        z_obs_b = z_obs_full[band_idx]
+        sigma_b = sigma_full[band_idx]
+        periods_b = selected_periods[band_idx]
+        modes = _solve_band_multistart(
+            z_obs=z_obs_b,
+            sigma=sigma_b,
+            periods=periods_b,
+            n_starts=n_starts,
+            bounds_override=bounds_override,
+            rng=rng,
+            mode_tolerance=mode_tolerance,
+            perturbation_scale=perturbation_scale,
+        )
+        band_modes_list.append((band_idx, modes))
+    return band_modes_list
+
+
 def _detect_band_disagreement(
     band_modes_list: list[tuple[np.ndarray, list[_Mode]]],
     mode_tolerance: dict,
@@ -2636,3 +2803,343 @@ def _build_per_mode_parameters_dataset(
         description="Discovered mode index per band; 0 = primary (lowest RMS)"
     )
     return ds
+
+
+def _resample_residuals(
+    z_obs: np.ndarray,
+    sigma: np.ndarray,
+    z_predicted: np.ndarray,
+    rng: np.random.Generator,
+) -> np.ndarray:
+    """Generate one parametric bootstrap replica.
+
+    For each tensor component (i,j) at each frequency k, draw real
+    and imaginary noise independently from N(0, sigma[k,i,j]^2) and
+    add to ``z_predicted[k,i,j]``. The result is a synthetic observed
+    tensor that, under the GB89 model with the noise assumption,
+    would have been a plausible observation.
+
+    Parameters
+    ----------
+    z_obs : (n_freqs, 2, 2) complex128
+        Original observed tensor. Used only for shape validation.
+    sigma : (n_freqs, 2, 2) float64
+        Per-component standard errors.
+    z_predicted : (n_freqs, 2, 2) complex128
+        Model-predicted tensor at the primary-mode parameters. The
+        bootstrap is around this, not around z_obs.
+    rng : np.random.Generator
+
+    Returns
+    -------
+    z_replica : (n_freqs, 2, 2) complex128
+
+    Notes
+    -----
+    The noise model assumes real and imaginary parts of each tensor
+    component are independent, both N(0, sigma^2). This matches the
+    convention used by :func:`_objfun` and :func:`_calc_error`
+    (which weight real and imaginary residuals each by sigma).
+
+    The bootstrap is around ``z_predicted``, not ``z_obs``: we are
+    asking "if the GB89 model is correct, what would observations
+    look like under repeated sampling at this noise level?". This
+    is parametric bootstrap; nonparametric bootstrap (e.g. resample
+    frequencies) is a different operation not implemented here.
+    """
+    if z_obs.shape != sigma.shape or z_obs.shape != z_predicted.shape:
+        raise ValueError(
+            f"_resample_residuals: shape mismatch — z_obs "
+            f"{z_obs.shape}, sigma {sigma.shape}, z_predicted "
+            f"{z_predicted.shape}"
+        )
+    if np.any(sigma <= 0):
+        raise ValueError("_resample_residuals: sigma contains non-positive entries")
+
+    real_noise = rng.normal(scale=sigma)
+    imag_noise = rng.normal(scale=sigma)
+    return z_predicted + real_noise + 1j * imag_noise
+
+
+def _predict_z_from_primary_modes(
+    band_modes_list: list[tuple[np.ndarray, list[_Mode]]],
+    selected_periods: np.ndarray,
+) -> np.ndarray:
+    """Build the model-predicted Z from per-band primary modes.
+
+    For each band, the primary mode's converged parameters specify
+    a forward model. We evaluate that model at each of the band's
+    periods to produce the per-period predicted tensor. Where periods
+    appear in multiple bands (overlap > 0), the prediction comes
+    from the band whose primary mode has the lowest RMS at that
+    period.
+
+    Parameters
+    ----------
+    band_modes_list : list of (band_idx, modes)
+    selected_periods : (n_periods,) float64
+
+    Returns
+    -------
+    z_predicted : (n_periods, 2, 2) complex128
+        Measurement-frame predicted tensor.
+
+    Raises
+    ------
+    RuntimeError
+        If any selected period is not covered by at least one band.
+    """
+    n_periods = len(selected_periods)
+    z_predicted = np.full((n_periods, 2, 2), np.nan, dtype=np.complex128)
+    best_rms = np.full(n_periods, np.inf)
+
+    mu0 = 4.0 * np.pi * 1.0e-7
+    factor = 2.0 * np.pi * mu0
+
+    for band_idx, modes in band_modes_list:
+        primary = modes[0]
+        x_opt = primary.band_result.x_opt
+        n_band_freqs = len(band_idx)
+        band_periods = selected_periods[band_idx]
+
+        unpacked = _unpack_x(x_opt, n_band_freqs)
+        theta = unpacked[0]
+        twist = unpacked[1]
+        shear = unpacked[2]
+        log10_gain = unpacked[3]
+        log10_rho_a = unpacked[5]
+        phase_a = unpacked[6]
+        log10_rho_b = unpacked[7]
+        phase_b = unpacked[8]
+        t = np.tan(twist)
+        e = np.tan(shear)
+        gain = 10.0**log10_gain
+        rho_a = 10.0**log10_rho_a
+        rho_b = 10.0**log10_rho_b
+        abs_a = np.sqrt(rho_a * factor / band_periods)
+        abs_b = np.sqrt(rho_b * factor / band_periods)
+        a = abs_a * np.exp(1j * phase_a)
+        b = abs_b * np.exp(1j * phase_b)
+
+        for local_i, global_i in enumerate(band_idx):
+            if primary.rms_misfit < best_rms[global_i]:
+                z_predicted[global_i] = gain * _estim_imp(
+                    a[local_i], b[local_i], t, e, theta
+                )
+                best_rms[global_i] = primary.rms_misfit
+
+    if np.any(np.isnan(z_predicted)):
+        raise RuntimeError(
+            "_predict_z_from_primary_modes: some periods not covered "
+            "by any band's primary mode prediction"
+        )
+    return z_predicted
+
+
+def _compute_ci_percentile(
+    replicates: np.ndarray,
+    level: float = 0.95,
+    axis: int = 0,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Percentile-based confidence interval from bootstrap replicates.
+
+    Computes the empirical CI as the (alpha/2, 1-alpha/2) percentiles
+    of the replicate distribution along ``axis``, where
+    ``alpha = 1 - level``. NaN-aware via :func:`numpy.nanpercentile`.
+
+    Complex-valued replicates produce complex CI bounds whose real
+    and imaginary parts are computed independently from the real and
+    imaginary parts of the replicate.
+
+    Parameters
+    ----------
+    replicates : ndarray
+    level : float, default 0.95
+    axis : int, default 0
+
+    Returns
+    -------
+    lower, upper : ndarray
+        Same shape as ``replicates`` with ``axis`` removed.
+
+    Notes
+    -----
+    Percentile bootstrap is appropriate when the replicate
+    distribution is roughly symmetric. For skewed distributions, BCa
+    is preferred but is not implemented in this session.
+
+    Coverage is approximately ``level`` in large samples for unbiased
+    estimators with symmetric error distributions. For small samples
+    or skewed distributions, actual coverage may differ from nominal.
+    """
+    if not 0 < level < 1:
+        raise ValueError(
+            f"_compute_ci_percentile: level must be in (0, 1), " f"got {level}"
+        )
+
+    alpha = 1 - level
+    lower_pct = 100 * (alpha / 2)
+    upper_pct = 100 * (1 - alpha / 2)
+
+    if np.iscomplexobj(replicates):
+        real_lower = np.nanpercentile(replicates.real, lower_pct, axis=axis)
+        real_upper = np.nanpercentile(replicates.real, upper_pct, axis=axis)
+        imag_lower = np.nanpercentile(replicates.imag, lower_pct, axis=axis)
+        imag_upper = np.nanpercentile(replicates.imag, upper_pct, axis=axis)
+        return (
+            real_lower + 1j * imag_lower,
+            real_upper + 1j * imag_upper,
+        )
+    return (
+        np.nanpercentile(replicates, lower_pct, axis=axis),
+        np.nanpercentile(replicates, upper_pct, axis=axis),
+    )
+
+
+def _bootstrap_decompose(
+    z_obs_full: np.ndarray,
+    sigma_full: np.ndarray,
+    selected_periods: np.ndarray,
+    bands: list[np.ndarray],
+    z_predicted: np.ndarray,
+    realisations: int,
+    n_starts: int,
+    bounds_override: dict | None,
+    rng: np.random.Generator,
+    mode_tolerance: dict | None,
+    perturbation_scale: float,
+    mode_warning_threshold: float,
+) -> dict[str, np.ndarray]:
+    """Run parametric bootstrap; return per-replica primary-mode arrays.
+
+    For each of ``realisations`` replicas:
+      1. Generate a synthetic Z via :func:`_resample_residuals`.
+      2. Run multi-start optimisation per band on the synthetic Z.
+      3. Extract per-period primary-mode canonical-form parameters
+         and per-period regional impedance components (rotated to
+         measurement frame).
+
+    Failed replicas (uncaught exceptions inside the per-band fit)
+    leave the corresponding row as NaN in every output array; the
+    caller can count failures via ``np.isnan(rms_misfit)``.
+
+    Parameters
+    ----------
+    z_obs_full : (n_periods, 2, 2) complex128
+    sigma_full : (n_periods, 2, 2) float64
+    selected_periods : (n_periods,) float64
+    bands : list of int ndarrays
+    z_predicted : (n_periods, 2, 2) complex128
+        Model prediction at the original-data primary modes.
+    realisations : int, >= 1
+    n_starts : int
+    bounds_override : dict or None
+    rng : np.random.Generator
+    mode_tolerance : dict or None
+    perturbation_scale : float
+    mode_warning_threshold : float
+        Per-replica primary-mode-warning is recorded when any band's
+        second-best mode has RMS within this factor of its primary's
+        RMS. Passed through from ``decompose``.
+
+    Returns
+    -------
+    dict with keys:
+        'strike'      : (realisations, n_periods) float, degrees
+        'twist'       : (realisations, n_periods) float, degrees
+        'shear'       : (realisations, n_periods) float, degrees
+        'gain'        : (realisations, n_periods) float, dimensionless
+        'regional_z'  : (realisations, n_periods, 2, 2) complex128
+        'rms_misfit'  : (realisations,) float, per-replica overall RMS
+        'mode_warning': (realisations,) bool, per-replica warning flag
+    """
+    if realisations < 1:
+        raise ValueError(
+            f"_bootstrap_decompose: realisations must be >= 1, " f"got {realisations}"
+        )
+
+    n_periods = len(selected_periods)
+    replicates = {
+        "strike": np.full((realisations, n_periods), np.nan),
+        "twist": np.full((realisations, n_periods), np.nan),
+        "shear": np.full((realisations, n_periods), np.nan),
+        "gain": np.full((realisations, n_periods), np.nan),
+        "regional_z": np.full(
+            (realisations, n_periods, 2, 2), np.nan, dtype=np.complex128
+        ),
+        "rms_misfit": np.full(realisations, np.nan),
+        "mode_warning": np.full(realisations, False),
+    }
+
+    mu0 = 4.0 * np.pi * 1.0e-7
+    factor = 2.0 * np.pi * mu0
+
+    for replica_i in range(realisations):
+        z_replica = _resample_residuals(z_obs_full, sigma_full, z_predicted, rng)
+
+        try:
+            band_modes_list = _decompose_bands_with_modes(
+                z_obs_full=z_replica,
+                sigma_full=sigma_full,
+                selected_periods=selected_periods,
+                bands=bands,
+                n_starts=n_starts,
+                bounds_override=bounds_override,
+                rng=rng,
+                mode_tolerance=mode_tolerance,
+                perturbation_scale=perturbation_scale,
+            )
+        except Exception:
+            continue
+
+        for band_idx, modes in band_modes_list:
+            primary = modes[0]
+            br = primary.band_result
+            n_band_freqs = len(band_idx)
+
+            strike_can, twist_can, shear_can = _canonicalise_solution(
+                float(br.x_opt[0]), float(br.x_opt[1]), float(br.x_opt[2])
+            )
+            log10_gain = float(br.x_opt[3])
+
+            unpacked = _unpack_x(br.x_opt, n_band_freqs)
+            log10_rho_a = unpacked[5]
+            phase_a = unpacked[6]
+            log10_rho_b = unpacked[7]
+            phase_b = unpacked[8]
+
+            band_periods = selected_periods[band_idx]
+            rho_a = 10.0**log10_rho_a
+            rho_b = 10.0**log10_rho_b
+            abs_a = np.sqrt(rho_a * factor / band_periods)
+            abs_b = np.sqrt(rho_b * factor / band_periods)
+            a_band = abs_a * np.exp(1j * phase_a)
+            b_band = abs_b * np.exp(1j * phase_b)
+
+            c, s = np.cos(strike_can), np.sin(strike_can)
+            R = np.array([[c, -s], [s, c]])
+
+            for local_i, global_i in enumerate(band_idx):
+                replicates["strike"][replica_i, global_i] = np.degrees(strike_can)
+                replicates["twist"][replica_i, global_i] = np.degrees(twist_can)
+                replicates["shear"][replica_i, global_i] = np.degrees(shear_can)
+                replicates["gain"][replica_i, global_i] = 10.0**log10_gain
+
+                a_k = a_band[local_i]
+                b_k = b_band[local_i]
+                z_strike_frame = np.array(
+                    [[0.0, a_k], [-b_k, 0.0]], dtype=np.complex128
+                )
+                replicates["regional_z"][replica_i, global_i] = R @ z_strike_frame @ R.T
+
+        all_rms = np.array([modes[0].rms_misfit for _, modes in band_modes_list])
+        replicates["rms_misfit"][replica_i] = float(np.sqrt(np.mean(all_rms**2)))
+
+        for _, modes in band_modes_list:
+            if len(modes) >= 2:
+                ratio = modes[1].rms_misfit / max(modes[0].rms_misfit, 1e-30)
+                if ratio <= mode_warning_threshold:
+                    replicates["mode_warning"][replica_i] = True
+                    break
+
+    return replicates

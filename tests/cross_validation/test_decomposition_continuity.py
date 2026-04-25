@@ -240,3 +240,79 @@ class TestStrikeExampleContinuity:
         )
         assert median_tw < 5.0, f"median twist error {median_tw:.2f} deg too large"
         assert median_sh < 5.0, f"median shear error {median_sh:.2f} deg too large"
+
+
+class TestStrikeExampleBootstrap:
+    """Bootstrap CIs on strike_example.
+
+    The Fortran reference is at a different local minimum than
+    Python on the long-period band (Session 5 finding: max azimuth
+    error ~33 deg there). The bootstrap is around Python's primary
+    mode, so the Fortran reference is not expected to fall within
+    the bootstrap CI on those bands. We assert only that the
+    bootstrap completes cleanly, the CI fields populate, and
+    Fortran-vs-Python coverage is at least 30% (allowing for the
+    long-period local-minima divergence).
+    """
+
+    @pytest.mark.skipif(
+        not _HAS_REFERENCE_DCMP,
+        reason="strike_example.dcmp not present; skipping bootstrap continuity",
+    )
+    def test_bootstrap_runs_and_populates_ci(self):
+        from mtpy.core.transfer_function.z_analysis.decomposition import decompose
+
+        z = _load_strike_example_z()
+        # Small realisations and n_starts for speed: ~30 ops per
+        # original-data fit + 20*2*4 = ~160 ops for bootstrap.
+        result = decompose(z, realisations=20, n_starts=2, seed=42)
+        assert "strike_ci_lower" in result.parameters
+        assert "strike_ci_upper" in result.parameters
+        assert result.metadata["bootstrap_realisations"] == 20
+        # No more than 10% of replicas should fail catastrophically
+        n_failed = result.metadata["bootstrap_n_failed"]
+        assert (
+            n_failed <= 2
+        ), f"bootstrap_n_failed={n_failed} exceeds 10% of 20 replicas"
+
+    @pytest.mark.skipif(
+        not _HAS_REFERENCE_DCMP,
+        reason="strike_example.dcmp not present; skipping bootstrap continuity",
+    )
+    def test_fortran_within_ci_at_least_partial_coverage(self):
+        """At least 30% of periods should have the Fortran reference
+        within Python's 95% CI. The remainder reflects the long-
+        period local-minima divergence carried over from Session 5."""
+        from strike_py.io.dcmp import read_dcmp
+
+        from mtpy.core.transfer_function.z_analysis.decomposition import decompose
+
+        z = _load_strike_example_z()
+        result = decompose(z, realisations=20, n_starts=2, seed=42)
+        ref = read_dcmp(_STRIKE_EXAMPLE_DCMP)
+
+        py_periods = result.parameters["period"].values
+        ci_l = result.parameters["strike_ci_lower"].values
+        ci_u = result.parameters["strike_ci_upper"].values
+
+        within = []
+        for k, period in enumerate(py_periods):
+            if not (np.isfinite(ci_l[k]) and np.isfinite(ci_u[k])):
+                continue
+            ref_idx = int(np.argmin(np.abs(ref.periods - period)))
+            ref_strike = float(ref.regional_azimuth_deg[ref_idx])
+            # Allow either branch of the GB89 90-deg ambiguity
+            in_ci = (
+                (ci_l[k] <= ref_strike <= ci_u[k])
+                or (ci_l[k] <= ref_strike - 90.0 <= ci_u[k])
+                or (ci_l[k] <= ref_strike + 90.0 <= ci_u[k])
+                or (ci_l[k] <= ref_strike - 180.0 <= ci_u[k])
+            )
+            within.append(in_ci)
+
+        coverage = float(np.mean(within)) if within else 0.0
+        assert coverage > 0.3, (
+            f"Fortran within Python's 95% CI on only "
+            f"{100*coverage:.0f}% of periods (regression bound 30%; "
+            f"residual gap is the Session 5 local-minima divergence)"
+        )
