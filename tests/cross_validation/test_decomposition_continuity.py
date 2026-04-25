@@ -225,17 +225,18 @@ class TestStrikeExampleContinuity:
         median_az = float(np.median(az_errs))
         median_tw = float(np.median(tw_errs))
         median_sh = float(np.median(sh_errs))
-        # Loose qualitative bounds for regression detection only.
-        # On strike_example, the Python single-start optimiser lands
-        # in a different local minimum from the Fortran reference for
-        # some bands; the symmetry-aware median azimuth error sits
-        # near 10 deg today. Tighter Task 7 assertions (azimuth +-1
-        # deg) await multi-start optimisation and matched band
-        # partitioning, both out of scope for this session.
-        assert median_az < 15.0, (
+        # Regression-detection bounds. Session 4 (single-start TRF)
+        # produced median azimuth error ~9.9 deg here; Session 5
+        # multi-start (default n_starts=5) tightens the median to
+        # ~6.3 deg. The maximum error is still ~33 deg at the long-
+        # period bands, where Python and Fortran converge to
+        # different valid local minima — that residual gap will
+        # close only with matched band partitioning (Session 7) and
+        # tighter optimiser tolerances (out of scope here). Tighter
+        # Task 7 assertions (azimuth +-1 deg) likewise await those.
+        assert median_az < 10.0, (
             f"median azimuth error {median_az:.2f} deg too large "
-            f"(regression bound 15 deg; investigate before "
-            f"loosening)"
+            f"(regression bound 10 deg; Session 5 baseline ~6.3 deg)"
         )
         assert median_tw < 5.0, f"median twist error {median_tw:.2f} deg too large"
         assert median_sh < 5.0, f"median shear error {median_sh:.2f} deg too large"

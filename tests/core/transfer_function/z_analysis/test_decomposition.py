@@ -23,18 +23,27 @@ from mtpy.core.transfer_function.z_analysis.decomposition import (
     _band_arrays_to_z,
     _BandResult,
     _build_bounds,
-    _build_initial_guess,
     _calc_error,
+    _canonical_initial_guess,
     _canonicalise_solution,
+    _cluster_modes,
+    _compute_mode_probabilities,
     _convz2p,
     _convz2r,
+    _DEFAULT_MODE_TOLERANCE,
+    _detect_band_disagreement,
+    _detect_primary_mode_warning,
     _estim_imp,
     _extract_bands,
     _extreme,
+    _generate_starting_points,
     _jkvar,
     _mat_multiply,
     _objfun,
+    _perturbed_initial_guess,
+    _rotated_initial_guess,
     _solve_band,
+    _solve_band_multistart,
     _unpack_x,
     _z_to_band_arrays,
     decompose,
@@ -904,17 +913,17 @@ class TestExtractBands:
             _extract_bands(np.array([1.0]), bandwidth=1.0)
 
 
-class TestBuildInitialGuess:
-    """_build_initial_guess produces a valid x0 vector."""
+class TestCanonicalInitialGuess:
+    """_canonical_initial_guess produces a valid x0 vector."""
 
     def test_shape(self):
         d = _build_synthetic_band(n_freqs=5)
-        x0 = _build_initial_guess(d["z_obs"], d["sigma"], d["periods"])
+        x0 = _canonical_initial_guess(d["z_obs"], d["sigma"], d["periods"])
         assert x0.shape == (5 + 4 * 5,)
 
     def test_distortion_starts_at_zero(self):
         d = _build_synthetic_band(n_freqs=4)
-        x0 = _build_initial_guess(d["z_obs"], d["sigma"], d["periods"])
+        x0 = _canonical_initial_guess(d["z_obs"], d["sigma"], d["periods"])
         assert x0[1] == 0.0  # twist
         assert x0[2] == 0.0  # shear
         assert x0[3] == 0.0  # log10_gain
@@ -1212,3 +1221,473 @@ class TestDecomposeEndToEnd:
         with pytest.raises(ValueError):
             # An empty window (no periods inside it)
             decompose(z, periods=(1e10, 1e11))
+
+
+class TestRotatedInitialGuess:
+    """_rotated_initial_guess produces the 90-degree symmetry alternative."""
+
+    def test_strike_rotated_by_pi_2(self):
+        d = _build_synthetic_band(n_freqs=5)
+        canonical = _canonical_initial_guess(d["z_obs"], d["sigma"], d["periods"])
+        rotated = _rotated_initial_guess(d["z_obs"], d["sigma"], d["periods"])
+        diff = (rotated[0] - canonical[0]) % np.pi
+        # Allow either pi/2 or 0 (mod pi) — rotation can wrap
+        wrap = min(abs(diff - np.pi / 2.0), abs(diff - np.pi / 2.0 + np.pi))
+        assert wrap < 1e-10
+
+    def test_te_tm_swap(self):
+        d = _build_synthetic_band(n_freqs=4)
+        canonical = _canonical_initial_guess(d["z_obs"], d["sigma"], d["periods"])
+        rotated = _rotated_initial_guess(d["z_obs"], d["sigma"], d["periods"])
+        n = 4
+        base = 5
+        # rotated's log10_rho_a slot == canonical's log10_rho_b slot
+        np.testing.assert_allclose(
+            rotated[base : base + n],
+            canonical[base + 2 * n : base + 3 * n],
+        )
+        # rotated's phase_a slot == canonical's phase_b slot
+        np.testing.assert_allclose(
+            rotated[base + n : base + 2 * n],
+            canonical[base + 3 * n : base + 4 * n],
+        )
+
+    def test_distortion_remains_zero(self):
+        d = _build_synthetic_band(n_freqs=5)
+        rotated = _rotated_initial_guess(d["z_obs"], d["sigma"], d["periods"])
+        assert rotated[1] == 0.0  # twist
+        assert rotated[2] == 0.0  # shear
+        assert rotated[3] == 0.0  # log10_gain
+        assert rotated[4] == 0.0  # anisotropy
+
+
+class TestPerturbedInitialGuess:
+    """_perturbed_initial_guess returns valid bounded perturbations."""
+
+    def test_within_bounds(self):
+        canonical = np.array([0.5, 0.0, 0.0, 0.0, 0.0, 1.0, 0.5, 1.0, 0.5])
+        lower = np.array([0.0, -1.0, -1.0, -2.0, -2.0, -3.0, 0.0, -3.0, 0.0])
+        upper = np.array([1.0, 1.0, 1.0, 2.0, 2.0, 3.0, 1.5, 3.0, 1.5])
+        rng = np.random.default_rng(0)
+        x = _perturbed_initial_guess(canonical, lower, upper, rng)
+        np.testing.assert_array_less(lower - 1e-12, x)
+        np.testing.assert_array_less(x, upper + 1e-12)
+
+    def test_reproducibility(self):
+        canonical = np.array([0.5, 0.0, 0.0, 0.0, 0.0])
+        lower = -np.ones(5)
+        upper = np.ones(5)
+        rng_a = np.random.default_rng(42)
+        rng_b = np.random.default_rng(42)
+        x_a = _perturbed_initial_guess(canonical, lower, upper, rng_a)
+        x_b = _perturbed_initial_guess(canonical, lower, upper, rng_b)
+        np.testing.assert_array_equal(x_a, x_b)
+
+    def test_perturbation_actually_perturbs(self):
+        canonical = np.array([0.5, 0.0, 0.0, 0.0, 0.0])
+        lower = -np.ones(5)
+        upper = np.ones(5)
+        rng = np.random.default_rng(123)
+        x = _perturbed_initial_guess(canonical, lower, upper, rng)
+        # At least one parameter should differ from canonical
+        assert not np.allclose(x, canonical)
+
+
+class TestGenerateStartingPoints:
+    """_generate_starting_points produces hybrid starts."""
+
+    def test_count_matches_n_starts(self):
+        d = _build_synthetic_band(n_freqs=4)
+        lower, upper = _build_bounds(4)
+        rng = np.random.default_rng(0)
+        starts = _generate_starting_points(
+            d["z_obs"], d["sigma"], d["periods"], lower, upper, 5, rng
+        )
+        assert len(starts) == 5
+
+    def test_n_starts_one_returns_only_canonical(self):
+        d = _build_synthetic_band(n_freqs=4)
+        lower, upper = _build_bounds(4)
+        rng = np.random.default_rng(0)
+        starts = _generate_starting_points(
+            d["z_obs"], d["sigma"], d["periods"], lower, upper, 1, rng
+        )
+        assert len(starts) == 1
+        canonical = np.clip(
+            _canonical_initial_guess(d["z_obs"], d["sigma"], d["periods"]),
+            lower,
+            upper,
+        )
+        np.testing.assert_array_equal(starts[0], canonical)
+
+    def test_first_two_are_canonical_and_rotated(self):
+        d = _build_synthetic_band(n_freqs=4)
+        lower, upper = _build_bounds(4)
+        rng = np.random.default_rng(0)
+        starts = _generate_starting_points(
+            d["z_obs"], d["sigma"], d["periods"], lower, upper, 5, rng
+        )
+        canonical_expected = np.clip(
+            _canonical_initial_guess(d["z_obs"], d["sigma"], d["periods"]),
+            lower,
+            upper,
+        )
+        rotated_expected = np.clip(
+            _rotated_initial_guess(d["z_obs"], d["sigma"], d["periods"]),
+            lower,
+            upper,
+        )
+        np.testing.assert_array_equal(starts[0], canonical_expected)
+        np.testing.assert_array_equal(starts[1], rotated_expected)
+
+    def test_reproducibility_same_seed(self):
+        d = _build_synthetic_band(n_freqs=4)
+        lower, upper = _build_bounds(4)
+        rng_a = np.random.default_rng(42)
+        rng_b = np.random.default_rng(42)
+        starts_a = _generate_starting_points(
+            d["z_obs"], d["sigma"], d["periods"], lower, upper, 5, rng_a
+        )
+        starts_b = _generate_starting_points(
+            d["z_obs"], d["sigma"], d["periods"], lower, upper, 5, rng_b
+        )
+        for a, b in zip(starts_a, starts_b):
+            np.testing.assert_array_equal(a, b)
+
+    def test_n_starts_zero_raises(self):
+        d = _build_synthetic_band(n_freqs=4)
+        lower, upper = _build_bounds(4)
+        rng = np.random.default_rng(0)
+        with pytest.raises(ValueError, match="n_starts must be >= 1"):
+            _generate_starting_points(
+                d["z_obs"], d["sigma"], d["periods"], lower, upper, 0, rng
+            )
+
+
+def _make_band_result_at(strike_deg, twist_deg, shear_deg, log10_gain, rms, n_freqs=4):
+    """Helper: synthesise a _BandResult with controlled canonical-form
+    parameters. Used for clustering / probability tests where we don't
+    need a real fit."""
+    n_params = 5 + 4 * n_freqs
+    x_opt = np.zeros(n_params)
+    x_opt[0] = np.radians(strike_deg)
+    x_opt[1] = np.radians(twist_deg)
+    x_opt[2] = np.radians(shear_deg)
+    x_opt[3] = log10_gain
+    x_err = np.full(n_params, 0.01)
+    x_err[4] = np.inf  # anisotropy non-identifiable
+    n_resid = 8 * n_freqs
+    residuals = np.full(n_resid, rms * np.sqrt(n_resid) / np.sqrt(n_resid))
+    chi_sq = rms * rms * n_resid
+    # Synthesise a non-degenerate Jacobian with anisotropy column zero
+    jac = np.eye(n_resid, n_params)
+    jac[:, 4] = 0.0
+    return _BandResult(
+        x_opt=x_opt,
+        x_err=x_err,
+        residuals=residuals,
+        chi_squared=chi_sq,
+        rms_misfit=rms,
+        n_iter=10,
+        converged=True,
+        cost_at_opt=0.5 * chi_sq,
+        jacobian=jac,
+    )
+
+
+class TestClusterModes:
+    """_cluster_modes correctly groups converged points."""
+
+    def test_empty_input(self):
+        assert _cluster_modes([]) == []
+
+    def test_single_result(self):
+        br = _make_band_result_at(30.0, 5.0, 3.0, 0.0, 0.5)
+        modes = _cluster_modes([br])
+        assert len(modes) == 1
+        assert modes[0].n_starts_landing_here == 1
+
+    def test_two_close_results_collapse_to_one_mode(self):
+        # Two points within 0.1 deg on every physical param -> 1 mode
+        br_a = _make_band_result_at(30.0, 5.0, 3.0, 0.0, 0.5)
+        br_b = _make_band_result_at(30.05, 5.05, 3.05, 0.005, 0.51)
+        modes = _cluster_modes([br_a, br_b])
+        assert len(modes) == 1
+        assert modes[0].n_starts_landing_here == 2
+
+    def test_two_distinct_results_yield_two_modes(self):
+        br_a = _make_band_result_at(30.0, 5.0, 3.0, 0.0, 0.5)
+        # Strike differs by 30 deg: well outside 0.5 deg tolerance
+        br_b = _make_band_result_at(60.0, 5.0, 3.0, 0.0, 0.7)
+        modes = _cluster_modes([br_a, br_b])
+        assert len(modes) == 2
+        # Modes sorted ascending by RMS
+        assert modes[0].rms_misfit < modes[1].rms_misfit
+
+    def test_rms_path_difference_does_not_split(self):
+        # Same physical params, very different RMS (1e-3 vs 1e-1) ->
+        # 1 mode under the new RMS-free clustering rule.
+        br_a = _make_band_result_at(30.0, 5.0, 3.0, 0.0, 1e-3)
+        br_b = _make_band_result_at(30.0, 5.0, 3.0, 0.0, 1e-1)
+        modes = _cluster_modes([br_a, br_b])
+        assert len(modes) == 1
+
+    def test_rms_relative_in_tolerance_warns(self):
+        br = _make_band_result_at(30.0, 5.0, 3.0, 0.0, 0.5)
+        with pytest.warns(UserWarning, match="rms_relative"):
+            _cluster_modes([br], mode_tolerance={"rms_relative": 1e-3})
+
+
+class TestComputeModeProbabilities:
+    """_compute_mode_probabilities normalised and ordered."""
+
+    def test_empty(self):
+        assert _compute_mode_probabilities([]) == []
+
+    def test_single_mode_probability_one(self):
+        br = _make_band_result_at(30.0, 5.0, 3.0, 0.0, 0.5)
+        modes = _cluster_modes([br])
+        probs = _compute_mode_probabilities(modes)
+        assert probs == [1.0]
+
+    def test_sum_to_one_two_modes(self):
+        br_a = _make_band_result_at(30.0, 5.0, 3.0, 0.0, 0.5)
+        br_b = _make_band_result_at(60.0, 5.0, 3.0, 0.0, 0.7)
+        modes = _cluster_modes([br_a, br_b])
+        probs = _compute_mode_probabilities(modes)
+        np.testing.assert_allclose(sum(probs), 1.0, atol=1e-12)
+
+    def test_lower_rms_higher_probability(self):
+        # Two modes with similar covariance structure (synthetic
+        # _BandResult uses identity jacobian shape) but different RMS;
+        # the lower-chi-squared one should win.
+        br_a = _make_band_result_at(30.0, 5.0, 3.0, 0.0, 0.1)
+        br_b = _make_band_result_at(60.0, 5.0, 3.0, 0.0, 1.0)
+        modes = _cluster_modes([br_a, br_b])
+        probs = _compute_mode_probabilities(modes)
+        assert probs[0] > probs[1]
+
+
+class TestSolveBandMultistart:
+    """_solve_band_multistart discovers modes correctly."""
+
+    def test_unimodal_problem_one_mode(self):
+        # Clean synthetic single-band fit: should converge to one mode.
+        d = _build_synthetic_band(theta_deg=30.0, n_freqs=5)
+        rng = np.random.default_rng(0)
+        modes = _solve_band_multistart(
+            d["z_obs"], d["sigma"], d["periods"], n_starts=5, rng=rng
+        )
+        assert len(modes) == 1
+        # All five starts should have landed at the primary mode
+        assert modes[0].n_starts_landing_here == 5
+
+    def test_n_starts_one_returns_one_mode(self):
+        d = _build_synthetic_band(theta_deg=30.0, n_freqs=5)
+        rng = np.random.default_rng(0)
+        modes = _solve_band_multistart(
+            d["z_obs"], d["sigma"], d["periods"], n_starts=1, rng=rng
+        )
+        assert len(modes) == 1
+        assert modes[0].n_starts_landing_here == 1
+
+    def test_primary_mode_recovers_truth(self):
+        d = _build_synthetic_band(
+            theta_deg=30.0, twist_deg=10.0, shear_deg=5.0, n_freqs=5
+        )
+        rng = np.random.default_rng(0)
+        modes = _solve_band_multistart(
+            d["z_obs"], d["sigma"], d["periods"], n_starts=5, rng=rng
+        )
+        cf = modes[0].canonical_form
+        # Truth: 30 deg in canonical [0, 90)
+        assert abs(cf["strike_deg"] - 30.0) < 1.0
+
+    def test_seed_reproducibility(self):
+        d = _build_synthetic_band(theta_deg=30.0, n_freqs=5)
+        rng_a = np.random.default_rng(7)
+        rng_b = np.random.default_rng(7)
+        modes_a = _solve_band_multistart(
+            d["z_obs"], d["sigma"], d["periods"], n_starts=5, rng=rng_a
+        )
+        modes_b = _solve_band_multistart(
+            d["z_obs"], d["sigma"], d["periods"], n_starts=5, rng=rng_b
+        )
+        assert len(modes_a) == len(modes_b)
+        for a, b in zip(modes_a, modes_b):
+            assert abs(a.rms_misfit - b.rms_misfit) < 1e-12
+
+    def test_probabilities_populated(self):
+        d = _build_synthetic_band(theta_deg=30.0, n_freqs=5)
+        rng = np.random.default_rng(0)
+        modes = _solve_band_multistart(
+            d["z_obs"], d["sigma"], d["periods"], n_starts=5, rng=rng
+        )
+        for mode in modes:
+            assert mode.probability is not None
+            assert 0.0 <= mode.probability <= 1.0
+        np.testing.assert_allclose(sum(m.probability for m in modes), 1.0, atol=1e-12)
+
+
+class TestDetectPrimaryModeWarning:
+    """_detect_primary_mode_warning fires only on close modes."""
+
+    def test_no_warning_with_single_mode(self):
+        br = _make_band_result_at(30.0, 5.0, 3.0, 0.0, 0.5)
+        modes = _cluster_modes([br])
+        triggered, _ = _detect_primary_mode_warning(
+            [(np.array([0]), modes)], threshold=1.5
+        )
+        assert triggered is False
+
+    def test_warning_when_modes_close(self):
+        br_a = _make_band_result_at(30.0, 5.0, 3.0, 0.0, 0.5)
+        br_b = _make_band_result_at(60.0, 5.0, 3.0, 0.0, 0.6)
+        modes = _cluster_modes([br_a, br_b])
+        triggered, text = _detect_primary_mode_warning(
+            [(np.array([0]), modes)], threshold=1.5
+        )
+        assert triggered is True
+        assert "modes" in text.lower()
+
+    def test_no_warning_when_modes_far(self):
+        br_a = _make_band_result_at(30.0, 5.0, 3.0, 0.0, 0.1)
+        br_b = _make_band_result_at(60.0, 5.0, 3.0, 0.0, 1.0)
+        modes = _cluster_modes([br_a, br_b])
+        triggered, _ = _detect_primary_mode_warning(
+            [(np.array([0]), modes)], threshold=1.5
+        )
+        assert triggered is False
+
+
+class TestDetectBandDisagreement:
+    """_detect_band_disagreement uses physical-params-only matcher."""
+
+    def test_none_when_single_band(self):
+        br = _make_band_result_at(30.0, 5.0, 3.0, 0.0, 0.5)
+        modes = _cluster_modes([br])
+        result = _detect_band_disagreement(
+            [(np.array([0]), modes)], _DEFAULT_MODE_TOLERANCE
+        )
+        assert result is None
+
+    def test_none_when_bands_agree_despite_different_rms(self):
+        # Two bands at the same physical parameters but with very
+        # different RMS values (because they fit different period
+        # subsets). Should NOT report disagreement under the new
+        # physical-params-only matcher.
+        br_a = _make_band_result_at(30.0, 5.0, 3.0, 0.0, 0.001)
+        br_b = _make_band_result_at(30.0, 5.0, 3.0, 0.0, 0.5)
+        modes_a = _cluster_modes([br_a])
+        modes_b = _cluster_modes([br_b])
+        result = _detect_band_disagreement(
+            [(np.array([0]), modes_a), (np.array([1]), modes_b)],
+            _DEFAULT_MODE_TOLERANCE,
+        )
+        assert result is None
+
+    def test_reports_when_strikes_disagree(self):
+        br_a = _make_band_result_at(30.0, 5.0, 3.0, 0.0, 0.5)
+        br_b = _make_band_result_at(60.0, 5.0, 3.0, 0.0, 0.5)
+        modes_a = _cluster_modes([br_a])
+        modes_b = _cluster_modes([br_b])
+        result = _detect_band_disagreement(
+            [(np.array([0]), modes_a), (np.array([1]), modes_b)],
+            _DEFAULT_MODE_TOLERANCE,
+        )
+        assert result is not None
+        assert len(result["disagreements"]) >= 1
+
+
+class TestDecomposeMultistart:
+    """decompose() with multi-start handles multi-modal cases."""
+
+    def test_default_n_starts_recorded(self):
+        z, _ = _build_synthetic_z()
+        result = decompose(z)
+        assert result.metadata["n_starts_per_band"] == 5
+
+    def test_n_starts_parameter_respected(self):
+        z, _ = _build_synthetic_z()
+        result = decompose(z, n_starts=3)
+        assert result.metadata["n_starts_per_band"] == 3
+
+    def test_n_starts_one_falls_through(self):
+        # n_starts=1 should give same behaviour as Session 4
+        # single-start (no multimodal warning, single mode per band).
+        z, _ = _build_synthetic_z()
+        result = decompose(z, n_starts=1)
+        for band_meta in result.metadata["per_band"]:
+            assert band_meta["n_modes"] == 1
+        assert result.metadata["primary_mode_warning"] is False
+
+    def test_per_band_modes_metadata_present(self):
+        z, _ = _build_synthetic_z()
+        result = decompose(z)
+        for band_meta in result.metadata["per_band"]:
+            assert "modes" in band_meta
+            assert "n_modes" in band_meta
+            assert "primary_mode_index" in band_meta
+            assert band_meta["primary_mode_index"] == 0
+            for mode in band_meta["modes"]:
+                assert "probability" in mode
+                assert "n_starts_landing_here" in mode
+                assert "canonical_form" in mode
+
+    def test_seed_reproducibility(self):
+        z, _ = _build_synthetic_z()
+        a = decompose(z, seed=99)
+        b = decompose(z, seed=99)
+        np.testing.assert_array_equal(
+            a.parameters["strike"].values, b.parameters["strike"].values
+        )
+
+    def test_recovers_session4_multimodal_case(self):
+        # Session 4 finding: theta=75, twist=15, shear=-8 had band 1
+        # land at theta=0 with single-start. With multi-start n=5,
+        # primary mode of every band should now recover theta=75
+        # (or its canonical fold, 75 in [0, 90)).
+        z, _ = _build_synthetic_z(theta_deg=75.0, twist_deg=15.0, shear_deg=-8.0)
+        result = decompose(z, n_starts=5)
+        strikes = result.parameters["strike"].values
+        finite = strikes[np.isfinite(strikes)]
+        # Median strike should be near 75 deg
+        median_strike = float(np.median(finite))
+        assert (
+            abs(median_strike - 75.0) < 5.0
+        ), f"median strike {median_strike} != 75 (multi-start failed)"
+
+    def test_return_all_modes_dataset_shape(self):
+        z, _ = _build_synthetic_z()
+        result = decompose(z, return_all_modes=True)
+        assert "mode" in result.parameters.dims
+        # Primary mode = 0, must equal the regular per-period values
+        # for the same-shape (period,) projection
+        n_periods = result.parameters.sizes["period"]
+        max_modes = result.parameters.sizes["mode"]
+        assert max_modes >= 1
+        assert result.parameters["strike"].shape == (n_periods, max_modes)
+
+    def test_rms_relative_warns(self):
+        z, _ = _build_synthetic_z()
+        with pytest.warns(UserWarning, match="rms_relative"):
+            decompose(z, mode_tolerance={"rms_relative": 1e-3})
+
+    def test_options_record_includes_multistart_params(self):
+        z, _ = _build_synthetic_z()
+        result = decompose(
+            z,
+            n_starts=3,
+            mode_warning_threshold=2.0,
+            perturbation_scale=0.2,
+        )
+        assert result.options["n_starts"] == 3
+        assert result.options["mode_warning_threshold"] == 2.0
+        assert result.options["perturbation_scale"] == 0.2
+
+    def test_band_disagreement_absent_for_consistent_synthetic(self):
+        # Synthetic with single distortion triple across 3 decades —
+        # bands should agree on primary-mode physical parameters.
+        z, _ = _build_synthetic_z(theta_deg=30.0, n_freqs=12)
+        result = decompose(z)
+        assert "band_disagreement" not in result.metadata

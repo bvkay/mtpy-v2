@@ -46,6 +46,7 @@ analysis.
 
 from __future__ import annotations
 
+import warnings
 from dataclasses import dataclass, field
 from typing import Any, TYPE_CHECKING
 
@@ -174,8 +175,13 @@ def decompose(
     initial_guess: dict[str, float] | None = None,
     realisations: int = 0,
     seed: int | None = None,
+    n_starts: int = 5,
+    mode_tolerance: dict[str, float] | None = None,
+    return_all_modes: bool = False,
+    mode_warning_threshold: float = 1.5,
+    perturbation_scale: float = 0.1,
 ) -> DecompositionResult:
-    """Single-site Groom-Bailey decomposition.
+    """Single-site Groom-Bailey decomposition with multi-start.
 
     Parameters
     ----------
@@ -214,18 +220,51 @@ def decompose(
         per Chave (2014); see module documentation.
 
     seed : int, optional
-        RNG seed for the bootstrap (PCG64). Required if
-        ``realisations > 0``.
+        RNG seed. Used both for bootstrap (when implemented) and
+        for the multi-start perturbation generation. ``None``
+        defaults to a fixed seed (42), so multi-start results are
+        reproducible by default.
+
+    n_starts : int, default 5
+        Number of optimisation starting points per band. Hybrid
+        strategy: canonical phase-tensor guess + 90-rotated guess
+        + ``n_starts - 2`` random perturbations. Default 5 is
+        sufficient for most cases; pathological multi-modal fits
+        can benefit from 10-20. Setting ``n_starts=1`` falls
+        through to single-start behaviour.
+
+    mode_tolerance : dict, optional
+        Per-parameter tolerances for clustering converged points
+        into modes. Keys: ``strike_deg`` (default 0.5),
+        ``twist_deg`` (default 0.5), ``shear_deg`` (default 0.5).
+        The previously-supported ``rms_relative`` and ``log10_gain``
+        keys are no longer used; passing either raises a
+        :class:`UserWarning` and the value is ignored. (RMS-based
+        matching was removed because of TRF path-dependent noise;
+        log10_gain because of gauge equivalence with the regional
+        impedance magnitudes at the band level.)
+
+    return_all_modes : bool, default False
+        If True, ``parameters`` includes a ``mode`` dimension with
+        per-mode parameter values per period (primary mode at
+        ``mode=0``). If False, ``parameters`` contains only the
+        primary mode, preserving the simple per-period API.
+
+    mode_warning_threshold : float, default 1.5
+        If any band's second-best mode has RMS within this factor
+        of the primary mode's RMS,
+        ``metadata['primary_mode_warning']`` is set to True with
+        explanatory text. Default 1.5 means warn when modes are
+        within 1.5x of each other.
+
+    perturbation_scale : float, default 0.1
+        Standard deviation of the Gaussian perturbation for random
+        starting points, as a fraction of the per-parameter bound
+        width.
 
     Returns
     -------
     DecompositionResult
-
-    Raises
-    ------
-    NotImplementedError
-        Until the implementation lands. See the contribution roadmap
-        in the project documentation.
 
     Notes
     -----
@@ -246,6 +285,27 @@ def decompose(
     ``z`` (e.g., for plotting). The strike-frame anti-diagonal
     representation is recoverable by rotating each period by its
     own ``-strike``.
+
+    Multi-start optimisation. The Groom-Bailey optimisation surface
+    is multi-modal: a single TRF run from one starting point can
+    converge to a local minimum that does not represent the global
+    minimum (Session 4 of the contribution observed up to 33-degree
+    azimuth errors against the Fortran reference on the canonical
+    strike_example dataset). Multi-start runs the optimiser from
+    ``n_starts`` diverse initial guesses, clusters the converged
+    points into modes by canonical-form parameters (with user-
+    configurable tolerances), and reports the lowest-RMS mode as
+    primary. Mode probabilities via the Laplace approximation are
+    stored in ``metadata['per_band'][i]['modes']``.
+
+    Primary-mode reporting. The user-facing ``parameters`` Dataset
+    and ``regional_z`` always reflect each band's primary (lowest-
+    RMS) mode. When ``metadata['primary_mode_warning']`` is True,
+    multiple modes are competitive within a band and the primary-
+    mode values may not be the best single-physical-solution
+    answer; inspect ``metadata['per_band'][i]['modes']`` for
+    alternatives. To access all modes as parallel arrays, set
+    ``return_all_modes=True``.
 
     For the McNeice-Jones multi-site joint decomposition, see
     :func:`decompose_joint`.
@@ -290,18 +350,29 @@ def decompose(
 
     bands = _extract_bands(selected_periods, bandwidth=bandwidth, overlap=overlap)
 
-    band_results = []
+    rng = np.random.default_rng(42 if seed is None else seed)
+
+    band_modes_list: list[tuple[np.ndarray, list[_Mode]]] = []
     for band_idx in bands:
         z_obs_b = z_selected[band_idx]
         sigma_b = sigma_selected[band_idx]
         periods_b = selected_periods[band_idx]
-        result = _solve_band(
+        modes = _solve_band_multistart(
             z_obs=z_obs_b,
             sigma=sigma_b,
             periods=periods_b,
+            n_starts=n_starts,
             bounds_override=bounds_override,
+            rng=rng,
+            mode_tolerance=mode_tolerance,
+            perturbation_scale=perturbation_scale,
         )
-        band_results.append((band_idx, result))
+        band_modes_list.append((band_idx, modes))
+
+    # Pick primary mode per band for the existing aggregation logic.
+    band_results = [
+        (band_idx, modes[0].band_result) for band_idx, modes in band_modes_list
+    ]
 
     n_periods = len(selected_periods)
     strike_pp = np.full(n_periods, np.nan)
@@ -557,19 +628,40 @@ def decompose(
     )
 
     per_band_metadata = []
-    for band_idx, br in band_results:
+    for band_idx, modes in band_modes_list:
+        mode_dicts = []
+        for mode in modes:
+            br_m = mode.band_result
+            mode_dicts.append(
+                {
+                    "rms_misfit": mode.rms_misfit,
+                    "chi_squared": mode.chi_squared,
+                    "n_starts_landing_here": mode.n_starts_landing_here,
+                    "probability": mode.probability,
+                    "x_opt": br_m.x_opt.tolist(),
+                    "x_err": br_m.x_err.tolist(),
+                    "converged": br_m.converged,
+                    "n_iter": br_m.n_iter,
+                    "canonical_form": mode.canonical_form,
+                }
+            )
         per_band_metadata.append(
             {
                 "band_period_indices": band_idx.tolist(),
                 "band_periods": selected_periods[band_idx].tolist(),
-                "x_opt": br.x_opt.tolist(),
-                "x_err": br.x_err.tolist(),
-                "chi_squared": br.chi_squared,
-                "rms_misfit": br.rms_misfit,
-                "converged": br.converged,
-                "n_iter": br.n_iter,
+                "modes": mode_dicts,
+                "n_modes": len(modes),
+                "primary_mode_index": 0,
             }
         )
+
+    primary_mode_warning, primary_mode_warning_text = _detect_primary_mode_warning(
+        band_modes_list, mode_warning_threshold
+    )
+    band_disagreement = _detect_band_disagreement(
+        band_modes_list, mode_tolerance or _DEFAULT_MODE_TOLERANCE
+    )
+
     metadata = {
         "convention": "clockwise from x-axis",
         "strike_range_degrees": "[0, 90)",
@@ -582,7 +674,20 @@ def decompose(
         "regional_z_frame": "measurement",
         "per_band": per_band_metadata,
         "n_bands": len(band_results),
+        "n_starts_per_band": n_starts,
+        "mode_tolerance": (
+            {k: v for k, v in (mode_tolerance or {}).items() if k != "rms_relative"}
+            or dict(_DEFAULT_MODE_TOLERANCE)
+        ),
+        "primary_mode_warning": primary_mode_warning,
     }
+    if primary_mode_warning:
+        metadata["primary_mode_warning_text"] = primary_mode_warning_text
+    if band_disagreement is not None:
+        metadata["band_disagreement"] = band_disagreement
+
+    if return_all_modes:
+        params = _build_per_mode_parameters_dataset(band_modes_list, selected_periods)
 
     options_record = {
         "periods": periods,
@@ -593,6 +698,11 @@ def decompose(
         "initial_guess": initial_guess,
         "realisations": realisations,
         "seed": seed,
+        "n_starts": n_starts,
+        "mode_tolerance": mode_tolerance,
+        "return_all_modes": return_all_modes,
+        "mode_warning_threshold": mode_warning_threshold,
+        "perturbation_scale": perturbation_scale,
     }
 
     return DecompositionResult(
@@ -1391,6 +1501,7 @@ class _BandResult:
     n_iter: int
     converged: bool
     cost_at_opt: float
+    jacobian: np.ndarray | None = None
 
 
 def _canonicalise_solution(
@@ -1619,12 +1730,12 @@ def _band_arrays_to_z(
     return z_regional, z_regional_error
 
 
-def _build_initial_guess(
+def _canonical_initial_guess(
     z_obs: np.ndarray,
     sigma: np.ndarray,
     periods: np.ndarray,
 ) -> np.ndarray:
-    """Heuristic starting point for the GB optimisation.
+    """Canonical heuristic starting point for the GB optimisation.
 
     Strategy:
       - Strike: circular median of per-period phase-tensor azimuths
@@ -1781,7 +1892,7 @@ def _solve_band(
     z_obs, sigma, periods : ndarrays
         Per-band observation arrays. See :func:`_objfun`.
     x0 : (5 + 4*n_freqs,) float64, optional
-        Initial parameter vector. Default: :func:`_build_initial_guess`,
+        Initial parameter vector. Default: :func:`_canonical_initial_guess`,
         clipped into the bounds.
     bounds : tuple of (lower, upper), optional
         Parameter bounds. Default: :func:`_build_bounds`.
@@ -1802,7 +1913,7 @@ def _solve_band(
     lower, upper = bounds
 
     if x0 is None:
-        x0 = _build_initial_guess(z_obs, sigma, periods)
+        x0 = _canonical_initial_guess(z_obs, sigma, periods)
     # Clip x0 into the bounds: scipy's TRF rejects out-of-bounds x0.
     x0 = np.clip(x0, lower, upper)
 
@@ -1854,4 +1965,674 @@ def _solve_band(
         n_iter=int(result.nfev),
         converged=int(result.status) > 0,
         cost_at_opt=float(result.cost),
+        jacobian=J,
     )
+
+
+def _rotated_initial_guess(
+    z_obs: np.ndarray,
+    sigma: np.ndarray,
+    periods: np.ndarray,
+) -> np.ndarray:
+    """Alternative initial guess at the 90-degree symmetry branch.
+
+    Same as :func:`_canonical_initial_guess` but with strike rotated
+    by ``pi/2`` (mod pi) and the per-frequency TE/TM regional
+    impedance parameters swapped. This deliberately seeds an
+    optimisation run at the alternate branch of the GB89 90-degree
+    ambiguity. Combined with the canonical guess, the pair covers
+    both sides of the dominant symmetry; if the global minimum lives
+    on the alternate branch, the optimiser starting here will find
+    it.
+
+    Parameters
+    ----------
+    z_obs : (n_freqs, 2, 2) complex128
+    sigma : (n_freqs, 2, 2) float64
+    periods : (n_freqs,) float64
+
+    Returns
+    -------
+    x0 : (5 + 4*n_freqs,) float64
+    """
+    n_freqs = len(periods)
+    canonical = _canonical_initial_guess(z_obs, sigma, periods)
+
+    rotated = canonical.copy()
+    rotated[0] = (canonical[0] + np.pi / 2.0) % np.pi
+
+    base = 5
+    log10_rho_a = canonical[base : base + n_freqs].copy()
+    phase_a = canonical[base + n_freqs : base + 2 * n_freqs].copy()
+    log10_rho_b = canonical[base + 2 * n_freqs : base + 3 * n_freqs].copy()
+    phase_b = canonical[base + 3 * n_freqs : base + 4 * n_freqs].copy()
+
+    rotated[base : base + n_freqs] = log10_rho_b
+    rotated[base + n_freqs : base + 2 * n_freqs] = phase_b
+    rotated[base + 2 * n_freqs : base + 3 * n_freqs] = log10_rho_a
+    rotated[base + 3 * n_freqs : base + 4 * n_freqs] = phase_a
+
+    return rotated
+
+
+def _perturbed_initial_guess(
+    canonical_x0: np.ndarray,
+    lower: np.ndarray,
+    upper: np.ndarray,
+    rng: np.random.Generator,
+    perturbation_scale: float = 0.1,
+) -> np.ndarray:
+    """Random Gaussian perturbation of a canonical initial guess.
+
+    Each parameter is perturbed by a Gaussian with standard
+    deviation ``perturbation_scale * (upper - lower)`` for that
+    parameter, then clipped to the bounds so scipy's TRF accepts
+    the start.
+
+    Parameters
+    ----------
+    canonical_x0 : (n_params,) float64
+    lower, upper : (n_params,) float64
+    rng : np.random.Generator
+    perturbation_scale : float, default 0.1
+        Standard deviation of the Gaussian perturbation as a
+        fraction of the bound width per parameter.
+
+    Returns
+    -------
+    x0 : (n_params,) float64
+        Perturbed and clipped.
+    """
+    bound_widths = upper - lower
+    sigma_per_param = perturbation_scale * bound_widths
+    perturbation = rng.normal(scale=sigma_per_param)
+    x0 = canonical_x0 + perturbation
+    return np.clip(x0, lower, upper)
+
+
+def _generate_starting_points(
+    z_obs: np.ndarray,
+    sigma: np.ndarray,
+    periods: np.ndarray,
+    lower: np.ndarray,
+    upper: np.ndarray,
+    n_starts: int,
+    rng: np.random.Generator,
+    perturbation_scale: float = 0.1,
+) -> list[np.ndarray]:
+    """Generate hybrid starting points for multi-start optimisation.
+
+    Strategy:
+      - Position 0: canonical phase-tensor guess (zero distortion).
+      - Position 1: 90-rotated guess (strike + pi/2 with TE/TM
+        swap), if ``n_starts >= 2``.
+      - Positions 2..n_starts-1: random Gaussian perturbations of
+        the canonical guess, scaled to the per-parameter bound
+        width.
+
+    All starts are clipped into the bounds.
+
+    Parameters
+    ----------
+    z_obs, sigma, periods : ndarrays
+        Single-band observation arrays.
+    lower, upper : (n_params,) ndarrays
+        Parameter bounds.
+    n_starts : int
+        Number of starting points. Must be >= 1.
+    rng : np.random.Generator
+        Used only for the random perturbations.
+    perturbation_scale : float, default 0.1
+
+    Returns
+    -------
+    list of (n_params,) ndarrays
+        Length ``n_starts``.
+    """
+    if n_starts < 1:
+        raise ValueError(
+            f"_generate_starting_points: n_starts must be >= 1, " f"got {n_starts}"
+        )
+
+    canonical = np.clip(_canonical_initial_guess(z_obs, sigma, periods), lower, upper)
+    starts = [canonical]
+
+    if n_starts >= 2:
+        rotated = np.clip(_rotated_initial_guess(z_obs, sigma, periods), lower, upper)
+        starts.append(rotated)
+
+    for _ in range(n_starts - 2):
+        starts.append(
+            _perturbed_initial_guess(canonical, lower, upper, rng, perturbation_scale)
+        )
+
+    return starts
+
+
+_DEFAULT_MODE_TOLERANCE = {
+    "strike_deg": 0.5,
+    "twist_deg": 0.5,
+    "shear_deg": 0.5,
+}
+# Note: log10_gain was originally intended as a fourth discriminator
+# but is gauge-equivalent at the band level (the forward model
+# satisfies (a, b, gain) -> (gain*a, gain*b, 1)), so different starts
+# converge to physically-equivalent solutions with different
+# gain/|a|/|b| splits. Including it as a clustering criterion would
+# fragment a single physical mode into multiple gauge-equivalent
+# clusters; we exclude it.
+
+
+@dataclass
+class _Mode:
+    """Internal type: one discovered mode of a multi-start fit.
+
+    Each mode collects the converged starts that landed in the same
+    physical basin (matching strike/twist/shear/gain within the
+    user-configurable tolerances). The representative
+    :class:`_BandResult` is the lowest-RMS member of the cluster.
+    """
+
+    rms_misfit: float
+    chi_squared: float
+    n_starts_landing_here: int
+    band_result: _BandResult
+    canonical_form: dict
+    probability: float | None = None
+
+
+def _canonical_form_summary(br: _BandResult) -> dict:
+    """Extract canonical-form scalar parameters for clustering.
+
+    Applies :func:`_canonicalise_solution` so that two converged
+    points differing only by the GB 90-degree symmetry produce
+    identical summaries.
+
+    Returns a dict with keys: ``strike_deg``, ``twist_deg``,
+    ``shear_deg``, ``log10_gain``, ``rms_misfit``.
+    """
+    strike_rad, twist_rad, shear_rad = _canonicalise_solution(
+        float(br.x_opt[0]), float(br.x_opt[1]), float(br.x_opt[2])
+    )
+    return {
+        "strike_deg": float(np.degrees(strike_rad)),
+        "twist_deg": float(np.degrees(twist_rad)),
+        "shear_deg": float(np.degrees(shear_rad)),
+        "log10_gain": float(br.x_opt[3]),
+        "rms_misfit": float(br.rms_misfit),
+    }
+
+
+def _modes_match_within_band(cf_a: dict, cf_b: dict, tolerance: dict) -> bool:
+    """Three physical-parameter conditions, used during clustering
+    of starts within a single band.
+
+    Two converged points within a band are the same mode when
+    strike, twist, and shear all agree within their respective
+    tolerances. We deliberately exclude log10_gain (gauge-equivalent;
+    see :data:`_DEFAULT_MODE_TOLERANCE` notes) and RMS (TRF's path-
+    dependent numerical noise produces O(1e-4) relative RMS
+    differences between starts converging to the same physical
+    basin).
+    """
+    return (
+        abs(cf_a["strike_deg"] - cf_b["strike_deg"]) <= tolerance["strike_deg"]
+        and abs(cf_a["twist_deg"] - cf_b["twist_deg"]) <= tolerance["twist_deg"]
+        and abs(cf_a["shear_deg"] - cf_b["shear_deg"]) <= tolerance["shear_deg"]
+    )
+
+
+def _modes_match_across_bands(cf_a: dict, cf_b: dict, tolerance: dict) -> bool:
+    """Same four physical-parameter conditions, used to compare
+    bands' primary modes.
+
+    The within-band and across-band matchers check the same fields
+    today; the function exists as a separate name because the
+    intents at the two call sites differ. Within a band, RMS is
+    the natural tie-breaker but we deliberately don't use it (see
+    :func:`_modes_match_within_band` notes). Across bands, RMS is
+    meaningless to compare because each band fits a different
+    period subset, so any RMS-aware matcher would always report
+    disagreement.
+    """
+    return _modes_match_within_band(cf_a, cf_b, tolerance)
+
+
+def _cluster_modes(
+    band_results: list[_BandResult],
+    mode_tolerance: dict | None = None,
+) -> list[_Mode]:
+    """Greedy clustering of converged points into modes.
+
+    Algorithm:
+      1. Compute canonical-form summary for each
+         :class:`_BandResult`.
+      2. Sort summaries ascending by RMS misfit.
+      3. The lowest-RMS point seeds mode 0 and becomes its
+         representative.
+      4. Each subsequent point is compared to all existing modes
+         via :func:`_modes_match_within_band`; if it matches any,
+         increment that mode's count, else open a new mode.
+
+    By sorting first, each mode's representative is always the
+    best converged point in its cluster.
+
+    Parameters
+    ----------
+    band_results : list of _BandResult
+    mode_tolerance : dict, optional
+        Overrides for the per-parameter tolerances. Keys:
+        ``strike_deg``, ``twist_deg``, ``shear_deg``. Defaults
+        applied for missing keys. The deprecated ``rms_relative``
+        and ``log10_gain`` keys raise :class:`UserWarning` and are
+        ignored.
+
+    Returns
+    -------
+    list of _Mode
+        Sorted ascending by RMS misfit. Mode 0 is primary.
+    """
+    if not band_results:
+        return []
+
+    tol = dict(_DEFAULT_MODE_TOLERANCE)
+    if mode_tolerance:
+        deprecated = {"rms_relative", "log10_gain"} & set(mode_tolerance)
+        if deprecated:
+            warnings.warn(
+                f"mode_tolerance keys {sorted(deprecated)} are no longer "
+                "used and will be ignored. Clustering uses strike_deg, "
+                "twist_deg, and shear_deg only: rms_relative was "
+                "fragile under TRF's path-dependent noise, and "
+                "log10_gain is gauge-equivalent with the regional "
+                "impedance magnitudes at the band level.",
+                UserWarning,
+                stacklevel=2,
+            )
+            mode_tolerance = {
+                k: v for k, v in mode_tolerance.items() if k not in deprecated
+            }
+        tol.update(mode_tolerance)
+
+    summaries = [(br, _canonical_form_summary(br)) for br in band_results]
+    summaries.sort(key=lambda x: x[1]["rms_misfit"])
+
+    modes: list[_Mode] = []
+    for br, cf in summaries:
+        matched = False
+        for mode in modes:
+            if _modes_match_within_band(mode.canonical_form, cf, tol):
+                mode.n_starts_landing_here += 1
+                matched = True
+                break
+        if not matched:
+            modes.append(
+                _Mode(
+                    rms_misfit=br.rms_misfit,
+                    chi_squared=br.chi_squared,
+                    n_starts_landing_here=1,
+                    band_result=br,
+                    canonical_form=cf,
+                )
+            )
+    return modes
+
+
+def _compute_mode_probabilities(modes: list[_Mode]) -> list[float]:
+    """Laplace approximation of mode probabilities.
+
+    For each mode i, the unnormalised log-weight is::
+
+        log_w_i = -0.5 * chi_squared_i + 0.5 * log det(cov_i)
+
+    where ``cov_i = (J_eff^T J_eff)^{-1}`` is the parameter
+    covariance restricted to identifiable parameters (the
+    anisotropy column of the Jacobian is identically zero, so we
+    drop it from the determinant calculation).
+
+    Probabilities are obtained by max-subtract on the log-weights
+    for numerical stability::
+
+        log_w_max = max(log_w_i)
+        w_i = exp(log_w_i - log_w_max)
+        p_i = w_i / sum_j w_j
+
+    Parameters
+    ----------
+    modes : list of _Mode
+        Each mode's ``band_result.jacobian`` must be populated.
+
+    Returns
+    -------
+    list of float
+        Mode probabilities, summing to 1, in the same order as
+        the input.
+
+    Notes
+    -----
+    The Laplace approximation assumes a Gaussian likelihood near
+    each mode. For MT decomposition the residuals are complex-
+    Gaussian by assumption, so the approximation is reasonable.
+
+    For modes whose effective Gram matrix is rank-deficient (more
+    than the anisotropy column unidentifiable), the determinant
+    is evaluated via eigenvalues of the pseudo-inverse with a
+    small floor.
+    """
+    if not modes:
+        return []
+    if len(modes) == 1:
+        return [1.0]
+
+    log_weights: list[float] = []
+    for mode in modes:
+        chi_sq = mode.chi_squared
+        J = mode.band_result.jacobian
+        if J is None:
+            # Should not happen in normal use; fall back to a
+            # likelihood-only weight.
+            log_weights.append(-0.5 * chi_sq)
+            continue
+        # Drop anisotropy column (index 4) from the Jacobian for
+        # the determinant: it's identically zero so det(J^T J)
+        # would otherwise be exactly zero.
+        J_eff = np.delete(J, 4, axis=1)
+        gram = J_eff.T @ J_eff
+        sign, log_det_gram = np.linalg.slogdet(gram)
+        if sign > 0:
+            log_det_cov = -log_det_gram
+        else:
+            cov = np.linalg.pinv(gram)
+            eigenvalues = np.linalg.eigvalsh(cov)
+            eigenvalues = eigenvalues[eigenvalues > 1e-30]
+            if eigenvalues.size == 0:
+                log_det_cov = -np.inf
+            else:
+                log_det_cov = float(np.sum(np.log(eigenvalues)))
+        log_weights.append(-0.5 * chi_sq + 0.5 * log_det_cov)
+
+    log_w_max = max(log_weights)
+    weights = [float(np.exp(lw - log_w_max)) for lw in log_weights]
+    total = sum(weights)
+    if total <= 0.0:
+        # Degenerate; fall back to uniform.
+        return [1.0 / len(modes)] * len(modes)
+    return [w / total for w in weights]
+
+
+def _solve_band_multistart(
+    z_obs: np.ndarray,
+    sigma: np.ndarray,
+    periods: np.ndarray,
+    n_starts: int = 5,
+    bounds: tuple[np.ndarray, np.ndarray] | None = None,
+    bounds_override: dict | None = None,
+    rng: np.random.Generator | None = None,
+    mode_tolerance: dict | None = None,
+    perturbation_scale: float = 0.1,
+    max_nfev: int = 1000,
+    ftol: float = 1e-10,
+    xtol: float = 1e-10,
+) -> list[_Mode]:
+    """Multi-start single-band optimisation.
+
+    Generates ``n_starts`` initial guesses via
+    :func:`_generate_starting_points`, runs :func:`_solve_band`
+    from each, then clusters the converged results into modes via
+    :func:`_cluster_modes`. Returns the modes sorted by RMS misfit
+    with mode probabilities populated.
+
+    Parameters
+    ----------
+    z_obs, sigma, periods : ndarrays
+        Single-band observation arrays.
+    n_starts : int, default 5
+    bounds : tuple, optional
+        Pre-computed (lower, upper) bounds; computed if None.
+    bounds_override : dict, optional
+        Passed to :func:`_build_bounds` when computing bounds.
+    rng : np.random.Generator, optional
+        Reproducibility. Defaults to ``np.random.default_rng(42)``.
+    mode_tolerance : dict, optional
+        Per-parameter tolerances for clustering.
+    perturbation_scale : float, default 0.1
+    max_nfev, ftol, xtol : optimiser parameters.
+
+    Returns
+    -------
+    list of _Mode
+        Sorted by RMS misfit. Mode 0 is primary. Mode probabilities
+        are populated on ``mode.probability``.
+
+    Raises
+    ------
+    RuntimeError
+        If every starting point's optimisation fails.
+    """
+    if rng is None:
+        rng = np.random.default_rng(42)
+
+    n_freqs = len(periods)
+    if bounds is None:
+        bounds = _build_bounds(n_freqs, bounds_override)
+    lower, upper = bounds
+
+    starting_points = _generate_starting_points(
+        z_obs,
+        sigma,
+        periods,
+        lower,
+        upper,
+        n_starts,
+        rng,
+        perturbation_scale=perturbation_scale,
+    )
+
+    band_results: list[_BandResult] = []
+    for x0 in starting_points:
+        try:
+            br = _solve_band(
+                z_obs=z_obs,
+                sigma=sigma,
+                periods=periods,
+                x0=x0,
+                bounds=bounds,
+                max_nfev=max_nfev,
+                ftol=ftol,
+                xtol=xtol,
+            )
+            band_results.append(br)
+        except Exception:
+            continue
+
+    if not band_results:
+        raise RuntimeError("_solve_band_multistart: all starting points failed")
+
+    modes = _cluster_modes(band_results, mode_tolerance)
+    probabilities = _compute_mode_probabilities(modes)
+    for mode, prob in zip(modes, probabilities):
+        mode.probability = prob
+
+    return modes
+
+
+def _detect_band_disagreement(
+    band_modes_list: list[tuple[np.ndarray, list[_Mode]]],
+    mode_tolerance: dict,
+) -> dict | None:
+    """Check whether bands' primary modes agree on physical params.
+
+    Uses :func:`_modes_match_across_bands`, which checks
+    strike/twist/shear/gain only (RMS comparison is meaningless
+    across bands fitting different period subsets).
+
+    Returns ``None`` if all primaries agree. Otherwise returns a
+    dict listing each disagreeing band pair with their canonical-
+    form summaries.
+    """
+    if len(band_modes_list) < 2:
+        return None
+
+    tol = dict(_DEFAULT_MODE_TOLERANCE)
+    if mode_tolerance:
+        # Tolerate deprecated keys silently here; _cluster_modes has
+        # already warned upstream.
+        tol.update(
+            {
+                k: v
+                for k, v in mode_tolerance.items()
+                if k not in ("rms_relative", "log10_gain")
+            }
+        )
+
+    primaries = [modes[0].canonical_form for _, modes in band_modes_list]
+
+    disagreements: list[dict] = []
+    for i in range(len(primaries)):
+        for j in range(i + 1, len(primaries)):
+            if not _modes_match_across_bands(primaries[i], primaries[j], tol):
+                disagreements.append(
+                    {
+                        "bands": [i, j],
+                        "values_i": primaries[i],
+                        "values_j": primaries[j],
+                    }
+                )
+
+    if not disagreements:
+        return None
+
+    return {
+        "disagreements": disagreements,
+        "interpretation": (
+            "Bands' primary modes disagree on canonical-form "
+            "physical parameters. This may indicate model "
+            "misspecification (deeper/shallower structure differs "
+            "across the period range) or that one band's primary "
+            "mode is not the global minimum. Inspect "
+            "metadata['per_band'] to see all modes per band."
+        ),
+    }
+
+
+def _detect_primary_mode_warning(
+    band_modes_list: list[tuple[np.ndarray, list[_Mode]]],
+    threshold: float,
+) -> tuple[bool, str]:
+    """Warn when any band's second-best mode is within ``threshold``
+    of its primary by RMS ratio.
+
+    Returns ``(True, text)`` if any band has a competitive second
+    mode, else ``(False, "")``.
+    """
+    for _, modes in band_modes_list:
+        if len(modes) < 2:
+            continue
+        ratio = modes[1].rms_misfit / max(modes[0].rms_misfit, 1e-30)
+        if ratio <= threshold:
+            text = (
+                f"At least one band discovered multiple modes within "
+                f"{threshold}x RMS of each other. Single-mode "
+                f"confidence intervals are misleading; the data does "
+                f"not strongly distinguish between competing physical "
+                f"solutions. See metadata['per_band']."
+            )
+            return True, text
+    return False, ""
+
+
+def _build_per_mode_parameters_dataset(
+    band_modes_list: list[tuple[np.ndarray, list[_Mode]]],
+    selected_periods: np.ndarray,
+) -> xr.Dataset:
+    """Build a ``(period, mode)``-shaped parameters Dataset.
+
+    For each band, each discovered mode contributes its (canonical-
+    form) band-level scalar parameters to all periods that band
+    covers, indexed by the mode's rank within the band (0 = primary).
+    Modes that don't exist for a given band are filled with NaN.
+
+    Overlapping bands: a later band's modes overwrite earlier bands'
+    modes at shared periods. This is acceptable for v1; if it
+    becomes an issue, add an explicit band index to the Dataset.
+
+    Parameters
+    ----------
+    band_modes_list : list of (band_idx, list[_Mode])
+    selected_periods : (n_periods,) float64
+
+    Returns
+    -------
+    xr.Dataset
+        Same variables as the primary-mode Dataset (strike, twist,
+        shear, gain, anisotropy, plus errors), with shape
+        ``(n_periods, max_modes)``.
+    """
+    n_periods = len(selected_periods)
+    max_modes = max((len(modes) for _, modes in band_modes_list), default=1)
+
+    shape = (n_periods, max_modes)
+    strike = np.full(shape, np.nan)
+    twist = np.full(shape, np.nan)
+    shear = np.full(shape, np.nan)
+    gain = np.full(shape, np.nan)
+    aniso = np.full(shape, np.nan)
+    strike_err = np.full(shape, np.nan)
+    twist_err = np.full(shape, np.nan)
+    shear_err = np.full(shape, np.nan)
+    gain_err = np.full(shape, np.nan)
+    aniso_err = np.full(shape, np.nan)
+
+    for band_idx, modes in band_modes_list:
+        for mode_i, mode in enumerate(modes):
+            br = mode.band_result
+            cf = mode.canonical_form
+            log10_gain = float(br.x_opt[3])
+            gain_value = 10.0**log10_gain
+            log10_gain_err = float(br.x_err[3])
+            gain_value_err = (
+                gain_value * np.log(10.0) * log10_gain_err
+                if np.isfinite(log10_gain_err)
+                else np.inf
+            )
+            for global_i in band_idx:
+                strike[global_i, mode_i] = cf["strike_deg"]
+                twist[global_i, mode_i] = cf["twist_deg"]
+                shear[global_i, mode_i] = cf["shear_deg"]
+                gain[global_i, mode_i] = gain_value
+                aniso[global_i, mode_i] = 0.0
+                strike_err[global_i, mode_i] = float(np.degrees(br.x_err[0]))
+                twist_err[global_i, mode_i] = float(np.degrees(br.x_err[1]))
+                shear_err[global_i, mode_i] = float(np.degrees(br.x_err[2]))
+                gain_err[global_i, mode_i] = gain_value_err
+
+    ds = xr.Dataset(
+        {
+            "strike": (("period", "mode"), strike),
+            "twist": (("period", "mode"), twist),
+            "shear": (("period", "mode"), shear),
+            "gain": (("period", "mode"), gain),
+            "anisotropy": (("period", "mode"), aniso),
+            "strike_error": (("period", "mode"), strike_err),
+            "twist_error": (("period", "mode"), twist_err),
+            "shear_error": (("period", "mode"), shear_err),
+            "gain_error": (("period", "mode"), gain_err),
+            "anisotropy_error": (("period", "mode"), aniso_err),
+        },
+        coords={
+            "period": selected_periods,
+            "mode": np.arange(max_modes),
+        },
+    )
+    ds["strike"].attrs.update(
+        units="degrees", range="[0, 90)", convention="clockwise from x-axis"
+    )
+    ds["twist"].attrs.update(units="degrees")
+    ds["shear"].attrs.update(units="degrees")
+    ds["gain"].attrs.update(units="dimensionless")
+    ds["anisotropy"].attrs.update(units="dimensionless", non_identifiable=True)
+    ds["period"].attrs.update(units="seconds")
+    ds["mode"].attrs.update(
+        description="Discovered mode index per band; 0 = primary (lowest RMS)"
+    )
+    return ds
