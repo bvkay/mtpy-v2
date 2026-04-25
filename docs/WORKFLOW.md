@@ -4,63 +4,64 @@ The contribution arrives in mtpy-v2 over a planned sequence of
 sessions, each producing a single commit (or rarely two) on
 `feature/groom-bailey-decomposition`. The branch pushes to
 `origin` and the PR opens against `MTgeophysics/mtpy-v2:main` after
-session 8.
+session 9.
 
 ---
 
 ## Session sequence
 
-**Session 1 — Scaffolding and governance** (this session).
-Create `decomposition.py` with `DecompositionResult` and stub
-functions raising `NotImplementedError`. Place CLAUDE.md and the
-three docs/. Add `.gitignore` rules for Claude artefacts. Add a
-single test file exercising the type round-trip contract. No
-numerics.
+**Session 1 — Scaffolding and governance** (complete, b9b1fdd).
+Module scaffold, DecompositionResult dataclass, governance docs,
+type contract tests.
 
-**Session 2 — Pure-Python kernels: simple ones**.
-Reimplement the seven trivially-portable Fortran kernels in pure
-NumPy: `mat_multiply`, `extreme`, `convz2r`, `convz2p`,
-`calc_error`, `jkvar`, `estim_imp`. Each gets a synthetic-input
-unit test. Cross-validation against the f2py-wrapped Fortran in
-`~/MT_Decomp` is established as a separate test module that skips
-when absent.
+**Session 2 — Pure-Python kernels: simple ones** (complete, 52c0bbb).
+Seven simple Fortran kernels reimplemented in NumPy with unit and
+cross-validation tests.
 
-**Session 3 — Pure-Python `objfun`**.
-The intricate kernel: residuals + analytic Jacobian for the GB
-problem. Port the formulas verbatim from the Fortran. Validate
-against the f2py-wrapped reference and against the integration
-test (estim_imp → alpha → objfun → zero residuals).
+**Session 3 — Pure-Python `objfun`** (complete, 573ef2e).
+Residuals + analytic Jacobian, validated by finite differences and
+Fortran cross-validation (kernel-level cross-validation deferred for
+objfun specifically due to convention divergence; documented in
+project memory).
 
-**Session 4 — `decompose(z: Z)` single-site driver**.
-Wire the pure-Python kernels into the banded-decomposition driver
-with `Z` as input and `DecompositionResult` as output. The numerics
-are the strike_py `_solve_band` and banded loop, ported and
-adapted. Continuity test against the Fortran reference using Task 7
-tolerances.
+**Session 4 — End-to-end single-site decomposition** (complete, c5e06f2).
+Wired Session 2-3 kernels into _solve_band, decompose(z: Z), with
+synthetic recovery, Z type-handling, and Fortran continuity tests.
+Single-start TRF; multi-modal-surface limitation acknowledged.
 
-**Session 5 — Bootstrap with Chave 2014 caveats**.
-Bootstrap CIs for direct GB parameters (g, t, e, s, θ, regional Z).
-Documentation flags reliability for direct parameters and
-unreliability for invariant-derived quantities per Chave 2014.
+**Session 5 — Multi-start optimisation** (planned).
+Add multi-start to address the multi-modal-surface limitation
+discovered in Session 4. Each band runs n_starts optimisations from
+diverse initial guesses (hybrid: canonical + 90-rotated + random
+perturbations). Modes are discovered via canonical-form clustering;
+mode probabilities computed via the Laplace approximation. Result
+metadata exposes per-band per-mode information.
 
-**Session 6 — Multi-site joint decomposition**.
-`decompose_joint(collection: MTCollection, ...)`. McNeice-Jones-
-style joint fit with shared strike and per-site distortion.
-Synthetic multi-site validation.
+This session is necessary before bootstrap because bootstrap CIs
+around a wrong local minimum are not meaningful.
 
-**Session 7 — Plotting**.
-`mtpy/imaging/plot_decomposition.py` with strike rose, twist/shear
-vs period, χ² fit, parameter bounds. Without a plot the feature
-won't get used; per the recon, this is not skippable.
+**Session 6 — Bootstrap with Chave 2014 caveats** (planned).
+Bootstrap CIs for direct GB parameters (gain, twist, shear, strike,
+regional Z) on top of multi-start. Documentation flags reliability
+for direct parameters and unreliability for invariant-derived
+quantities per Chave (2014).
 
-**Session 8 — Integration polish**.
-`Z.decompose()` and `MT.decompose()` thin methods.
-`MTCollection.decompose()` for joint fits. Final regression. PR
-preparation: clean up commits if needed, write the PR description.
+**Session 7 — Multi-site joint decomposition** (planned).
+decompose_joint(collection: MTCollection, ...). McNeice-Jones-style
+joint fit with shared strike and per-site distortion. Synthetic
+multi-site validation.
 
-After Session 8: PR opens against `MTgeophysics/mtpy-v2:main`. The
-PR review and discussion may produce follow-up sessions before
-merge.
+**Session 8 — Plotting** (planned).
+mtpy/imaging/plot_decomposition.py with strike rose, twist/shear vs
+period, chi-squared fit, parameter bounds. Per the recon, without a
+plot the feature won't get used.
+
+**Session 9 — Integration polish + PR prep** (planned).
+Z.decompose(), MT.decompose(), MTCollection.decompose() thin
+methods. Documentation, final regression, PR description.
+
+After Session 9: PR opens against MTgeophysics/mtpy-v2:main. The PR
+review may produce follow-up sessions before merge.
 
 ---
 
