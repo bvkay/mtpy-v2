@@ -13,6 +13,25 @@ strike_py reference is not present, so CI can run without it.
 The skip pattern: at module import time, attempt to add
 ``MT_DECOMP_PATH`` to ``sys.path`` and import ``strike_py.kernels``.
 If either step fails, the entire module is marked skip.
+
+Why no ``_objfun`` cross-validation. The Fortran adapter
+``objfun_wrapped`` and the Python ``_objfun`` parameterise the
+GB optimisation problem differently:
+
+- Fortran x is ``[re(a_k), im(a_k), re(b_k), im(b_k) per freq,
+  tan(twist), tan(shear), theta]`` (size ``4*n_freqs + 3``); no
+  gain or anisotropy parameter.
+- Python x is ``[theta, twist, shear, log10_gain, anisotropy,
+  log10_rho_a, phase_a, log10_rho_b, phase_b]`` (size
+  ``5 + 4*n_freqs``).
+
+Furthermore, the Fortran computes residuals in alpha-space
+(Pauli-spin combinations) with a deliberately non-standard sigma
+weighting (raw tensor-component sigma used for the combined
+alphas; see the strike_py forensic notes). Element-wise comparison
+of residual vectors or Jacobians is therefore not meaningful. The
+forward-model continuity link is provided by the ``_estim_imp``
+cross-validation below.
 """
 
 from __future__ import annotations

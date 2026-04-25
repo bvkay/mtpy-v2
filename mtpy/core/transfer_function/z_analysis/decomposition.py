@@ -578,3 +578,416 @@ def _estim_imp(
     z[0, 1] = (alpha1 - alpha2) / 2.0
     z[1, 0] = (alpha1 + alpha2) / 2.0
     return z
+
+
+def _unpack_x(
+    x: np.ndarray, n_freqs: int
+) -> tuple[
+    float,
+    float,
+    float,
+    float,
+    float,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+]:
+    """Unpack the GB optimisation state vector.
+
+    Inverse of the packing convention used by :func:`_objfun` and
+    (in a subsequent session) ``_solve_band``. Returns the named
+    parameters as a tuple, suitable for unpacking with multiple-
+    assignment.
+
+    Parameters
+    ----------
+    x : (5 + 4*n_freqs,) float ndarray
+        Flat parameter vector.
+
+        - ``x[0]`` : strike theta in radians
+        - ``x[1]`` : twist t in radians
+        - ``x[2]`` : shear e in radians
+        - ``x[3]`` : log10 of site gain g
+        - ``x[4]`` : anisotropy s (dimensionless)
+        - ``x[5 : 5 + n_freqs]`` : log10(rho_a) per frequency
+        - ``x[5 + n_freqs : 5 + 2*n_freqs]`` : phase_a (radians)
+          per frequency
+        - ``x[5 + 2*n_freqs : 5 + 3*n_freqs]`` : log10(rho_b) per
+          frequency
+        - ``x[5 + 3*n_freqs : 5 + 4*n_freqs]`` : phase_b (radians)
+          per frequency
+
+    n_freqs : int
+        Number of frequencies in the band.
+
+    Returns
+    -------
+    theta, twist, shear, log10_gain, anisotropy : float
+        Scalar parameters.
+    log10_rho_a, phase_a, log10_rho_b, phase_b : (n_freqs,) ndarray
+        Per-frequency parameters.
+
+    Raises
+    ------
+    ValueError
+        If ``len(x) != 5 + 4*n_freqs``.
+
+    Notes
+    -----
+    The packing places scalar parameters first so that the
+    optimiser's preconditioner (TRF's column scaling) can be set
+    independently for the structurally distinct parameter blocks.
+    """
+    expected_len = 5 + 4 * n_freqs
+    if x.size != expected_len:
+        raise ValueError(
+            f"_unpack_x: expected x of size {expected_len} for "
+            f"n_freqs={n_freqs}, got {x.size}"
+        )
+    theta = float(x[0])
+    twist = float(x[1])
+    shear = float(x[2])
+    log10_gain = float(x[3])
+    anisotropy = float(x[4])
+
+    base = 5
+    log10_rho_a = x[base : base + n_freqs]
+    phase_a = x[base + n_freqs : base + 2 * n_freqs]
+    log10_rho_b = x[base + 2 * n_freqs : base + 3 * n_freqs]
+    phase_b = x[base + 3 * n_freqs : base + 4 * n_freqs]
+
+    return (
+        theta,
+        twist,
+        shear,
+        log10_gain,
+        anisotropy,
+        log10_rho_a,
+        phase_a,
+        log10_rho_b,
+        phase_b,
+    )
+
+
+def _objfun(
+    x: np.ndarray,
+    z_obs: np.ndarray,
+    sigma: np.ndarray,
+    periods: np.ndarray,
+    compute_jacobian: bool = True,
+) -> tuple[np.ndarray, np.ndarray | None]:
+    """Residuals and analytic Jacobian for single-band GB optimisation.
+
+    The function :func:`scipy.optimize.least_squares` sees: given a
+    flat parameter vector ``x``, return the per-observation residuals
+    and (optionally) the analytic Jacobian.
+
+    Parameters
+    ----------
+    x : (5 + 4*n_freqs,) float ndarray
+        Flat parameter vector. See :func:`_unpack_x` for the
+        unpacking convention.
+    z_obs : (n_freqs, 2, 2) complex ndarray
+        Observed impedance tensors per frequency, in SI units.
+    sigma : (n_freqs, 2, 2) float ndarray
+        Per-component standard errors. Must be strictly positive.
+    periods : (n_freqs,) float ndarray
+        Periods in seconds, matching ``z_obs`` along axis 0.
+    compute_jacobian : bool, default True
+        If True, return the analytic Jacobian as the second element
+        of the return tuple. If False, return ``None`` for the
+        Jacobian and skip the (expensive) computation.
+
+    Returns
+    -------
+    residuals : (8*n_freqs,) float ndarray
+        Per-observation residuals, packed as
+        ``[Re(dZ_xx)/sigma, Im(dZ_xx)/sigma,
+        Re(dZ_xy)/sigma, Im(dZ_xy)/sigma,
+        Re(dZ_yx)/sigma, Im(dZ_yx)/sigma,
+        Re(dZ_yy)/sigma, Im(dZ_yy)/sigma]``
+        per frequency, in frequency order.
+    jacobian : (8*n_freqs, 5+4*n_freqs) float ndarray, or None
+        Analytic Jacobian if ``compute_jacobian``, else ``None``.
+
+    Raises
+    ------
+    ValueError
+        If ``z_obs.shape != (len(periods), 2, 2)``,
+        ``sigma.shape != z_obs.shape``,
+        ``len(x) != 5 + 4*len(periods)``, or ``sigma`` contains
+        non-positive entries.
+
+    Notes
+    -----
+    The gain parameter ``log10_gain`` enters as a multiplicative
+    factor ``g = 10**log10_gain`` on the predicted impedance:
+    ``Z_pred = g * R(theta) C T(t) S(e) Z_2D R(theta).T``. This
+    matches the strike_py convention where gain is identifiable
+    only up to the regional impedance amplitudes (the static-shift
+    ambiguity).
+
+    The anisotropy parameter ``s`` is structurally non-identifiable
+    from MT data alone (see CLAUDE.md invariant 4). It is included
+    in the parameter vector so that bounds and external
+    constraints can act on it, but the Jacobian column for ``s``
+    is exactly zero. This is documented behaviour, not a bug.
+
+    Convention divergence from the Fortran reference. The
+    ``strike_py`` Fortran ``objfun`` adapter
+    (``objfun_wrapped``) parameterises the problem differently
+    from this Python implementation: it stores impedances
+    directly as ``(re(a), im(a), re(b), im(b))`` per frequency,
+    has no gain or anisotropy parameter, and computes residuals
+    in alpha-space (Pauli-spin combinations) with a non-standard
+    sigma weighting. Because of this, element-wise comparison of
+    residual vectors or Jacobians between the two implementations
+    is not meaningful. The forward-model kernel ``_estim_imp`` is
+    cross-validated against Fortran in
+    ``tests/cross_validation/test_kernels_against_fortran.py`` --
+    that is the continuity link.
+    """
+    n_freqs = len(periods)
+
+    if z_obs.shape != (n_freqs, 2, 2):
+        raise ValueError(
+            f"_objfun: z_obs shape {z_obs.shape} does not match "
+            f"(n_freqs, 2, 2) = ({n_freqs}, 2, 2)"
+        )
+    if sigma.shape != z_obs.shape:
+        raise ValueError(
+            f"_objfun: sigma shape {sigma.shape} does not match "
+            f"z_obs shape {z_obs.shape}"
+        )
+    if x.size != 5 + 4 * n_freqs:
+        raise ValueError(
+            f"_objfun: x size {x.size} does not match "
+            f"5 + 4*n_freqs = {5 + 4 * n_freqs}"
+        )
+    if np.any(sigma <= 0):
+        raise ValueError("_objfun: sigma contains non-positive entries")
+
+    (
+        theta,
+        twist,
+        shear,
+        log10_gain,
+        _anisotropy,
+        log10_rho_a,
+        phase_a,
+        log10_rho_b,
+        phase_b,
+    ) = _unpack_x(x, n_freqs)
+
+    t = np.tan(twist)
+    e = np.tan(shear)
+    sec2_t = 1.0 / np.cos(twist) ** 2
+    sec2_e = 1.0 / np.cos(shear) ** 2
+    c2 = np.cos(2.0 * theta)
+    s2 = np.sin(2.0 * theta)
+    gain = 10.0**log10_gain
+    ln10 = np.log(10.0)
+
+    mu0 = 4.0 * np.pi * 1.0e-7
+    factor = 2.0 * np.pi * mu0
+
+    # Per-frequency complex impedances a, b from (rho, phase).
+    # |a|^2 * T = rho * factor, so |a| = sqrt(rho * factor / T).
+    rho_a = 10.0**log10_rho_a
+    rho_b = 10.0**log10_rho_b
+    abs_a = np.sqrt(rho_a * factor / periods)
+    abs_b = np.sqrt(rho_b * factor / periods)
+    a = abs_a * np.exp(1j * phase_a)
+    b = abs_b * np.exp(1j * phase_b)
+
+    residuals = np.empty(8 * n_freqs, dtype=np.float64)
+
+    if compute_jacobian:
+        jacobian = np.zeros((8 * n_freqs, 5 + 4 * n_freqs), dtype=np.float64)
+    else:
+        jacobian = None
+
+    for k in range(n_freqs):
+        a_k = a[k]
+        b_k = b[k]
+
+        alpha0 = -b_k * (e - t) + a_k * (t + e)
+        alpha1 = (
+            s2 * (-b_k * (e - t))
+            + c2 * (-b_k * (1.0 + t * e))
+            + c2 * (a_k * (1.0 - e * t))
+            - s2 * (a_k * (t + e))
+        )
+        alpha2 = -b_k * (1.0 + t * e) - a_k * (1.0 - e * t)
+        alpha3 = (
+            c2 * (-b_k * (e - t))
+            - s2 * (-b_k * (1.0 + t * e))
+            - s2 * (a_k * (1.0 - e * t))
+            - c2 * (a_k * (t + e))
+        )
+
+        z_pred = np.empty((2, 2), dtype=np.complex128)
+        z_pred[0, 0] = (alpha0 + alpha3) / 2.0
+        z_pred[1, 1] = (alpha0 - alpha3) / 2.0
+        z_pred[0, 1] = (alpha1 - alpha2) / 2.0
+        z_pred[1, 0] = (alpha1 + alpha2) / 2.0
+        z_pred = gain * z_pred
+
+        diff = z_pred - z_obs[k]
+        s_k = sigma[k]
+        residuals[8 * k + 0] = diff[0, 0].real / s_k[0, 0]
+        residuals[8 * k + 1] = diff[0, 0].imag / s_k[0, 0]
+        residuals[8 * k + 2] = diff[0, 1].real / s_k[0, 1]
+        residuals[8 * k + 3] = diff[0, 1].imag / s_k[0, 1]
+        residuals[8 * k + 4] = diff[1, 0].real / s_k[1, 0]
+        residuals[8 * k + 5] = diff[1, 0].imag / s_k[1, 0]
+        residuals[8 * k + 6] = diff[1, 1].real / s_k[1, 1]
+        residuals[8 * k + 7] = diff[1, 1].imag / s_k[1, 1]
+
+        if not compute_jacobian:
+            continue
+
+        # ------------------------------------------------------------------
+        # Partial derivatives. We compute d(alpha_i)/d(parameter) for
+        # each parameter, then build d(z_pred)/d(parameter) via the
+        # same Pauli-spin inversion used in the forward pass, scale by
+        # gain, and pack into Jacobian columns divided by sigma.
+        #
+        # d(c2)/d(theta) = -2*s2; d(s2)/d(theta) = +2*c2.
+        # alpha0 and alpha2 have no theta dependence.
+        # ------------------------------------------------------------------
+        d_alpha1_dtheta = (
+            (2.0 * c2) * (-b_k * (e - t))
+            + (-2.0 * s2) * (-b_k * (1.0 + t * e))
+            + (-2.0 * s2) * (a_k * (1.0 - e * t))
+            - (2.0 * c2) * (a_k * (t + e))
+        )
+        d_alpha3_dtheta = (
+            (-2.0 * s2) * (-b_k * (e - t))
+            - (2.0 * c2) * (-b_k * (1.0 + t * e))
+            - (2.0 * c2) * (a_k * (1.0 - e * t))
+            - (-2.0 * s2) * (a_k * (t + e))
+        )
+
+        # d(alpha)/d(t) (twist's tangent). Multiply by sec2_t for
+        # the chain through twist itself.
+        d_alpha0_dt = -b_k * (-1.0) + a_k * (1.0)
+        d_alpha1_dt = (
+            s2 * (-b_k * (-1.0))
+            + c2 * (-b_k * e)
+            + c2 * (a_k * (-e))
+            - s2 * (a_k * 1.0)
+        )
+        d_alpha2_dt = -b_k * e - a_k * (-e)
+        d_alpha3_dt = (
+            c2 * (-b_k * (-1.0))
+            - s2 * (-b_k * e)
+            - s2 * (a_k * (-e))
+            - c2 * (a_k * 1.0)
+        )
+
+        # d(alpha)/d(e) (shear's tangent). Multiply by sec2_e.
+        d_alpha0_de = -b_k * 1.0 + a_k * 1.0
+        d_alpha1_de = (
+            s2 * (-b_k * 1.0) + c2 * (-b_k * t) + c2 * (a_k * (-t)) - s2 * (a_k * 1.0)
+        )
+        d_alpha2_de = -b_k * t - a_k * (-t)
+        d_alpha3_de = (
+            c2 * (-b_k * 1.0) - s2 * (-b_k * t) - s2 * (a_k * (-t)) - c2 * (a_k * 1.0)
+        )
+
+        # alpha is linear in a and b. Coefficients used by the
+        # rho/phase chain rule below.
+        coef_a_alpha0 = t + e
+        coef_a_alpha1 = c2 * (1.0 - e * t) - s2 * (t + e)
+        coef_a_alpha2 = -(1.0 - e * t)
+        coef_a_alpha3 = -s2 * (1.0 - e * t) - c2 * (t + e)
+        coef_b_alpha0 = -(e - t)
+        coef_b_alpha1 = -s2 * (e - t) - c2 * (1.0 + t * e)
+        coef_b_alpha2 = -(1.0 + t * e)
+        coef_b_alpha3 = -c2 * (e - t) + s2 * (1.0 + t * e)
+
+        def z_from_dalpha(d0, d1, d2, d3):
+            """Build dZ/dx (2x2 complex) from dalpha_i/dx values via
+            the same Pauli-spin inversion as in the forward pass.
+            Multiplied by gain because gain enters z_pred linearly.
+            """
+            dz = np.empty((2, 2), dtype=np.complex128)
+            dz[0, 0] = (d0 + d3) / 2.0
+            dz[1, 1] = (d0 - d3) / 2.0
+            dz[0, 1] = (d1 - d2) / 2.0
+            dz[1, 0] = (d1 + d2) / 2.0
+            return gain * dz
+
+        dz_dtheta = z_from_dalpha(0.0, d_alpha1_dtheta, 0.0, d_alpha3_dtheta)
+        dz_dtwist = sec2_t * z_from_dalpha(
+            d_alpha0_dt, d_alpha1_dt, d_alpha2_dt, d_alpha3_dt
+        )
+        dz_dshear = sec2_e * z_from_dalpha(
+            d_alpha0_de, d_alpha1_de, d_alpha2_de, d_alpha3_de
+        )
+        dz_dlog10_gain = z_pred * ln10
+
+        # da/d(log10_rho_a) = a * ln(10) / 2 (since rho ~ |a|^2 and
+        # log10_rho enters via |a| = sqrt(10^log10_rho * ...)).
+        # da/d(phase_a) = i * a.
+        da_dlog10_rho = a_k * ln10 / 2.0
+        da_dphase = 1j * a_k
+        dz_dlog10_rho_a = z_from_dalpha(
+            coef_a_alpha0 * da_dlog10_rho,
+            coef_a_alpha1 * da_dlog10_rho,
+            coef_a_alpha2 * da_dlog10_rho,
+            coef_a_alpha3 * da_dlog10_rho,
+        )
+        dz_dphase_a = z_from_dalpha(
+            coef_a_alpha0 * da_dphase,
+            coef_a_alpha1 * da_dphase,
+            coef_a_alpha2 * da_dphase,
+            coef_a_alpha3 * da_dphase,
+        )
+
+        db_dlog10_rho = b_k * ln10 / 2.0
+        db_dphase = 1j * b_k
+        dz_dlog10_rho_b = z_from_dalpha(
+            coef_b_alpha0 * db_dlog10_rho,
+            coef_b_alpha1 * db_dlog10_rho,
+            coef_b_alpha2 * db_dlog10_rho,
+            coef_b_alpha3 * db_dlog10_rho,
+        )
+        dz_dphase_b = z_from_dalpha(
+            coef_b_alpha0 * db_dphase,
+            coef_b_alpha1 * db_dphase,
+            coef_b_alpha2 * db_dphase,
+            coef_b_alpha3 * db_dphase,
+        )
+
+        def pack_dz(dz):
+            """Pack a (2,2) complex partial into 8 sigma-weighted
+            real entries matching the residuals layout."""
+            return np.array(
+                [
+                    dz[0, 0].real / s_k[0, 0],
+                    dz[0, 0].imag / s_k[0, 0],
+                    dz[0, 1].real / s_k[0, 1],
+                    dz[0, 1].imag / s_k[0, 1],
+                    dz[1, 0].real / s_k[1, 0],
+                    dz[1, 0].imag / s_k[1, 0],
+                    dz[1, 1].real / s_k[1, 1],
+                    dz[1, 1].imag / s_k[1, 1],
+                ]
+            )
+
+        row_start = 8 * k
+        row_end = 8 * (k + 1)
+        jacobian[row_start:row_end, 0] = pack_dz(dz_dtheta)
+        jacobian[row_start:row_end, 1] = pack_dz(dz_dtwist)
+        jacobian[row_start:row_end, 2] = pack_dz(dz_dshear)
+        jacobian[row_start:row_end, 3] = pack_dz(dz_dlog10_gain)
+        # column 4 (anisotropy) stays zero; non-identifiable.
+        jacobian[row_start:row_end, 5 + 0 * n_freqs + k] = pack_dz(dz_dlog10_rho_a)
+        jacobian[row_start:row_end, 5 + 1 * n_freqs + k] = pack_dz(dz_dphase_a)
+        jacobian[row_start:row_end, 5 + 2 * n_freqs + k] = pack_dz(dz_dlog10_rho_b)
+        jacobian[row_start:row_end, 5 + 3 * n_freqs + k] = pack_dz(dz_dphase_b)
+
+    return residuals, jacobian

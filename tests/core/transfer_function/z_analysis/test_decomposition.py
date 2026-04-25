@@ -27,6 +27,8 @@ from mtpy.core.transfer_function.z_analysis.decomposition import (
     _extreme,
     _jkvar,
     _mat_multiply,
+    _objfun,
+    _unpack_x,
     decompose,
     decompose_joint,
     DecompositionResult,
@@ -407,3 +409,296 @@ class TestEstimImp:
         )
 
         np.testing.assert_allclose(alpha_via_z, alpha_direct, atol=1e-15)
+
+
+# ---------------------------------------------------------------------------
+# _unpack_x and _objfun: GB optimisation residuals and analytic
+# Jacobian. Three test layers below: parameter-vector indexing
+# (TestUnpackX), residual correctness at known points
+# (TestObjfunResiduals), input validation (TestObjfunValidation), and
+# analytic Jacobian validation against central finite differences
+# (TestObjfunJacobian). The Fortran reference's ``objfun_wrapped``
+# uses a fundamentally different state-vector parameterisation
+# (impedances stored as ``(re, im)`` per frequency, residuals
+# computed in alpha-space with non-standard sigma weighting). Direct
+# element-wise cross-validation is therefore not meaningful for
+# _objfun; the forward-model continuity is provided by the
+# _estim_imp cross-validation in
+# tests/cross_validation/test_kernels_against_fortran.py.
+# ---------------------------------------------------------------------------
+
+
+class TestUnpackX:
+    """_unpack_x correctly partitions the flat parameter vector."""
+
+    def test_simple_case(self):
+        n_freqs = 3
+        x = np.arange(5 + 4 * n_freqs, dtype=np.float64)
+        (
+            theta,
+            twist,
+            shear,
+            log10_gain,
+            aniso,
+            lr_a,
+            ph_a,
+            lr_b,
+            ph_b,
+        ) = _unpack_x(x, n_freqs)
+
+        assert theta == 0.0
+        assert twist == 1.0
+        assert shear == 2.0
+        assert log10_gain == 3.0
+        assert aniso == 4.0
+        np.testing.assert_array_equal(lr_a, [5, 6, 7])
+        np.testing.assert_array_equal(ph_a, [8, 9, 10])
+        np.testing.assert_array_equal(lr_b, [11, 12, 13])
+        np.testing.assert_array_equal(ph_b, [14, 15, 16])
+
+    def test_size_mismatch_raises(self):
+        x = np.zeros(10)
+        with pytest.raises(ValueError, match="expected x of size"):
+            _unpack_x(x, n_freqs=3)
+
+
+def _make_synthetic_data(
+    theta_deg=30.0,
+    twist_deg=15.0,
+    shear_deg=10.0,
+    log10_gain=0.0,
+    n_freqs=5,
+    seed=0,
+):
+    """Build a synthetic single-band problem from known parameters.
+
+    Returns ``(x, z_obs, sigma, periods)``. ``z_obs`` is the
+    forward-modelled tensor at the same parameters as ``x``, so
+    ``_objfun(x, z_obs, sigma, periods)`` should give zero
+    residuals to machine precision.
+    """
+    rng = np.random.default_rng(seed)
+    periods = np.logspace(0.0, 1.0, n_freqs)
+
+    log10_rho_a = rng.uniform(-1.0, 3.0, n_freqs)
+    phase_a = rng.uniform(0.0, np.pi / 2, n_freqs)
+    log10_rho_b = rng.uniform(-1.0, 3.0, n_freqs)
+    phase_b = rng.uniform(0.0, np.pi / 2, n_freqs)
+
+    theta = np.radians(theta_deg)
+    twist = np.radians(twist_deg)
+    shear = np.radians(shear_deg)
+
+    x = np.concatenate(
+        [
+            [theta, twist, shear, log10_gain, 0.0],
+            log10_rho_a,
+            phase_a,
+            log10_rho_b,
+            phase_b,
+        ]
+    )
+
+    mu0 = 4.0 * np.pi * 1.0e-7
+    factor = 2.0 * np.pi * mu0
+    rho_a = 10.0**log10_rho_a
+    rho_b = 10.0**log10_rho_b
+    abs_a = np.sqrt(rho_a * factor / periods)
+    abs_b = np.sqrt(rho_b * factor / periods)
+    a = abs_a * np.exp(1j * phase_a)
+    b = abs_b * np.exp(1j * phase_b)
+    gain = 10.0**log10_gain
+    t = np.tan(twist)
+    e = np.tan(shear)
+
+    z_obs = np.empty((n_freqs, 2, 2), dtype=np.complex128)
+    for k in range(n_freqs):
+        z_obs[k] = gain * _estim_imp(a[k], b[k], t, e, theta)
+
+    sigma = np.maximum(0.01 * np.abs(z_obs), 1e-12)
+    return x, z_obs, sigma, periods
+
+
+class TestObjfunResiduals:
+    """The cornerstone test: residuals are zero when x reproduces
+    the data exactly."""
+
+    def test_residuals_zero_at_truth(self):
+        x, z_obs, sigma, periods = _make_synthetic_data()
+        residuals, _ = _objfun(x, z_obs, sigma, periods, compute_jacobian=False)
+        np.testing.assert_allclose(residuals, 0.0, atol=1e-12)
+
+    def test_residuals_grow_with_perturbation(self):
+        """Perturbing strike from truth gives non-trivial residuals."""
+        x, z_obs, sigma, periods = _make_synthetic_data()
+        x_perturbed = x.copy()
+        x_perturbed[0] += np.radians(5.0)
+        residuals, _ = _objfun(
+            x_perturbed,
+            z_obs,
+            sigma,
+            periods,
+            compute_jacobian=False,
+        )
+        rms = np.sqrt(np.mean(residuals**2))
+        assert rms > 1.0
+
+    def test_residual_shape(self):
+        x, z_obs, sigma, periods = _make_synthetic_data(n_freqs=4)
+        residuals, _ = _objfun(x, z_obs, sigma, periods, compute_jacobian=False)
+        assert residuals.shape == (8 * 4,)
+
+    def test_jacobian_shape(self):
+        x, z_obs, sigma, periods = _make_synthetic_data(n_freqs=4)
+        _, jac = _objfun(x, z_obs, sigma, periods, compute_jacobian=True)
+        assert jac.shape == (8 * 4, 5 + 4 * 4)
+
+    def test_anisotropy_jacobian_column_zero(self):
+        """Column 4 (anisotropy) is identically zero by design."""
+        x, z_obs, sigma, periods = _make_synthetic_data(n_freqs=4)
+        _, jac = _objfun(x, z_obs, sigma, periods, compute_jacobian=True)
+        np.testing.assert_array_equal(jac[:, 4], 0.0)
+
+
+class TestObjfunValidation:
+    """_objfun validates its inputs."""
+
+    def test_z_obs_wrong_shape(self):
+        x = np.zeros(5 + 4 * 3)
+        z_obs = np.zeros((3, 2, 3), dtype=np.complex128)
+        sigma = np.ones((3, 2, 3))
+        periods = np.array([1.0, 2.0, 3.0])
+        with pytest.raises(ValueError, match="z_obs shape"):
+            _objfun(x, z_obs, sigma, periods)
+
+    def test_x_wrong_size(self):
+        x = np.zeros(10)
+        z_obs = np.zeros((3, 2, 2), dtype=np.complex128)
+        sigma = np.ones((3, 2, 2))
+        periods = np.array([1.0, 2.0, 3.0])
+        with pytest.raises(ValueError, match="x size"):
+            _objfun(x, z_obs, sigma, periods)
+
+    def test_nonpositive_sigma(self):
+        x = np.zeros(5 + 4 * 1)
+        z_obs = np.zeros((1, 2, 2), dtype=np.complex128)
+        sigma = np.zeros((1, 2, 2))
+        periods = np.array([1.0])
+        with pytest.raises(ValueError, match="sigma"):
+            _objfun(x, z_obs, sigma, periods)
+
+
+class TestObjfunJacobian:
+    """Analytic Jacobian agrees with central finite differences.
+
+    This is the layer that catches sign errors in the analytic
+    derivatives. Tolerance is ~1e-4 relative -- finite differences
+    at h=1e-7 give about that much accuracy on Jacobian entries
+    of typical magnitude. Anything looser hides bugs.
+    """
+
+    @staticmethod
+    def _finite_diff_jacobian(x, z_obs, sigma, periods, h=1e-7):
+        n_resid = 8 * len(periods)
+        jac = np.zeros((n_resid, len(x)))
+        for j in range(len(x)):
+            x_plus = x.copy()
+            x_plus[j] += h
+            x_minus = x.copy()
+            x_minus[j] -= h
+            r_plus, _ = _objfun(
+                x_plus,
+                z_obs,
+                sigma,
+                periods,
+                compute_jacobian=False,
+            )
+            r_minus, _ = _objfun(
+                x_minus,
+                z_obs,
+                sigma,
+                periods,
+                compute_jacobian=False,
+            )
+            jac[:, j] = (r_plus - r_minus) / (2 * h)
+        return jac
+
+    def _make_problem(
+        self,
+        theta_deg=30.0,
+        twist_deg=15.0,
+        shear_deg=10.0,
+        log10_gain=0.0,
+        n_freqs=4,
+        seed=0,
+    ):
+        """Build a synthetic problem and perturb x slightly off
+        the residuals-zero point so all derivatives are non-trivial.
+        """
+        x_true, z_obs, sigma, periods = _make_synthetic_data(
+            theta_deg=theta_deg,
+            twist_deg=twist_deg,
+            shear_deg=shear_deg,
+            log10_gain=log10_gain,
+            n_freqs=n_freqs,
+            seed=seed,
+        )
+        rng = np.random.default_rng(seed + 1000)
+        x = x_true + 0.01 * rng.normal(size=x_true.shape)
+        return x, z_obs, sigma, periods
+
+    def test_jacobian_matches_finite_diff_canonical(self):
+        x, z_obs, sigma, periods = self._make_problem()
+
+        _, jac_analytic = _objfun(x, z_obs, sigma, periods, compute_jacobian=True)
+        jac_numeric = self._finite_diff_jacobian(x, z_obs, sigma, periods, h=1e-7)
+
+        # Anisotropy column: zero analytically (by construction)
+        # and ~zero numerically (because the parameter has no
+        # effect on the model).
+        np.testing.assert_array_equal(jac_analytic[:, 4], 0.0)
+        np.testing.assert_allclose(jac_numeric[:, 4], 0.0, atol=1e-6)
+
+        # All other columns: agreement at finite-difference
+        # precision.
+        cols_to_check = [0, 1, 2, 3] + list(range(5, len(x)))
+        for j in cols_to_check:
+            col_a = jac_analytic[:, j]
+            col_n = jac_numeric[:, j]
+            scale = max(
+                np.max(np.abs(col_a)),
+                np.max(np.abs(col_n)),
+                1e-15,
+            )
+            np.testing.assert_allclose(
+                col_a,
+                col_n,
+                atol=scale * 1e-5,
+                rtol=1e-5,
+                err_msg=f"Jacobian column {j} disagrees",
+            )
+
+    @pytest.mark.parametrize("seed", [1, 17, 42])
+    def test_jacobian_at_multiple_parameter_points(self, seed):
+        """Run the Jacobian check at several points to catch
+        accidental agreement at any one location."""
+        x, z_obs, sigma, periods = self._make_problem(
+            theta_deg=20 + (10 * seed) % 60,
+            twist_deg=5 + (5 * seed) % 25,
+            shear_deg=5 + (5 * (seed + 1)) % 25,
+            seed=seed,
+        )
+        _, jac_a = _objfun(x, z_obs, sigma, periods, compute_jacobian=True)
+        jac_n = self._finite_diff_jacobian(x, z_obs, sigma, periods)
+        cols_to_check = [0, 1, 2, 3] + list(range(5, len(x)))
+        for j in cols_to_check:
+            ca = jac_a[:, j]
+            cn = jac_n[:, j]
+            scale = max(np.max(np.abs(ca)), np.max(np.abs(cn)), 1e-15)
+            np.testing.assert_allclose(
+                ca,
+                cn,
+                atol=scale * 1e-4,
+                rtol=1e-4,
+                err_msg=f"seed={seed}, column {j}",
+            )
