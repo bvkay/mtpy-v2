@@ -24,6 +24,7 @@ from mtpy.core.transfer_function.z_analysis.decomposition import (
     _BandResult,
     _bootstrap_decompose,
     _build_bounds,
+    _build_bounds_joint,
     _calc_error,
     _canonical_initial_guess,
     _canonicalise_solution,
@@ -42,6 +43,7 @@ from mtpy.core.transfer_function.z_analysis.decomposition import (
     _jkvar,
     _mat_multiply,
     _objfun,
+    _objfun_joint,
     _perturbed_initial_guess,
     _predict_z_from_primary_modes,
     _resample_residuals,
@@ -49,6 +51,7 @@ from mtpy.core.transfer_function.z_analysis.decomposition import (
     _solve_band,
     _solve_band_multistart,
     _unpack_x,
+    _unpack_x_joint,
     _z_to_band_arrays,
     decompose,
     decompose_joint,
@@ -300,18 +303,6 @@ class TestZTypeRoundTrip:
         np.testing.assert_array_equal(z_reconstructed.z, z.z)
         np.testing.assert_array_equal(z_reconstructed.z_error, z.z_error)
         np.testing.assert_array_equal(z_reconstructed.frequency, z.frequency)
-
-
-class TestDecomposeStubs:
-    """``decompose_joint`` is still a stub; ``decompose`` is
-    implemented (its contract tests live in TestDecomposeEndToEnd)."""
-
-    def test_decompose_joint_raises(self, mt_with_impedance):
-        # Pass a list with a single MT-like; decompose_joint takes
-        # MTCollection or list[MT] but raising before validation is
-        # fine for the stub test.
-        with pytest.raises(NotImplementedError, match="subsequent"):
-            decompose_joint([mt_with_impedance])
 
 
 # ---------------------------------------------------------------------------
@@ -2046,3 +2037,539 @@ class TestDecomposeBootstrap:
         assert cov_strike >= 17, f"strike coverage {cov_strike}/{n_outer} below 85%"
         assert cov_twist >= 17, f"twist coverage {cov_twist}/{n_outer} below 85%"
         assert cov_shear >= 17, f"shear coverage {cov_shear}/{n_outer} below 85%"
+
+
+# ============================================================
+# Session 7 — joint multi-site decomposition tests
+# ============================================================
+
+
+def _make_synthetic_joint_data(
+    theta_deg=30.0,
+    n_sites=3,
+    n_freqs=4,
+    seed=0,
+):
+    """Synthetic joint single-band data with known truth.
+
+    Returns
+    -------
+    x_true : (1 + 4*n_sites*(1+n_freqs),) float
+        Truth joint state vector packed in the same layout as
+        :func:`_unpack_x_joint`.
+    z_obs_per_site : (n_sites, n_freqs, 2, 2) complex128
+    sigma_per_site : (n_sites, n_freqs, 2, 2) float64
+    periods : (n_freqs,) float64
+    """
+    rng = np.random.default_rng(seed)
+    periods = np.logspace(0, 1, n_freqs)
+    theta = np.radians(theta_deg)
+
+    twist = np.radians(rng.uniform(-15, 15, n_sites))
+    shear = np.radians(rng.uniform(-10, 10, n_sites))
+    log10_gain = rng.uniform(-0.5, 0.5, n_sites)
+    anisotropy = np.zeros(n_sites)
+
+    log10_rho_a = rng.uniform(0.5, 2.5, (n_sites, n_freqs))
+    phase_a = rng.uniform(0.3, 1.4, (n_sites, n_freqs))
+    log10_rho_b = rng.uniform(0.5, 2.5, (n_sites, n_freqs))
+    phase_b = rng.uniform(0.3, 1.4, (n_sites, n_freqs))
+
+    x = np.empty(1 + 4 * n_sites * (1 + n_freqs))
+    x[0] = theta
+    for i in range(n_sites):
+        x[1 + 4 * i + 0] = twist[i]
+        x[1 + 4 * i + 1] = shear[i]
+        x[1 + 4 * i + 2] = log10_gain[i]
+        x[1 + 4 * i + 3] = anisotropy[i]
+    regional_base = 1 + 4 * n_sites
+    for i in range(n_sites):
+        site_start = regional_base + 4 * n_freqs * i
+        x[site_start : site_start + n_freqs] = log10_rho_a[i]
+        x[site_start + n_freqs : site_start + 2 * n_freqs] = phase_a[i]
+        x[site_start + 2 * n_freqs : site_start + 3 * n_freqs] = log10_rho_b[i]
+        x[site_start + 3 * n_freqs : site_start + 4 * n_freqs] = phase_b[i]
+
+    mu0 = 4.0 * np.pi * 1.0e-7
+    factor = 2.0 * np.pi * mu0
+    z_obs = np.empty((n_sites, n_freqs, 2, 2), dtype=np.complex128)
+    for i in range(n_sites):
+        t_i = np.tan(twist[i])
+        e_i = np.tan(shear[i])
+        gain_i = 10.0 ** log10_gain[i]
+        for k in range(n_freqs):
+            rho_a_ik = 10.0 ** log10_rho_a[i, k]
+            rho_b_ik = 10.0 ** log10_rho_b[i, k]
+            abs_a_ik = np.sqrt(rho_a_ik * factor / periods[k])
+            abs_b_ik = np.sqrt(rho_b_ik * factor / periods[k])
+            a_ik = abs_a_ik * np.exp(1j * phase_a[i, k])
+            b_ik = abs_b_ik * np.exp(1j * phase_b[i, k])
+            z_obs[i, k] = gain_i * _estim_imp(a_ik, b_ik, t_i, e_i, theta)
+
+    sigma = np.maximum(0.01 * np.abs(z_obs), 1e-15)
+    return x, z_obs, sigma, periods
+
+
+class TestUnpackXJoint:
+    """_unpack_x_joint correctly extracts the joint state vector."""
+
+    def test_simple_case(self):
+        n_sites, n_freqs = 2, 3
+        x = np.arange(1 + 4 * n_sites * (1 + n_freqs), dtype=float)
+        (
+            theta,
+            twist,
+            shear,
+            log10_gain,
+            aniso,
+            lr_a,
+            ph_a,
+            lr_b,
+            ph_b,
+        ) = _unpack_x_joint(x, n_sites, n_freqs)
+
+        assert theta == 0.0
+        np.testing.assert_array_equal(twist, [1.0, 5.0])
+        np.testing.assert_array_equal(shear, [2.0, 6.0])
+        np.testing.assert_array_equal(log10_gain, [3.0, 7.0])
+        np.testing.assert_array_equal(aniso, [4.0, 8.0])
+        # site 0 regional starts at 9, four blocks of n_freqs=3
+        np.testing.assert_array_equal(lr_a[0], [9, 10, 11])
+        np.testing.assert_array_equal(ph_a[0], [12, 13, 14])
+        np.testing.assert_array_equal(lr_b[0], [15, 16, 17])
+        np.testing.assert_array_equal(ph_b[0], [18, 19, 20])
+        # site 1 regional starts at 9 + 4*3 = 21
+        np.testing.assert_array_equal(lr_a[1], [21, 22, 23])
+        np.testing.assert_array_equal(ph_b[1], [30, 31, 32])
+
+    def test_size_mismatch_raises(self):
+        with pytest.raises(ValueError, match="expected x of size"):
+            _unpack_x_joint(np.zeros(10), n_sites=2, n_freqs=3)
+
+    def test_single_site_reduces_to_unpack_x(self):
+        """For n_sites=1, joint unpacking matches single-site unpacking."""
+        n_freqs = 4
+        x = np.arange(5 + 4 * n_freqs, dtype=float)
+        (
+            theta_ss,
+            twist_ss,
+            shear_ss,
+            log10_gain_ss,
+            aniso_ss,
+            lr_a_ss,
+            ph_a_ss,
+            lr_b_ss,
+            ph_b_ss,
+        ) = _unpack_x(x, n_freqs)
+        (
+            theta_j,
+            twist_j,
+            shear_j,
+            log10_gain_j,
+            aniso_j,
+            lr_a_j,
+            ph_a_j,
+            lr_b_j,
+            ph_b_j,
+        ) = _unpack_x_joint(x, n_sites=1, n_freqs=n_freqs)
+
+        assert theta_ss == theta_j
+        assert twist_ss == twist_j[0]
+        assert shear_ss == shear_j[0]
+        assert log10_gain_ss == log10_gain_j[0]
+        assert aniso_ss == aniso_j[0]
+        np.testing.assert_array_equal(lr_a_ss, lr_a_j[0])
+        np.testing.assert_array_equal(ph_a_ss, ph_a_j[0])
+        np.testing.assert_array_equal(lr_b_ss, lr_b_j[0])
+        np.testing.assert_array_equal(ph_b_ss, ph_b_j[0])
+
+
+class TestBuildBoundsJoint:
+    """_build_bounds_joint matches single-site defaults."""
+
+    def test_shape(self):
+        n_sites, n_freqs = 3, 5
+        lower, upper = _build_bounds_joint(n_sites, n_freqs)
+        n_params = 1 + 4 * n_sites * (1 + n_freqs)
+        assert lower.shape == (n_params,)
+        assert upper.shape == (n_params,)
+        assert np.all(lower < upper)
+
+    def test_strike_bounds(self):
+        lower, upper = _build_bounds_joint(2, 4)
+        assert lower[0] == 0.0
+        assert upper[0] == np.pi
+
+    def test_per_site_distortion_bounds(self):
+        n_sites = 3
+        lower, upper = _build_bounds_joint(n_sites, 3)
+        for i in range(n_sites):
+            base = 1 + 4 * i
+            # twist, shear: [-pi/4, pi/4]
+            assert lower[base + 0] == -np.pi / 4
+            assert upper[base + 0] == np.pi / 4
+            assert lower[base + 1] == -np.pi / 4
+            assert upper[base + 1] == np.pi / 4
+
+    def test_unknown_override_raises(self):
+        with pytest.raises(ValueError, match="unknown override"):
+            _build_bounds_joint(2, 4, bounds_override={"frobozz": (0, 1)})
+
+
+class TestObjfunJointResiduals:
+    """Cornerstone test: joint residuals are zero at the truth."""
+
+    def test_residuals_zero_at_truth(self):
+        x, z_obs, sigma, periods = _make_synthetic_joint_data()
+        residuals, _ = _objfun_joint(x, z_obs, sigma, periods, compute_jacobian=False)
+        np.testing.assert_allclose(residuals, 0.0, atol=1e-12)
+
+    def test_residuals_grow_with_strike_perturbation(self):
+        x, z_obs, sigma, periods = _make_synthetic_joint_data()
+        x_p = x.copy()
+        x_p[0] += np.radians(5.0)
+        residuals, _ = _objfun_joint(x_p, z_obs, sigma, periods, compute_jacobian=False)
+        rms = np.sqrt(np.mean(residuals**2))
+        assert rms > 1.0
+
+    def test_residual_shape(self):
+        n_sites, n_freqs = 3, 4
+        x, z_obs, sigma, periods = _make_synthetic_joint_data(
+            n_sites=n_sites, n_freqs=n_freqs
+        )
+        residuals, _ = _objfun_joint(x, z_obs, sigma, periods, compute_jacobian=False)
+        assert residuals.shape == (8 * n_sites * n_freqs,)
+
+    def test_jacobian_shape(self):
+        n_sites, n_freqs = 3, 4
+        x, z_obs, sigma, periods = _make_synthetic_joint_data(
+            n_sites=n_sites, n_freqs=n_freqs
+        )
+        _, jac = _objfun_joint(x, z_obs, sigma, periods, compute_jacobian=True)
+        assert jac.shape == (
+            8 * n_sites * n_freqs,
+            1 + 4 * n_sites * (1 + n_freqs),
+        )
+
+    def test_per_site_anisotropy_columns_zero(self):
+        n_sites = 3
+        x, z_obs, sigma, periods = _make_synthetic_joint_data(n_sites=n_sites)
+        _, jac = _objfun_joint(x, z_obs, sigma, periods, compute_jacobian=True)
+        for i in range(n_sites):
+            np.testing.assert_array_equal(jac[:, 1 + 4 * i + 3], 0.0)
+
+
+class TestObjfunJointValidation:
+    """_objfun_joint validates its inputs."""
+
+    def test_z_obs_3d_raises(self):
+        x = np.zeros(1 + 4 * 1 * (1 + 3))
+        z_obs = np.zeros((3, 2, 2), dtype=np.complex128)
+        sigma = np.ones((3, 2, 2))
+        periods = np.array([1.0, 2.0, 3.0])
+        with pytest.raises(ValueError, match="must be 4-D"):
+            _objfun_joint(x, z_obs, sigma, periods)
+
+    def test_x_wrong_size(self):
+        x = np.zeros(10)
+        z_obs = np.zeros((2, 3, 2, 2), dtype=np.complex128)
+        sigma = np.ones((2, 3, 2, 2))
+        periods = np.array([1.0, 2.0, 3.0])
+        with pytest.raises(ValueError, match="x size"):
+            _objfun_joint(x, z_obs, sigma, periods)
+
+    def test_nonpositive_sigma(self):
+        n_sites, n_freqs = 1, 1
+        x = np.zeros(1 + 4 * n_sites * (1 + n_freqs))
+        z_obs = np.zeros((n_sites, n_freqs, 2, 2), dtype=np.complex128)
+        sigma = np.zeros((n_sites, n_freqs, 2, 2))
+        periods = np.array([1.0])
+        with pytest.raises(ValueError, match="sigma"):
+            _objfun_joint(x, z_obs, sigma, periods)
+
+
+class TestObjfunJointJacobian:
+    """Joint analytic Jacobian agrees with central finite differences."""
+
+    @staticmethod
+    def _finite_diff_jacobian(x, z_obs, sigma, periods, h=1e-7):
+        n_resid = 8 * z_obs.shape[0] * z_obs.shape[1]
+        jac = np.zeros((n_resid, len(x)))
+        for j in range(len(x)):
+            x_p = x.copy()
+            x_p[j] += h
+            x_m = x.copy()
+            x_m[j] -= h
+            r_p, _ = _objfun_joint(x_p, z_obs, sigma, periods, compute_jacobian=False)
+            r_m, _ = _objfun_joint(x_m, z_obs, sigma, periods, compute_jacobian=False)
+            jac[:, j] = (r_p - r_m) / (2 * h)
+        return jac
+
+    @staticmethod
+    def _perturbed_problem(seed=0):
+        x_true, z_obs, sigma, periods = _make_synthetic_joint_data(seed=seed)
+        rng = np.random.default_rng(seed + 1000)
+        x = x_true + 0.01 * rng.normal(size=x_true.shape)
+        return x, z_obs, sigma, periods
+
+    def test_jacobian_matches_finite_diff(self):
+        x, z_obs, sigma, periods = self._perturbed_problem(seed=0)
+        _, jac_a = _objfun_joint(x, z_obs, sigma, periods, compute_jacobian=True)
+        jac_n = self._finite_diff_jacobian(x, z_obs, sigma, periods)
+
+        n_sites = z_obs.shape[0]
+        anisotropy_cols = {1 + 4 * i + 3 for i in range(n_sites)}
+        # Anisotropy columns: zero analytically, near-zero numerically
+        for j in anisotropy_cols:
+            np.testing.assert_array_equal(jac_a[:, j], 0.0)
+            np.testing.assert_allclose(jac_n[:, j], 0.0, atol=1e-6)
+
+        for j in range(len(x)):
+            if j in anisotropy_cols:
+                continue
+            ca = jac_a[:, j]
+            cn = jac_n[:, j]
+            scale = max(np.max(np.abs(ca)), np.max(np.abs(cn)), 1e-15)
+            np.testing.assert_allclose(
+                ca,
+                cn,
+                atol=scale * 1e-4,
+                rtol=1e-4,
+                err_msg=f"Joint Jacobian column {j}",
+            )
+
+    def test_jacobian_at_multiple_points(self):
+        for seed in [1, 17, 42]:
+            x, z_obs, sigma, periods = self._perturbed_problem(seed=seed)
+            _, jac_a = _objfun_joint(x, z_obs, sigma, periods, compute_jacobian=True)
+            jac_n = self._finite_diff_jacobian(x, z_obs, sigma, periods)
+            n_sites = z_obs.shape[0]
+            anisotropy_cols = {1 + 4 * i + 3 for i in range(n_sites)}
+            for j in range(len(x)):
+                if j in anisotropy_cols:
+                    continue
+                ca = jac_a[:, j]
+                cn = jac_n[:, j]
+                scale = max(np.max(np.abs(ca)), np.max(np.abs(cn)), 1e-15)
+                np.testing.assert_allclose(
+                    ca,
+                    cn,
+                    atol=scale * 1e-3,
+                    rtol=1e-3,
+                    err_msg=f"seed={seed}, column {j}",
+                )
+
+
+class TestObjfunJointSingleSiteReduction:
+    """For n_sites=1, _objfun_joint produces residuals and Jacobian
+    bit-for-bit identical to _objfun (the layouts coincide)."""
+
+    def test_residuals_match(self):
+        n_freqs = 4
+        x_ss, z_obs_ss, sigma_ss, periods = _make_synthetic_data(n_freqs=n_freqs)
+        z_obs_j = z_obs_ss[None, ...]
+        sigma_j = sigma_ss[None, ...]
+        x_j = x_ss.copy()
+
+        r_ss, _ = _objfun(x_ss, z_obs_ss, sigma_ss, periods, compute_jacobian=False)
+        r_j, _ = _objfun_joint(x_j, z_obs_j, sigma_j, periods, compute_jacobian=False)
+        np.testing.assert_allclose(r_ss, r_j, atol=1e-15)
+
+    def test_jacobian_matches(self):
+        n_freqs = 4
+        x_ss, z_obs_ss, sigma_ss, periods = _make_synthetic_data(n_freqs=n_freqs)
+        rng = np.random.default_rng(0)
+        x_ss = x_ss + 0.01 * rng.normal(size=x_ss.shape)
+
+        z_obs_j = z_obs_ss[None, ...]
+        sigma_j = sigma_ss[None, ...]
+        x_j = x_ss.copy()
+
+        _, jac_ss = _objfun(x_ss, z_obs_ss, sigma_ss, periods, compute_jacobian=True)
+        _, jac_j = _objfun_joint(x_j, z_obs_j, sigma_j, periods, compute_jacobian=True)
+        np.testing.assert_allclose(jac_ss, jac_j, atol=1e-15)
+
+
+def _make_synthetic_joint_collection(
+    theta_deg=30.0,
+    n_sites=3,
+    n_freqs=12,
+    seed=0,
+):
+    """Synthetic list[MT-like] for joint end-to-end tests.
+
+    Returns a list of objects with ``.station`` and ``.Z`` matching
+    what ``_normalise_collection_input`` expects.
+    """
+    x_true, z_obs, sigma, periods = _make_synthetic_joint_data(
+        theta_deg=theta_deg,
+        n_sites=n_sites,
+        n_freqs=n_freqs,
+        seed=seed,
+    )
+    frequencies = 1.0 / periods
+
+    class _MTLike:
+        def __init__(self, station, z, z_error, frequency):
+            self.station = station
+            self.Z = Z(z=z, z_error=z_error, frequency=frequency)
+
+    return (
+        [_MTLike(f"s{i}", z_obs[i], sigma[i], frequencies) for i in range(n_sites)],
+        {
+            "true_strike_deg": theta_deg,
+            "n_sites": n_sites,
+            "n_freqs": n_freqs,
+            "x_true": x_true,
+        },
+    )
+
+
+class TestDecomposeJointEndToEnd:
+    """decompose_joint() recovers known parameters from synthetic data."""
+
+    def test_returns_decomposition_result(self):
+        stations, _ = _make_synthetic_joint_collection()
+        result = decompose_joint(stations, n_starts=2)
+        assert isinstance(result, DecompositionResult)
+        assert result.method == "mcneice_jones_joint"
+        assert result.frame == "measurement"
+
+    def test_recovers_shared_strike_within_5_deg(self):
+        stations, truth = _make_synthetic_joint_collection(theta_deg=45.0)
+        result = decompose_joint(stations, n_starts=2)
+        median_strike = float(np.nanmedian(result.parameters["strike"].values))
+        diff = min(
+            abs(median_strike - 45.0),
+            abs(median_strike - 45.0 - 90.0),
+            abs(median_strike - 45.0 + 90.0),
+        )
+        assert diff < 5.0, f"median strike {median_strike} not within 5 deg of 45"
+
+    def test_strike_has_no_station_dim(self):
+        stations, _ = _make_synthetic_joint_collection()
+        result = decompose_joint(stations, n_starts=2)
+        assert "station" not in result.parameters["strike"].dims
+        assert "period" in result.parameters["strike"].dims
+
+    def test_per_site_params_have_station_dim(self):
+        stations, truth = _make_synthetic_joint_collection(n_sites=3)
+        result = decompose_joint(stations, n_starts=2)
+        for name in ("twist", "shear", "gain", "anisotropy"):
+            assert "station" in result.parameters[name].dims
+            assert result.parameters[name].sizes["station"] == 3
+
+    def test_regional_z_is_dict(self):
+        stations, _ = _make_synthetic_joint_collection(n_sites=3)
+        result = decompose_joint(stations, n_starts=2)
+        assert isinstance(result.regional_z, dict)
+        assert len(result.regional_z) == 3
+        for sid, z in result.regional_z.items():
+            assert isinstance(z, Z)
+
+    def test_metadata_has_joint_keys(self):
+        stations, _ = _make_synthetic_joint_collection(n_sites=3)
+        result = decompose_joint(stations, n_starts=2)
+        assert result.metadata["n_sites"] == 3
+        assert result.metadata["strike_sharing"] == "per_band_shared"
+        assert result.metadata["mode_clustering"] == "all_sites_agree"
+        assert result.metadata["regional_z_format"] == "dict"
+        assert "per_band" in result.metadata
+        assert len(result.metadata["station_ids"]) == 3
+
+    def test_strike_sharing_invalid_raises(self):
+        stations, _ = _make_synthetic_joint_collection(n_sites=2)
+        with pytest.raises(NotImplementedError, match="strike_sharing"):
+            decompose_joint(stations, strike_sharing="survey_global")
+
+    def test_mode_clustering_invalid_raises(self):
+        stations, _ = _make_synthetic_joint_collection(n_sites=2)
+        with pytest.raises(NotImplementedError, match="mode_clustering"):
+            decompose_joint(stations, mode_clustering="majority_sites_agree")
+
+    def test_regional_z_format_invalid_raises(self):
+        stations, _ = _make_synthetic_joint_collection(n_sites=2)
+        with pytest.raises(NotImplementedError, match="regional_z_format"):
+            decompose_joint(stations, regional_z_format="mtcollection")
+
+    def test_ci_method_invalid_raises(self):
+        stations, _ = _make_synthetic_joint_collection(n_sites=2)
+        with pytest.raises(NotImplementedError, match="ci_method"):
+            decompose_joint(stations, ci_method="bca")
+
+    def test_empty_stations_raises(self):
+        with pytest.raises(ValueError, match="no stations"):
+            decompose_joint([])
+
+    def test_inconsistent_frequency_grids_raises(self):
+        stations, _ = _make_synthetic_joint_collection(n_sites=2, n_freqs=4)
+        # Replace second station's frequency grid with a different one
+        stations[1].Z = Z(
+            z=np.asarray(stations[1].Z.z),
+            z_error=np.asarray(stations[1].Z.z_error),
+            frequency=np.asarray(stations[1].Z.frequency) * 2.0,
+        )
+        with pytest.raises(ValueError, match="different frequency grid"):
+            decompose_joint(stations)
+
+
+class TestDecomposeJointSingleSiteReduction:
+    """Cornerstone reduction test: decompose_joint(n_sites=1) matches
+    decompose() on the same data within numerical tolerance."""
+
+    def test_strike_matches(self):
+        # Build a single-site synthetic dataset
+        stations, _ = _make_synthetic_joint_collection(n_sites=1, n_freqs=12)
+        z = stations[0].Z
+        result_joint = decompose_joint(stations, n_starts=2, seed=0)
+        result_ss = decompose(z, n_starts=2, seed=0)
+
+        # Compare per-period strike (joint has shape (n_periods,) too)
+        strike_joint = result_joint.parameters["strike"].values
+        strike_ss = result_ss.parameters["strike"].values
+        finite = np.isfinite(strike_joint) & np.isfinite(strike_ss)
+        # Allow up to 1 deg disagreement (canonical-form folding,
+        # band-aggregation differences for single-site).
+        np.testing.assert_allclose(strike_joint[finite], strike_ss[finite], atol=1.0)
+
+    def test_per_site_distortion_matches_single_site(self):
+        stations, _ = _make_synthetic_joint_collection(n_sites=1, n_freqs=12)
+        z = stations[0].Z
+        result_joint = decompose_joint(stations, n_starts=2, seed=0)
+        result_ss = decompose(z, n_starts=2, seed=0)
+        # Joint twist has shape (n_periods, 1); ss has (n_periods,)
+        twist_joint = result_joint.parameters["twist"].values[:, 0]
+        twist_ss = result_ss.parameters["twist"].values
+        finite = np.isfinite(twist_joint) & np.isfinite(twist_ss)
+        np.testing.assert_allclose(twist_joint[finite], twist_ss[finite], atol=0.5)
+
+
+class TestDecomposeJointBootstrap:
+    """Smoke test: decompose_joint with realisations > 0 produces CI fields."""
+
+    def test_realisations_zero_no_ci_fields(self):
+        stations, _ = _make_synthetic_joint_collection(n_sites=2)
+        result = decompose_joint(stations, realisations=0, n_starts=2)
+        assert "strike_ci_lower" not in result.parameters
+        assert "bootstrap_replicates" not in result.metadata
+
+    def test_realisations_positive_adds_ci_fields(self):
+        stations, _ = _make_synthetic_joint_collection(n_sites=2, n_freqs=4)
+        result = decompose_joint(stations, realisations=3, n_starts=2, seed=42)
+        for name in ("strike", "twist", "shear", "gain"):
+            assert f"{name}_ci_lower" in result.parameters
+            assert f"{name}_ci_upper" in result.parameters
+        # Strike has no station dim; per-site CIs do
+        assert "station" not in result.parameters["strike_ci_lower"].dims
+        assert "station" in result.parameters["twist_ci_lower"].dims
+
+    def test_metadata_populated(self):
+        stations, _ = _make_synthetic_joint_collection(n_sites=2, n_freqs=4)
+        result = decompose_joint(stations, realisations=3, n_starts=2, seed=42)
+        assert result.metadata["bootstrap_realisations"] == 3
+        assert result.metadata["bootstrap_ci_method"] == "percentile"
+        assert "bootstrap_replicates" in result.metadata
+        assert "bootstrap_caveats" in result.metadata
+        replicas = result.metadata["bootstrap_replicates"]
+        assert replicas["strike"].shape[0] == 3
+        assert replicas["twist"].shape == (3, 4, 2)

@@ -835,7 +835,7 @@ def decompose(
 
 
 def decompose_joint(
-    collection: "MTCollection | list[MT]",
+    collection_or_list: "MTCollection | list[MT]",
     periods: tuple[float, float] | None = None,
     bandwidth: float = 1.0,
     overlap: float = 0.0,
@@ -844,42 +844,523 @@ def decompose_joint(
     initial_guess: dict[str, float] | None = None,
     realisations: int = 0,
     seed: int | None = None,
+    n_starts: int = 5,
+    mode_tolerance: dict[str, float] | None = None,
+    return_all_modes: bool = False,
+    mode_warning_threshold: float = 1.5,
+    perturbation_scale: float = 0.1,
+    ci_level: float = 0.95,
+    ci_method: str = "percentile",
+    strike_sharing: str = "per_band_shared",
+    mode_clustering: str = "all_sites_agree",
+    regional_z_format: str = "dict",
 ) -> DecompositionResult:
     """Multi-site joint Groom-Bailey decomposition (McNeice & Jones, 2001).
 
-    Fits a single shared regional strike across all sites, with
-    per-site distortion parameters and per-site regional
-    impedances.
+    Fits a single shared regional strike per band across all sites,
+    with per-site distortion (twist, shear, gain) and per-site per-
+    frequency regional impedance.
 
     Parameters
     ----------
-    collection : MTCollection or list of MT
-        Multi-site input. ``MTCollection`` is MTH5-backed;
-        ``list[MT]`` is in-memory.
-
+    collection_or_list : MTCollection or list of MT
+        Multi-site input. List-of-MT path is the primary supported
+        entry; MTCollection is supported via its ``dataframe`` and
+        ``get_tf`` interface. All stations must share a common
+        frequency grid.
     periods, bandwidth, overlap, norm_type, bounds_override,
-    initial_guess, realisations, seed
+    initial_guess, realisations, seed, n_starts, mode_tolerance,
+    return_all_modes, mode_warning_threshold, perturbation_scale,
+    ci_level, ci_method
         See :func:`decompose`.
+
+    Future-scope parameters
+    -----------------------
+    strike_sharing : str, default ``'per_band_shared'``
+        How regional strike is shared across stations. Currently
+        only ``'per_band_shared'`` is implemented (one strike per
+        band, shared across all stations within the band). Planned:
+        ``'survey_global'`` (single strike across all bands and
+        stations), ``'per_station_smoothed'`` (regional
+        decomposition with spatial smoothness prior),
+        ``'per_band_per_station_unconstrained'`` (no sharing). Other
+        values raise :class:`NotImplementedError`.
+    mode_clustering : str, default ``'all_sites_agree'``
+        Predicate for grouping multi-start replicas into modes.
+        Currently only ``'all_sites_agree'`` is implemented (every
+        site's (twist, shear) must agree for two replicas to be the
+        same mode). Planned: ``'majority_sites_agree'``,
+        ``'strike_only'``. Other values raise
+        :class:`NotImplementedError`.
+    regional_z_format : str, default ``'dict'``
+        Format for ``result.regional_z``. Currently only ``'dict'``
+        (``dict[station_id, Z]``). Planned: ``'mtcollection'``
+        (returns a fresh ``MTCollection``). Other values raise
+        :class:`NotImplementedError`.
 
     Returns
     -------
     DecompositionResult
-        With an additional ``station`` coordinate on
-        ``parameters`` and ``regional_z`` per-station.
+        ``parameters`` is an :class:`xarray.Dataset` with mixed
+        dimensionality:
 
-    Raises
-    ------
-    NotImplementedError
-        Until the implementation lands.
+        - ``strike``, ``strike_error`` (and optional bootstrap CI
+          fields): shape ``(period,)`` — shared across stations
+        - ``twist``, ``shear``, ``gain``, ``anisotropy`` (with
+          ``_error`` and CI fields): shape ``(period, station)``
+
+        ``regional_z`` is ``dict[station_id, Z]`` (per
+        ``regional_z_format``).
+        ``method`` is ``'mcneice_jones_joint'``.
 
     Notes
     -----
-    See :func:`decompose` for the single-site equivalent and for the
-    documentation of conventions.
+    Joint single-band optimisation has roughly ``1 + 4*n_sites*(1 +
+    n_freqs)`` parameters. With 5 sites and 5 freqs/band, that is
+    ~120 parameters per band. TRF with the analytic Jacobian handles
+    this efficiently; per-band fits typically converge in well under
+    a second. Bootstrap multiplies cost by ``realisations`` (default
+    when opted in: 100). Recommend exploratory analysis with
+    ``realisations=0`` and ``n_starts=2``.
+
+    For ``n_sites == 1``, joint decomposition reduces to single-site
+    :func:`decompose` modulo the result data structure (verified by
+    ``TestDecomposeJointSingleSiteReduction``).
+
+    Bootstrap scope. This session ships strike/twist/shear/gain
+    bootstrap CIs as ``parameters`` Dataset fields. Per-station
+    regional Z bootstrap CIs are not stored on the Dataset (they
+    would require five-dimensional arrays); the per-replica
+    primary-mode parameters are available in
+    ``metadata['bootstrap_replicates']`` for custom analysis.
+
+    References
+    ----------
+    McNeice, G. W., & Jones, A. G. (2001). Multisite, multifrequency
+    tensor decomposition of magnetotelluric data. Geophysics, 66(1),
+    158-173.
     """
-    raise NotImplementedError(
-        "Multi-site joint decomposition implementation lands in a "
-        "subsequent contribution session. See the project roadmap."
+    from mtpy.core.transfer_function.z import Z as _Z
+
+    if strike_sharing != "per_band_shared":
+        raise NotImplementedError(
+            f"strike_sharing={strike_sharing!r} is planned future work; "
+            f"only 'per_band_shared' is currently implemented."
+        )
+    if mode_clustering != "all_sites_agree":
+        raise NotImplementedError(
+            f"mode_clustering={mode_clustering!r} is planned future "
+            f"work; only 'all_sites_agree' is currently implemented."
+        )
+    if regional_z_format != "dict":
+        raise NotImplementedError(
+            f"regional_z_format={regional_z_format!r} is planned "
+            f"future work; only 'dict' is currently implemented."
+        )
+    if ci_method != "percentile":
+        raise NotImplementedError(
+            f"ci_method={ci_method!r} not implemented; only "
+            f"'percentile' is supported."
+        )
+
+    stations = _normalise_collection_input(collection_or_list)
+    _validate_joint_input(stations)
+
+    n_sites = len(stations)
+    station_ids = [sid for sid, _ in stations]
+    ref_z = stations[0][1]
+    frequencies = np.asarray(ref_z.frequency, dtype=np.float64)
+    all_periods = 1.0 / frequencies
+
+    if periods is not None:
+        permin, permax = periods
+        period_mask = (all_periods >= permin) & (all_periods <= permax)
+    else:
+        period_mask = np.ones(len(all_periods), dtype=bool)
+    if not period_mask.any():
+        raise ValueError(f"decompose_joint: no periods in window {periods}")
+
+    selected_periods = all_periods[period_mask]
+    sort_idx = np.argsort(selected_periods)
+    selected_periods = selected_periods[sort_idx]
+    n_periods = len(selected_periods)
+
+    z_per_site = np.empty((n_sites, n_periods, 2, 2), dtype=np.complex128)
+    sigma_per_site = np.empty((n_sites, n_periods, 2, 2), dtype=np.float64)
+    for i, (_, z) in enumerate(stations):
+        z_full = np.asarray(z.z, dtype=np.complex128)[period_mask]
+        sigma_full = np.asarray(z.z_error, dtype=np.float64)[period_mask]
+        z_per_site[i] = z_full[sort_idx]
+        sigma_per_site[i] = sigma_full[sort_idx]
+
+    bands = _extract_bands(selected_periods, bandwidth=bandwidth, overlap=overlap)
+
+    rng = np.random.default_rng(42 if seed is None else seed)
+
+    band_modes_list = _decompose_bands_with_modes_joint(
+        z_obs_per_site_full=z_per_site,
+        sigma_per_site_full=sigma_per_site,
+        selected_periods=selected_periods,
+        bands=bands,
+        n_starts=n_starts,
+        bounds_override=bounds_override,
+        rng=rng,
+        mode_tolerance=mode_tolerance,
+        perturbation_scale=perturbation_scale,
+    )
+
+    # Aggregation: pick each band's primary mode, expand band-level
+    # scalars to per-period values, build per-site arrays.
+    strike_pp = np.full(n_periods, np.nan)
+    strike_err_pp = np.full(n_periods, np.nan)
+    twist_pp = np.full((n_periods, n_sites), np.nan)
+    shear_pp = np.full((n_periods, n_sites), np.nan)
+    gain_pp = np.full((n_periods, n_sites), np.nan)
+    aniso_pp = np.zeros((n_periods, n_sites))
+    twist_err_pp = np.full((n_periods, n_sites), np.nan)
+    shear_err_pp = np.full((n_periods, n_sites), np.nan)
+    gain_err_pp = np.full((n_periods, n_sites), np.nan)
+    aniso_err_pp = np.full((n_periods, n_sites), np.nan)
+    chi_squared_pp = np.full(n_periods, np.nan)
+
+    # Per-site per-period regional Z (measurement frame)
+    z_regional_per_site = np.full(
+        (n_sites, n_periods, 2, 2), np.nan, dtype=np.complex128
+    )
+
+    # For overlapping bands, lower-RMS band wins per period.
+    best_rms_per_period = np.full(n_periods, np.inf)
+
+    mu0 = 4.0 * np.pi * 1.0e-7
+    factor = 2.0 * np.pi * mu0
+
+    for band_idx, modes in band_modes_list:
+        primary = modes[0]
+        br = primary.band_result
+        n_band_freqs = len(band_idx)
+        band_periods = selected_periods[band_idx]
+
+        cf = _canonical_form_summary_joint(br, n_sites, n_band_freqs)
+        strike_can_rad = np.radians(cf["strike_deg"])
+        per_site_twist_rad = np.radians(cf["per_site_twist_deg"])
+        per_site_shear_rad = np.radians(cf["per_site_shear_deg"])
+        per_site_log10_gain = cf["per_site_log10_gain"]
+
+        # Per-band Jacobian-based parameter errors
+        x_err = br.x_err
+        strike_err_rad = float(x_err[0])
+        per_site_twist_err_rad = np.array(
+            [float(x_err[1 + 4 * i + 0]) for i in range(n_sites)]
+        )
+        per_site_shear_err_rad = np.array(
+            [float(x_err[1 + 4 * i + 1]) for i in range(n_sites)]
+        )
+        per_site_log10_gain_err = np.array(
+            [float(x_err[1 + 4 * i + 2]) for i in range(n_sites)]
+        )
+
+        # Regional Z per site at each band period (measurement frame)
+        unpacked = _unpack_x_joint(br.x_opt, n_sites, n_band_freqs)
+        log10_rho_a_band = unpacked[5]
+        phase_a_band = unpacked[6]
+        log10_rho_b_band = unpacked[7]
+        phase_b_band = unpacked[8]
+
+        c, s = np.cos(strike_can_rad), np.sin(strike_can_rad)
+        R = np.array([[c, -s], [s, c]])
+
+        for i in range(n_sites):
+            rho_a_i = 10.0 ** log10_rho_a_band[i]
+            rho_b_i = 10.0 ** log10_rho_b_band[i]
+            abs_a_i = np.sqrt(rho_a_i * factor / band_periods)
+            abs_b_i = np.sqrt(rho_b_i * factor / band_periods)
+            a_band_i = abs_a_i * np.exp(1j * phase_a_band[i])
+            b_band_i = abs_b_i * np.exp(1j * phase_b_band[i])
+
+            for local_k, global_k in enumerate(band_idx):
+                if primary.rms_misfit >= best_rms_per_period[global_k]:
+                    continue
+                z_strike = np.array(
+                    [
+                        [0.0, a_band_i[local_k]],
+                        [-b_band_i[local_k], 0.0],
+                    ],
+                    dtype=np.complex128,
+                )
+                z_regional_per_site[i, global_k] = R @ z_strike @ R.T
+
+        # Per-period scalars: take this band's values at each period
+        # it covers (lower-RMS wins on overlap).
+        for local_k, global_k in enumerate(band_idx):
+            if primary.rms_misfit >= best_rms_per_period[global_k]:
+                continue
+            best_rms_per_period[global_k] = primary.rms_misfit
+            strike_pp[global_k] = np.degrees(strike_can_rad)
+            strike_err_pp[global_k] = np.degrees(strike_err_rad)
+            for i in range(n_sites):
+                twist_pp[global_k, i] = np.degrees(per_site_twist_rad[i])
+                shear_pp[global_k, i] = np.degrees(per_site_shear_rad[i])
+                gain_pp[global_k, i] = 10.0 ** per_site_log10_gain[i]
+                twist_err_pp[global_k, i] = np.degrees(per_site_twist_err_rad[i])
+                shear_err_pp[global_k, i] = np.degrees(per_site_shear_err_rad[i])
+                if np.isfinite(per_site_log10_gain_err[i]):
+                    gain_err_pp[global_k, i] = (
+                        gain_pp[global_k, i] * np.log(10.0) * per_site_log10_gain_err[i]
+                    )
+                else:
+                    gain_err_pp[global_k, i] = np.inf
+            # Per-period chi-squared (sum of 8 weighted resids per
+            # site at this freq, summed across sites).
+            resid_at_period = 0.0
+            n_band_freqs_b = len(band_idx)
+            for i in range(n_sites):
+                start = 8 * (i * n_band_freqs_b + local_k)
+                resid_at_period += float(np.sum(br.residuals[start : start + 8] ** 2))
+            chi_squared_pp[global_k] = resid_at_period
+
+    # Build params Dataset
+    params = xr.Dataset(
+        {
+            "strike": ("period", strike_pp),
+            "strike_error": ("period", strike_err_pp),
+            "twist": (("period", "station"), twist_pp),
+            "twist_error": (("period", "station"), twist_err_pp),
+            "shear": (("period", "station"), shear_pp),
+            "shear_error": (("period", "station"), shear_err_pp),
+            "gain": (("period", "station"), gain_pp),
+            "gain_error": (("period", "station"), gain_err_pp),
+            "anisotropy": (("period", "station"), aniso_pp),
+            "anisotropy_error": (("period", "station"), aniso_err_pp),
+        },
+        coords={
+            "period": selected_periods,
+            "station": station_ids,
+        },
+    )
+    params["strike"].attrs.update(
+        units="degrees",
+        range="[0, 90)",
+        convention="clockwise from x-axis",
+        sharing="per_band_shared (one strike per band across stations)",
+    )
+    params["twist"].attrs.update(units="degrees")
+    params["shear"].attrs.update(units="degrees")
+    params["gain"].attrs.update(units="dimensionless")
+    params["anisotropy"].attrs.update(units="dimensionless", non_identifiable=True)
+    params["period"].attrs.update(units="seconds")
+
+    # Build regional_z dict[station_id, Z]
+    regional_z_meas_err = np.full((n_sites, n_periods, 2, 2), np.nan)
+    regional_z = {}
+    for i, sid in enumerate(station_ids):
+        regional_z[sid] = _Z(
+            z=z_regional_per_site[i],
+            z_error=regional_z_meas_err[i],
+            frequency=1.0 / selected_periods,
+        )
+
+    # Total RMS across all bands' primary modes
+    total_chi_sq = sum(modes[0].chi_squared for _, modes in band_modes_list)
+    total_n_resid = sum(
+        len(modes[0].band_result.residuals) for _, modes in band_modes_list
+    )
+    rms_misfit = float(np.sqrt(total_chi_sq / max(total_n_resid, 1)))
+
+    chi_squared_da = xr.DataArray(
+        chi_squared_pp,
+        coords={"period": selected_periods},
+        dims=["period"],
+        attrs={
+            "degrees_of_freedom": 8 * n_sites,
+            "description": (
+                f"Per-period chi-squared = sum across {n_sites} "
+                f"stations of 8 sigma-weighted squared residuals."
+            ),
+        },
+    )
+
+    # Per-band metadata with per-mode info
+    per_band_metadata = []
+    for band_idx, modes in band_modes_list:
+        mode_dicts = []
+        for mode in modes:
+            br_m = mode.band_result
+            mode_dicts.append(
+                {
+                    "rms_misfit": mode.rms_misfit,
+                    "chi_squared": mode.chi_squared,
+                    "n_starts_landing_here": mode.n_starts_landing_here,
+                    "probability": mode.probability,
+                    "x_opt": br_m.x_opt.tolist(),
+                    "x_err": br_m.x_err.tolist(),
+                    "converged": br_m.converged,
+                    "n_iter": br_m.n_iter,
+                    "canonical_form": {
+                        "strike_deg": mode.canonical_form["strike_deg"],
+                        "per_site_twist_deg": mode.canonical_form[
+                            "per_site_twist_deg"
+                        ].tolist(),
+                        "per_site_shear_deg": mode.canonical_form[
+                            "per_site_shear_deg"
+                        ].tolist(),
+                        "per_site_log10_gain": mode.canonical_form[
+                            "per_site_log10_gain"
+                        ].tolist(),
+                        "rms_misfit": mode.canonical_form["rms_misfit"],
+                    },
+                }
+            )
+        per_band_metadata.append(
+            {
+                "band_period_indices": band_idx.tolist(),
+                "band_periods": selected_periods[band_idx].tolist(),
+                "modes": mode_dicts,
+                "n_modes": len(modes),
+                "primary_mode_index": 0,
+            }
+        )
+
+    primary_mode_warning = False
+    primary_mode_warning_text = ""
+    for _, modes in band_modes_list:
+        if len(modes) >= 2:
+            ratio = modes[1].rms_misfit / max(modes[0].rms_misfit, 1e-30)
+            if ratio <= mode_warning_threshold:
+                primary_mode_warning = True
+                primary_mode_warning_text = (
+                    f"At least one band discovered multiple joint "
+                    f"modes within {mode_warning_threshold}x RMS of "
+                    f"each other. Single-mode CIs are misleading."
+                )
+                break
+
+    metadata = {
+        "convention": "clockwise from x-axis",
+        "strike_range_degrees": "[0, 90)",
+        "regional_z_frame": "measurement",
+        "n_sites": n_sites,
+        "station_ids": list(station_ids),
+        "n_bands": len(band_modes_list),
+        "n_starts_per_band": n_starts,
+        "strike_sharing": strike_sharing,
+        "mode_clustering": mode_clustering,
+        "regional_z_format": regional_z_format,
+        "mode_tolerance": (
+            {
+                k: v
+                for k, v in (mode_tolerance or {}).items()
+                if k not in ("rms_relative", "log10_gain")
+            }
+            or dict(_DEFAULT_MODE_TOLERANCE)
+        ),
+        "primary_mode_warning": primary_mode_warning,
+        "per_band": per_band_metadata,
+    }
+    if primary_mode_warning:
+        metadata["primary_mode_warning_text"] = primary_mode_warning_text
+
+    # Bootstrap (minimal: strike/twist/shear/gain CIs only;
+    # regional Z bootstrap CIs deferred — see docstring).
+    if realisations > 0:
+        bootstrap_rng = np.random.default_rng(int(rng.integers(0, 2**32)))
+        bootstrap_replicates = _bootstrap_decompose_joint(
+            z_obs_per_site_full=z_per_site,
+            sigma_per_site_full=sigma_per_site,
+            selected_periods=selected_periods,
+            bands=bands,
+            band_modes_list=band_modes_list,
+            realisations=realisations,
+            n_starts=n_starts,
+            bounds_override=bounds_override,
+            rng=bootstrap_rng,
+            mode_tolerance=mode_tolerance,
+            perturbation_scale=perturbation_scale,
+            mode_warning_threshold=mode_warning_threshold,
+        )
+
+        ci_strike_lower, ci_strike_upper = _compute_ci_percentile(
+            bootstrap_replicates["strike"], level=ci_level
+        )
+        ci_twist_lower, ci_twist_upper = _compute_ci_percentile(
+            bootstrap_replicates["twist"], level=ci_level
+        )
+        ci_shear_lower, ci_shear_upper = _compute_ci_percentile(
+            bootstrap_replicates["shear"], level=ci_level
+        )
+        ci_gain_lower, ci_gain_upper = _compute_ci_percentile(
+            bootstrap_replicates["gain"], level=ci_level
+        )
+
+        params["strike_ci_lower"] = (("period",), ci_strike_lower)
+        params["strike_ci_upper"] = (("period",), ci_strike_upper)
+        params["twist_ci_lower"] = (("period", "station"), ci_twist_lower)
+        params["twist_ci_upper"] = (("period", "station"), ci_twist_upper)
+        params["shear_ci_lower"] = (("period", "station"), ci_shear_lower)
+        params["shear_ci_upper"] = (("period", "station"), ci_shear_upper)
+        params["gain_ci_lower"] = (("period", "station"), ci_gain_lower)
+        params["gain_ci_upper"] = (("period", "station"), ci_gain_upper)
+        for k in (
+            "strike_ci_lower",
+            "strike_ci_upper",
+            "twist_ci_lower",
+            "twist_ci_upper",
+            "shear_ci_lower",
+            "shear_ci_upper",
+        ):
+            params[k].attrs["units"] = "degrees"
+        for k in ("gain_ci_lower", "gain_ci_upper"):
+            params[k].attrs["units"] = "dimensionless"
+
+        metadata["bootstrap_replicates"] = bootstrap_replicates
+        metadata["bootstrap_realisations"] = realisations
+        metadata["bootstrap_ci_method"] = ci_method
+        metadata["bootstrap_ci_level"] = ci_level
+        metadata["bootstrap_n_failed"] = int(
+            np.sum(np.isnan(bootstrap_replicates["rms_misfit"]))
+        )
+        metadata["bootstrap_caveats"] = (
+            "Parametric bootstrap CIs assume the GB89 forward model "
+            "and the per-component Gaussian noise model are correct. "
+            "Per Chave (2014), CIs derived via phase-tensor "
+            "invariants or Mohr-circle quantities are formally "
+            "meaningless. Per-station regional Z bootstrap CIs are "
+            "not stored on the Dataset in this session; the per-"
+            "replica primary-mode parameters are available in "
+            "metadata['bootstrap_replicates']."
+        )
+        warning_fraction = float(np.mean(bootstrap_replicates["mode_warning"]))
+        metadata["bootstrap_mode_warning_fraction"] = warning_fraction
+
+    options_record = {
+        "periods": periods,
+        "bandwidth": bandwidth,
+        "overlap": overlap,
+        "norm_type": norm_type,
+        "bounds_override": bounds_override,
+        "initial_guess": initial_guess,
+        "realisations": realisations,
+        "seed": seed,
+        "n_starts": n_starts,
+        "mode_tolerance": mode_tolerance,
+        "return_all_modes": return_all_modes,
+        "mode_warning_threshold": mode_warning_threshold,
+        "perturbation_scale": perturbation_scale,
+        "ci_level": ci_level,
+        "ci_method": ci_method,
+        "strike_sharing": strike_sharing,
+        "mode_clustering": mode_clustering,
+        "regional_z_format": regional_z_format,
+    }
+
+    return DecompositionResult(
+        parameters=params,
+        regional_z=regional_z,
+        chi_squared=chi_squared_da,
+        rms_misfit=rms_misfit,
+        method="mcneice_jones_joint",
+        options=options_record,
+        metadata=metadata,
+        frame="measurement",
     )
 
 
@@ -3140,6 +3621,1156 @@ def _bootstrap_decompose(
                 ratio = modes[1].rms_misfit / max(modes[0].rms_misfit, 1e-30)
                 if ratio <= mode_warning_threshold:
                     replicates["mode_warning"][replica_i] = True
+                    break
+
+    return replicates
+
+
+def _unpack_x_joint(
+    x: np.ndarray, n_sites: int, n_freqs: int
+) -> tuple[
+    float,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+]:
+    """Unpack the joint multi-site optimisation state vector.
+
+    Layout (all units consistent with single-site :func:`_unpack_x`)::
+
+        x[0]                                         theta_shared
+        x[1 + 4*i + 0..3]                            site i's
+                                                     (twist, shear,
+                                                      log10_gain,
+                                                      anisotropy)
+        x[1 + 4*n_sites + 4*n_freqs*i + 0*n_freqs + k]
+                                                     site i's
+                                                     log10_rho_a at
+                                                     freq k
+        x[... + 1*n_freqs + k]                       site i's phase_a
+        x[... + 2*n_freqs + k]                       site i's
+                                                     log10_rho_b
+        x[... + 3*n_freqs + k]                       site i's phase_b
+
+    Total length: ``1 + 4 * n_sites * (1 + n_freqs)``.
+
+    For ``n_sites == 1`` the length coincides with the single-site
+    layout (``5 + 4*n_freqs``), and the leading-five layout matches
+    bit-for-bit. This is the foundation of the single-site reduction
+    sanity tests.
+
+    Parameters
+    ----------
+    x : (1 + 4*n_sites*(1+n_freqs),) float ndarray
+    n_sites : int
+    n_freqs : int
+
+    Returns
+    -------
+    theta_shared : float
+    twist, shear, log10_gain, anisotropy : (n_sites,) ndarrays
+    log10_rho_a, phase_a, log10_rho_b, phase_b : (n_sites, n_freqs)
+        ndarrays.
+
+    Raises
+    ------
+    ValueError
+        If ``len(x)`` does not match the joint layout.
+    """
+    expected_len = 1 + 4 * n_sites * (1 + n_freqs)
+    if x.size != expected_len:
+        raise ValueError(
+            f"_unpack_x_joint: expected x of size {expected_len} "
+            f"for n_sites={n_sites}, n_freqs={n_freqs}, got {x.size}"
+        )
+
+    theta_shared = float(x[0])
+
+    site_scalars = x[1 : 1 + 4 * n_sites].reshape(n_sites, 4)
+    twist = site_scalars[:, 0].copy()
+    shear = site_scalars[:, 1].copy()
+    log10_gain = site_scalars[:, 2].copy()
+    anisotropy = site_scalars[:, 3].copy()
+
+    regional_base = 1 + 4 * n_sites
+    log10_rho_a = np.empty((n_sites, n_freqs))
+    phase_a = np.empty((n_sites, n_freqs))
+    log10_rho_b = np.empty((n_sites, n_freqs))
+    phase_b = np.empty((n_sites, n_freqs))
+    for i in range(n_sites):
+        site_start = regional_base + 4 * n_freqs * i
+        log10_rho_a[i] = x[site_start : site_start + n_freqs]
+        phase_a[i] = x[site_start + n_freqs : site_start + 2 * n_freqs]
+        log10_rho_b[i] = x[site_start + 2 * n_freqs : site_start + 3 * n_freqs]
+        phase_b[i] = x[site_start + 3 * n_freqs : site_start + 4 * n_freqs]
+
+    return (
+        theta_shared,
+        twist,
+        shear,
+        log10_gain,
+        anisotropy,
+        log10_rho_a,
+        phase_a,
+        log10_rho_b,
+        phase_b,
+    )
+
+
+def _build_bounds_joint(
+    n_sites: int,
+    n_freqs: int,
+    bounds_override: dict | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Joint parameter bounds matching single-site defaults.
+
+    Same per-parameter defaults as :func:`_build_bounds`, replicated
+    across all sites where applicable. ``bounds_override`` accepts
+    the same keys.
+    """
+    PI_4 = np.pi / 4.0
+    defaults = {
+        "strike": (0.0, np.pi),
+        "twist": (-PI_4, PI_4),
+        "shear": (-PI_4, PI_4),
+        "log10_gain": (-2.0, 2.0),
+        "anisotropy": (-2.0, 2.0),
+        "log10_rho_a": (-3.0, 6.0),
+        "phase_a": (-PI_4, 3 * PI_4),
+        "log10_rho_b": (-3.0, 6.0),
+        "phase_b": (-PI_4, 3 * PI_4),
+    }
+    if bounds_override:
+        for key, val in bounds_override.items():
+            if key not in defaults:
+                raise ValueError(f"_build_bounds_joint: unknown override key {key!r}")
+            defaults[key] = val
+
+    n_params = 1 + 4 * n_sites * (1 + n_freqs)
+    lower = np.empty(n_params)
+    upper = np.empty(n_params)
+
+    lower[0], upper[0] = defaults["strike"]
+
+    for i in range(n_sites):
+        base = 1 + 4 * i
+        lower[base + 0], upper[base + 0] = defaults["twist"]
+        lower[base + 1], upper[base + 1] = defaults["shear"]
+        lower[base + 2], upper[base + 2] = defaults["log10_gain"]
+        lower[base + 3], upper[base + 3] = defaults["anisotropy"]
+
+    regional_base = 1 + 4 * n_sites
+    for i in range(n_sites):
+        site_start = regional_base + 4 * n_freqs * i
+        lower[site_start : site_start + n_freqs] = defaults["log10_rho_a"][0]
+        upper[site_start : site_start + n_freqs] = defaults["log10_rho_a"][1]
+        lower[site_start + n_freqs : site_start + 2 * n_freqs] = defaults["phase_a"][0]
+        upper[site_start + n_freqs : site_start + 2 * n_freqs] = defaults["phase_a"][1]
+        lower[site_start + 2 * n_freqs : site_start + 3 * n_freqs] = defaults[
+            "log10_rho_b"
+        ][0]
+        upper[site_start + 2 * n_freqs : site_start + 3 * n_freqs] = defaults[
+            "log10_rho_b"
+        ][1]
+        lower[site_start + 3 * n_freqs : site_start + 4 * n_freqs] = defaults[
+            "phase_b"
+        ][0]
+        upper[site_start + 3 * n_freqs : site_start + 4 * n_freqs] = defaults[
+            "phase_b"
+        ][1]
+
+    return lower, upper
+
+
+def _objfun_joint(
+    x: np.ndarray,
+    z_obs_per_site: np.ndarray,
+    sigma_per_site: np.ndarray,
+    periods: np.ndarray,
+    compute_jacobian: bool = True,
+) -> tuple[np.ndarray, np.ndarray | None]:
+    """Joint multi-site GB residuals and analytic Jacobian.
+
+    The forward-model algebra for each ``(site_i, freq_k)`` matches
+    single-site :func:`_objfun` exactly, with the shared theta from
+    ``x[0]`` and the per-site distortion / regional impedance pulled
+    from the joint state vector via :func:`_unpack_x_joint`.
+
+    Residuals layout: ``r[8 * (i * n_freqs + k) + c]`` for site
+    ``i``, frequency ``k``, residual component ``c`` in 0..7.
+
+    Jacobian column layout: column 0 is the shared theta (dense);
+    columns ``1 + 4*i + (0..3)`` are site i's distortion (block-
+    sparse with 8*n_freqs nonzero rows per column); columns
+    ``1 + 4*n_sites + 4*n_freqs*i + ...`` are site i's per-freq
+    regional impedance (sparse, 8 nonzero rows per column).
+
+    For ``n_sites == 1`` the residuals and Jacobian coincide bit-
+    for-bit with single-site :func:`_objfun` — verified by
+    ``TestObjfunJointSingleSiteReduction``.
+    """
+    if z_obs_per_site.ndim != 4:
+        raise ValueError(
+            f"_objfun_joint: z_obs_per_site must be 4-D "
+            f"(n_sites, n_freqs, 2, 2); got shape {z_obs_per_site.shape}"
+        )
+    n_sites, n_freqs = z_obs_per_site.shape[0], z_obs_per_site.shape[1]
+    if z_obs_per_site.shape != (n_sites, n_freqs, 2, 2):
+        raise ValueError(
+            f"_objfun_joint: z_obs_per_site shape "
+            f"{z_obs_per_site.shape} not (n_sites, n_freqs, 2, 2)"
+        )
+    if sigma_per_site.shape != z_obs_per_site.shape:
+        raise ValueError(
+            f"_objfun_joint: sigma_per_site shape "
+            f"{sigma_per_site.shape} does not match z_obs_per_site"
+        )
+    if periods.shape != (n_freqs,):
+        raise ValueError(
+            f"_objfun_joint: periods shape {periods.shape} does not "
+            f"match (n_freqs,) = ({n_freqs},)"
+        )
+    expected_x_len = 1 + 4 * n_sites * (1 + n_freqs)
+    if x.size != expected_x_len:
+        raise ValueError(
+            f"_objfun_joint: x size {x.size} does not match "
+            f"1 + 4*n_sites*(1+n_freqs) = {expected_x_len}"
+        )
+    if np.any(sigma_per_site <= 0):
+        raise ValueError("_objfun_joint: sigma_per_site contains non-positive entries")
+
+    (
+        theta,
+        twist,
+        shear,
+        log10_gain,
+        _anisotropy,
+        log10_rho_a,
+        phase_a,
+        log10_rho_b,
+        phase_b,
+    ) = _unpack_x_joint(x, n_sites, n_freqs)
+
+    c2 = np.cos(2.0 * theta)
+    s2 = np.sin(2.0 * theta)
+    ln10 = np.log(10.0)
+    mu0 = 4.0 * np.pi * 1.0e-7
+    factor = 2.0 * np.pi * mu0
+
+    t_per_site = np.tan(twist)
+    e_per_site = np.tan(shear)
+    sec2_t_per_site = 1.0 / np.cos(twist) ** 2
+    sec2_e_per_site = 1.0 / np.cos(shear) ** 2
+    gain_per_site = 10.0**log10_gain
+
+    rho_a = 10.0**log10_rho_a
+    rho_b = 10.0**log10_rho_b
+    abs_a = np.sqrt(rho_a * factor / periods[None, :])
+    abs_b = np.sqrt(rho_b * factor / periods[None, :])
+    a = abs_a * np.exp(1j * phase_a)
+    b = abs_b * np.exp(1j * phase_b)
+
+    n_resid = 8 * n_sites * n_freqs
+    residuals = np.empty(n_resid, dtype=np.float64)
+    if compute_jacobian:
+        jacobian = np.zeros((n_resid, expected_x_len), dtype=np.float64)
+    else:
+        jacobian = None
+
+    regional_base = 1 + 4 * n_sites
+
+    for i in range(n_sites):
+        t_i = t_per_site[i]
+        e_i = e_per_site[i]
+        sec2_t_i = sec2_t_per_site[i]
+        sec2_e_i = sec2_e_per_site[i]
+        gain_i = gain_per_site[i]
+
+        site_dist_base = 1 + 4 * i
+        site_regional_base = regional_base + 4 * n_freqs * i
+
+        for k in range(n_freqs):
+            a_k = a[i, k]
+            b_k = b[i, k]
+
+            # Forward model — same algebra as _objfun, per (site, freq).
+            alpha0 = -b_k * (e_i - t_i) + a_k * (t_i + e_i)
+            alpha1 = (
+                s2 * (-b_k * (e_i - t_i))
+                + c2 * (-b_k * (1.0 + t_i * e_i))
+                + c2 * (a_k * (1.0 - e_i * t_i))
+                - s2 * (a_k * (t_i + e_i))
+            )
+            alpha2 = -b_k * (1.0 + t_i * e_i) - a_k * (1.0 - e_i * t_i)
+            alpha3 = (
+                c2 * (-b_k * (e_i - t_i))
+                - s2 * (-b_k * (1.0 + t_i * e_i))
+                - s2 * (a_k * (1.0 - e_i * t_i))
+                - c2 * (a_k * (t_i + e_i))
+            )
+
+            z_pred = np.empty((2, 2), dtype=np.complex128)
+            z_pred[0, 0] = (alpha0 + alpha3) / 2.0
+            z_pred[1, 1] = (alpha0 - alpha3) / 2.0
+            z_pred[0, 1] = (alpha1 - alpha2) / 2.0
+            z_pred[1, 0] = (alpha1 + alpha2) / 2.0
+            z_pred = gain_i * z_pred
+
+            row_start = 8 * (i * n_freqs + k)
+            diff = z_pred - z_obs_per_site[i, k]
+            s_ik = sigma_per_site[i, k]
+            residuals[row_start + 0] = diff[0, 0].real / s_ik[0, 0]
+            residuals[row_start + 1] = diff[0, 0].imag / s_ik[0, 0]
+            residuals[row_start + 2] = diff[0, 1].real / s_ik[0, 1]
+            residuals[row_start + 3] = diff[0, 1].imag / s_ik[0, 1]
+            residuals[row_start + 4] = diff[1, 0].real / s_ik[1, 0]
+            residuals[row_start + 5] = diff[1, 0].imag / s_ik[1, 0]
+            residuals[row_start + 6] = diff[1, 1].real / s_ik[1, 1]
+            residuals[row_start + 7] = diff[1, 1].imag / s_ik[1, 1]
+
+            if not compute_jacobian:
+                continue
+
+            d_alpha1_dtheta = (
+                (2.0 * c2) * (-b_k * (e_i - t_i))
+                + (-2.0 * s2) * (-b_k * (1.0 + t_i * e_i))
+                + (-2.0 * s2) * (a_k * (1.0 - e_i * t_i))
+                - (2.0 * c2) * (a_k * (t_i + e_i))
+            )
+            d_alpha3_dtheta = (
+                (-2.0 * s2) * (-b_k * (e_i - t_i))
+                - (2.0 * c2) * (-b_k * (1.0 + t_i * e_i))
+                - (2.0 * c2) * (a_k * (1.0 - e_i * t_i))
+                - (-2.0 * s2) * (a_k * (t_i + e_i))
+            )
+
+            d_alpha0_dt = -b_k * (-1.0) + a_k * (1.0)
+            d_alpha1_dt = (
+                s2 * (-b_k * (-1.0))
+                + c2 * (-b_k * e_i)
+                + c2 * (a_k * (-e_i))
+                - s2 * (a_k * 1.0)
+            )
+            d_alpha2_dt = -b_k * e_i - a_k * (-e_i)
+            d_alpha3_dt = (
+                c2 * (-b_k * (-1.0))
+                - s2 * (-b_k * e_i)
+                - s2 * (a_k * (-e_i))
+                - c2 * (a_k * 1.0)
+            )
+
+            d_alpha0_de = -b_k * 1.0 + a_k * 1.0
+            d_alpha1_de = (
+                s2 * (-b_k * 1.0)
+                + c2 * (-b_k * t_i)
+                + c2 * (a_k * (-t_i))
+                - s2 * (a_k * 1.0)
+            )
+            d_alpha2_de = -b_k * t_i - a_k * (-t_i)
+            d_alpha3_de = (
+                c2 * (-b_k * 1.0)
+                - s2 * (-b_k * t_i)
+                - s2 * (a_k * (-t_i))
+                - c2 * (a_k * 1.0)
+            )
+
+            coef_a_alpha0 = t_i + e_i
+            coef_a_alpha1 = c2 * (1.0 - e_i * t_i) - s2 * (t_i + e_i)
+            coef_a_alpha2 = -(1.0 - e_i * t_i)
+            coef_a_alpha3 = -s2 * (1.0 - e_i * t_i) - c2 * (t_i + e_i)
+            coef_b_alpha0 = -(e_i - t_i)
+            coef_b_alpha1 = -s2 * (e_i - t_i) - c2 * (1.0 + t_i * e_i)
+            coef_b_alpha2 = -(1.0 + t_i * e_i)
+            coef_b_alpha3 = -c2 * (e_i - t_i) + s2 * (1.0 + t_i * e_i)
+
+            def z_from_dalpha(d0, d1, d2, d3, _gain=gain_i):
+                dz = np.empty((2, 2), dtype=np.complex128)
+                dz[0, 0] = (d0 + d3) / 2.0
+                dz[1, 1] = (d0 - d3) / 2.0
+                dz[0, 1] = (d1 - d2) / 2.0
+                dz[1, 0] = (d1 + d2) / 2.0
+                return _gain * dz
+
+            dz_dtheta = z_from_dalpha(0.0, d_alpha1_dtheta, 0.0, d_alpha3_dtheta)
+            dz_dtwist = sec2_t_i * z_from_dalpha(
+                d_alpha0_dt, d_alpha1_dt, d_alpha2_dt, d_alpha3_dt
+            )
+            dz_dshear = sec2_e_i * z_from_dalpha(
+                d_alpha0_de, d_alpha1_de, d_alpha2_de, d_alpha3_de
+            )
+            dz_dlog10_gain = z_pred * ln10
+
+            da_dlog10_rho = a_k * ln10 / 2.0
+            da_dphase = 1j * a_k
+            dz_dlog10_rho_a = z_from_dalpha(
+                coef_a_alpha0 * da_dlog10_rho,
+                coef_a_alpha1 * da_dlog10_rho,
+                coef_a_alpha2 * da_dlog10_rho,
+                coef_a_alpha3 * da_dlog10_rho,
+            )
+            dz_dphase_a = z_from_dalpha(
+                coef_a_alpha0 * da_dphase,
+                coef_a_alpha1 * da_dphase,
+                coef_a_alpha2 * da_dphase,
+                coef_a_alpha3 * da_dphase,
+            )
+            db_dlog10_rho = b_k * ln10 / 2.0
+            db_dphase = 1j * b_k
+            dz_dlog10_rho_b = z_from_dalpha(
+                coef_b_alpha0 * db_dlog10_rho,
+                coef_b_alpha1 * db_dlog10_rho,
+                coef_b_alpha2 * db_dlog10_rho,
+                coef_b_alpha3 * db_dlog10_rho,
+            )
+            dz_dphase_b = z_from_dalpha(
+                coef_b_alpha0 * db_dphase,
+                coef_b_alpha1 * db_dphase,
+                coef_b_alpha2 * db_dphase,
+                coef_b_alpha3 * db_dphase,
+            )
+
+            def pack_dz(dz, _s_ik=s_ik):
+                return np.array(
+                    [
+                        dz[0, 0].real / _s_ik[0, 0],
+                        dz[0, 0].imag / _s_ik[0, 0],
+                        dz[0, 1].real / _s_ik[0, 1],
+                        dz[0, 1].imag / _s_ik[0, 1],
+                        dz[1, 0].real / _s_ik[1, 0],
+                        dz[1, 0].imag / _s_ik[1, 0],
+                        dz[1, 1].real / _s_ik[1, 1],
+                        dz[1, 1].imag / _s_ik[1, 1],
+                    ]
+                )
+
+            row_end = row_start + 8
+
+            jacobian[row_start:row_end, 0] = pack_dz(dz_dtheta)
+            jacobian[row_start:row_end, site_dist_base + 0] = pack_dz(dz_dtwist)
+            jacobian[row_start:row_end, site_dist_base + 1] = pack_dz(dz_dshear)
+            jacobian[row_start:row_end, site_dist_base + 2] = pack_dz(dz_dlog10_gain)
+            # site_dist_base + 3 (anisotropy) stays zero
+
+            jacobian[
+                row_start:row_end,
+                site_regional_base + 0 * n_freqs + k,
+            ] = pack_dz(dz_dlog10_rho_a)
+            jacobian[
+                row_start:row_end,
+                site_regional_base + 1 * n_freqs + k,
+            ] = pack_dz(dz_dphase_a)
+            jacobian[
+                row_start:row_end,
+                site_regional_base + 2 * n_freqs + k,
+            ] = pack_dz(dz_dlog10_rho_b)
+            jacobian[
+                row_start:row_end,
+                site_regional_base + 3 * n_freqs + k,
+            ] = pack_dz(dz_dphase_b)
+
+    return residuals, jacobian
+
+
+def _canonical_initial_guess_joint(
+    z_obs_per_site: np.ndarray,
+    sigma_per_site: np.ndarray,
+    periods: np.ndarray,
+) -> np.ndarray:
+    """Joint canonical initial guess.
+
+    Strategy: median of per-site phase-tensor strikes for the shared
+    theta; per-site distortion at zero; per-site regional impedances
+    derived from each site's Z rotated by the shared theta.
+    """
+    n_sites = z_obs_per_site.shape[0]
+    n_freqs = z_obs_per_site.shape[1]
+
+    per_site_strikes = np.array(
+        [
+            _canonical_initial_guess(z_obs_per_site[i], sigma_per_site[i], periods)[0]
+            for i in range(n_sites)
+        ]
+    )
+    median_2theta = np.arctan2(
+        np.median(np.sin(2.0 * per_site_strikes)),
+        np.median(np.cos(2.0 * per_site_strikes)),
+    )
+    theta_shared = median_2theta / 2.0
+
+    x_joint = np.empty(1 + 4 * n_sites * (1 + n_freqs))
+    x_joint[0] = theta_shared
+
+    for i in range(n_sites):
+        base = 1 + 4 * i
+        x_joint[base + 0] = 0.0  # twist
+        x_joint[base + 1] = 0.0  # shear
+        x_joint[base + 2] = 0.0  # log10_gain
+        x_joint[base + 3] = 0.0  # anisotropy
+
+    c, s = np.cos(theta_shared), np.sin(theta_shared)
+    R = np.array([[c, -s], [s, c]])
+    mu0 = 4.0 * np.pi * 1.0e-7
+    factor = 2.0 * np.pi * mu0
+    regional_base = 1 + 4 * n_sites
+    for i in range(n_sites):
+        site_start = regional_base + 4 * n_freqs * i
+        log10_rho_a = np.empty(n_freqs)
+        phase_a = np.empty(n_freqs)
+        log10_rho_b = np.empty(n_freqs)
+        phase_b = np.empty(n_freqs)
+        for k in range(n_freqs):
+            z_rot = R.T @ z_obs_per_site[i, k] @ R
+            a_k = z_rot[0, 1]
+            b_k = -z_rot[1, 0]
+            log10_rho_a[k] = np.log10(max(abs(a_k), 1e-15) ** 2 * periods[k] / factor)
+            phase_a[k] = np.arctan2(a_k.imag, a_k.real)
+            log10_rho_b[k] = np.log10(max(abs(b_k), 1e-15) ** 2 * periods[k] / factor)
+            phase_b[k] = np.arctan2(b_k.imag, b_k.real)
+        x_joint[site_start : site_start + n_freqs] = log10_rho_a
+        x_joint[site_start + n_freqs : site_start + 2 * n_freqs] = phase_a
+        x_joint[site_start + 2 * n_freqs : site_start + 3 * n_freqs] = log10_rho_b
+        x_joint[site_start + 3 * n_freqs : site_start + 4 * n_freqs] = phase_b
+
+    return x_joint
+
+
+def _rotated_initial_guess_joint(
+    z_obs_per_site: np.ndarray,
+    sigma_per_site: np.ndarray,
+    periods: np.ndarray,
+) -> np.ndarray:
+    """Joint 90-rotated alternative.
+
+    Same as :func:`_canonical_initial_guess_joint` but with strike +
+    pi/2 (mod pi) and TE/TM swapped at every site simultaneously
+    (since strike is shared across sites, the swap is also shared).
+    """
+    canonical = _canonical_initial_guess_joint(z_obs_per_site, sigma_per_site, periods)
+    n_sites = z_obs_per_site.shape[0]
+    n_freqs = z_obs_per_site.shape[1]
+
+    rotated = canonical.copy()
+    rotated[0] = (canonical[0] + np.pi / 2.0) % np.pi
+
+    regional_base = 1 + 4 * n_sites
+    for i in range(n_sites):
+        site_start = regional_base + 4 * n_freqs * i
+        log10_rho_a = canonical[site_start : site_start + n_freqs].copy()
+        phase_a = canonical[site_start + n_freqs : site_start + 2 * n_freqs].copy()
+        log10_rho_b = canonical[
+            site_start + 2 * n_freqs : site_start + 3 * n_freqs
+        ].copy()
+        phase_b = canonical[site_start + 3 * n_freqs : site_start + 4 * n_freqs].copy()
+
+        rotated[site_start : site_start + n_freqs] = log10_rho_b
+        rotated[site_start + n_freqs : site_start + 2 * n_freqs] = phase_b
+        rotated[site_start + 2 * n_freqs : site_start + 3 * n_freqs] = log10_rho_a
+        rotated[site_start + 3 * n_freqs : site_start + 4 * n_freqs] = phase_a
+
+    return rotated
+
+
+def _generate_starting_points_joint(
+    z_obs_per_site: np.ndarray,
+    sigma_per_site: np.ndarray,
+    periods: np.ndarray,
+    lower: np.ndarray,
+    upper: np.ndarray,
+    n_starts: int,
+    rng: np.random.Generator,
+    perturbation_scale: float = 0.1,
+) -> list[np.ndarray]:
+    """Joint hybrid starting points: canonical, rotated, perturbations."""
+    if n_starts < 1:
+        raise ValueError(
+            f"_generate_starting_points_joint: n_starts must be >= 1, "
+            f"got {n_starts}"
+        )
+
+    canonical = np.clip(
+        _canonical_initial_guess_joint(z_obs_per_site, sigma_per_site, periods),
+        lower,
+        upper,
+    )
+    starts = [canonical]
+    if n_starts >= 2:
+        rotated = np.clip(
+            _rotated_initial_guess_joint(z_obs_per_site, sigma_per_site, periods),
+            lower,
+            upper,
+        )
+        starts.append(rotated)
+    for _ in range(n_starts - 2):
+        starts.append(
+            _perturbed_initial_guess(canonical, lower, upper, rng, perturbation_scale)
+        )
+    return starts
+
+
+def _solve_band_joint(
+    z_obs_per_site: np.ndarray,
+    sigma_per_site: np.ndarray,
+    periods: np.ndarray,
+    x0: np.ndarray | None = None,
+    bounds: tuple[np.ndarray, np.ndarray] | None = None,
+    bounds_override: dict | None = None,
+    max_nfev: int = 1000,
+    ftol: float = 1e-10,
+    xtol: float = 1e-10,
+) -> _BandResult:
+    """Joint single-band optimisation across multiple sites.
+
+    Direct extension of :func:`_solve_band` to the joint state vector.
+    """
+    n_sites = z_obs_per_site.shape[0]
+    n_freqs = z_obs_per_site.shape[1]
+
+    if bounds is None:
+        bounds = _build_bounds_joint(n_sites, n_freqs, bounds_override)
+    lower, upper = bounds
+
+    if x0 is None:
+        x0 = _canonical_initial_guess_joint(z_obs_per_site, sigma_per_site, periods)
+    x0 = np.clip(x0, lower, upper)
+
+    def fun(x):
+        r, _ = _objfun_joint(
+            x, z_obs_per_site, sigma_per_site, periods, compute_jacobian=False
+        )
+        return r
+
+    def jac(x):
+        _, j = _objfun_joint(
+            x, z_obs_per_site, sigma_per_site, periods, compute_jacobian=True
+        )
+        return j
+
+    result = least_squares(
+        fun=fun,
+        x0=x0,
+        jac=jac,
+        bounds=(lower, upper),
+        method="trf",
+        ftol=ftol,
+        xtol=xtol,
+        max_nfev=max_nfev,
+    )
+
+    x_opt = result.x
+    residuals = result.fun
+    chi_squared = float(np.sum(residuals**2))
+    n_resid = len(residuals)
+    rms_misfit = float(np.sqrt(chi_squared / n_resid))
+
+    J = result.jac
+    col_norms = np.linalg.norm(J, axis=0)
+    zero_cols = col_norms < 1e-15
+    try:
+        cov = np.linalg.pinv(J.T @ J, rcond=1e-12)
+        x_err = np.sqrt(np.maximum(np.diag(cov), 0.0))
+        x_err[zero_cols] = np.inf
+    except np.linalg.LinAlgError:
+        x_err = np.full_like(x_opt, np.nan)
+
+    return _BandResult(
+        x_opt=x_opt,
+        x_err=x_err,
+        residuals=residuals,
+        chi_squared=chi_squared,
+        rms_misfit=rms_misfit,
+        n_iter=int(result.nfev),
+        converged=int(result.status) > 0,
+        cost_at_opt=float(result.cost),
+        jacobian=J,
+    )
+
+
+def _canonical_form_summary_joint(br: _BandResult, n_sites: int, n_freqs: int) -> dict:
+    """Joint canonical-form summary for clustering converged points.
+
+    Strike is shared across sites, so canonicalisation is decided by
+    the shared theta alone; if it rotates by pi/2, every site's shear
+    flips sign simultaneously.
+
+    Returns
+    -------
+    dict with keys:
+        strike_deg : float
+        per_site_twist_deg : (n_sites,) ndarray
+        per_site_shear_deg : (n_sites,) ndarray
+        per_site_log10_gain : (n_sites,) ndarray (gauge — not used
+                              for clustering, kept for diagnostics)
+        rms_misfit : float
+    """
+    (
+        theta_shared,
+        twist,
+        shear,
+        log10_gain,
+        _aniso,
+        _,
+        _,
+        _,
+        _,
+    ) = _unpack_x_joint(br.x_opt, n_sites, n_freqs)
+
+    strike_can, _, _ = _canonicalise_solution(
+        theta_shared, float(twist[0]), float(shear[0])
+    )
+    rotated = abs(strike_can - (theta_shared % np.pi)) > 1e-9
+    canonical_shear = -shear if rotated else shear
+
+    return {
+        "strike_deg": float(np.degrees(strike_can)),
+        "per_site_twist_deg": np.degrees(twist).copy(),
+        "per_site_shear_deg": np.degrees(canonical_shear).copy(),
+        "per_site_log10_gain": log10_gain.copy(),
+        "rms_misfit": float(br.rms_misfit),
+    }
+
+
+def _modes_match_within_band_joint(cf_a: dict, cf_b: dict, tolerance: dict) -> bool:
+    """Two joint canonical-form summaries match if shared strike
+    agrees within tolerance and every site's (twist, shear) agree.
+
+    log10_gain and rms are NOT checked — gauge-equivalent and path-
+    dependent respectively (see Sessions 5 and 6).
+    """
+    if abs(cf_a["strike_deg"] - cf_b["strike_deg"]) > tolerance["strike_deg"]:
+        return False
+    if np.any(
+        np.abs(cf_a["per_site_twist_deg"] - cf_b["per_site_twist_deg"])
+        > tolerance["twist_deg"]
+    ):
+        return False
+    if np.any(
+        np.abs(cf_a["per_site_shear_deg"] - cf_b["per_site_shear_deg"])
+        > tolerance["shear_deg"]
+    ):
+        return False
+    return True
+
+
+def _modes_match_across_bands_joint(cf_a: dict, cf_b: dict, tolerance: dict) -> bool:
+    """Cross-band joint mode-equivalence predicate.
+
+    Same as :func:`_modes_match_within_band_joint`. Exists as a
+    separate name for documented intent: cross-band RMS comparison
+    is meaningless because bands fit different period subsets.
+    """
+    return _modes_match_within_band_joint(cf_a, cf_b, tolerance)
+
+
+def _cluster_modes_joint(
+    band_results: list[_BandResult],
+    n_sites: int,
+    n_freqs: int,
+    mode_tolerance: dict | None = None,
+) -> list[_Mode]:
+    """Greedy single-pass clustering of joint converged points."""
+    if not band_results:
+        return []
+
+    tol = dict(_DEFAULT_MODE_TOLERANCE)
+    if mode_tolerance:
+        deprecated = {"rms_relative", "log10_gain"} & set(mode_tolerance)
+        if deprecated:
+            warnings.warn(
+                f"mode_tolerance keys {sorted(deprecated)} are no longer "
+                "used and will be ignored. Joint clustering uses "
+                "strike_deg, twist_deg, and shear_deg only.",
+                UserWarning,
+                stacklevel=2,
+            )
+            mode_tolerance = {
+                k: v for k, v in mode_tolerance.items() if k not in deprecated
+            }
+        tol.update(mode_tolerance)
+
+    summaries = [
+        (br, _canonical_form_summary_joint(br, n_sites, n_freqs)) for br in band_results
+    ]
+    summaries.sort(key=lambda x: x[1]["rms_misfit"])
+
+    modes: list[_Mode] = []
+    for br, cf in summaries:
+        matched = False
+        for mode in modes:
+            if _modes_match_within_band_joint(mode.canonical_form, cf, tol):
+                mode.n_starts_landing_here += 1
+                matched = True
+                break
+        if not matched:
+            modes.append(
+                _Mode(
+                    rms_misfit=br.rms_misfit,
+                    chi_squared=br.chi_squared,
+                    n_starts_landing_here=1,
+                    band_result=br,
+                    canonical_form=cf,
+                )
+            )
+    return modes
+
+
+def _compute_mode_probabilities_joint(modes: list[_Mode], n_sites: int) -> list[float]:
+    """Laplace approximation, dropping per-site anisotropy columns.
+
+    Same algebra as :func:`_compute_mode_probabilities` but with
+    n_sites zero columns removed from the Gram matrix instead of one.
+    """
+    if not modes:
+        return []
+    if len(modes) == 1:
+        return [1.0]
+
+    aniso_cols = [1 + 4 * i + 3 for i in range(n_sites)]
+
+    log_weights: list[float] = []
+    for mode in modes:
+        chi_sq = mode.chi_squared
+        J = mode.band_result.jacobian
+        if J is None:
+            log_weights.append(-0.5 * chi_sq)
+            continue
+        J_eff = np.delete(J, aniso_cols, axis=1)
+        gram = J_eff.T @ J_eff
+        sign, log_det_gram = np.linalg.slogdet(gram)
+        if sign > 0:
+            log_det_cov = -log_det_gram
+        else:
+            cov = np.linalg.pinv(gram)
+            eigenvalues = np.linalg.eigvalsh(cov)
+            eigenvalues = eigenvalues[eigenvalues > 1e-30]
+            if eigenvalues.size == 0:
+                log_det_cov = -np.inf
+            else:
+                log_det_cov = float(np.sum(np.log(eigenvalues)))
+        log_weights.append(-0.5 * chi_sq + 0.5 * log_det_cov)
+
+    log_w_max = max(log_weights)
+    weights = [float(np.exp(lw - log_w_max)) for lw in log_weights]
+    total = sum(weights)
+    if total <= 0.0:
+        return [1.0 / len(modes)] * len(modes)
+    return [w / total for w in weights]
+
+
+def _solve_band_joint_multistart(
+    z_obs_per_site: np.ndarray,
+    sigma_per_site: np.ndarray,
+    periods: np.ndarray,
+    n_starts: int = 5,
+    bounds: tuple[np.ndarray, np.ndarray] | None = None,
+    bounds_override: dict | None = None,
+    rng: np.random.Generator | None = None,
+    mode_tolerance: dict | None = None,
+    perturbation_scale: float = 0.1,
+    max_nfev: int = 1000,
+    ftol: float = 1e-10,
+    xtol: float = 1e-10,
+) -> list[_Mode]:
+    """Multi-start joint single-band optimisation."""
+    if rng is None:
+        rng = np.random.default_rng(42)
+
+    n_sites = z_obs_per_site.shape[0]
+    n_freqs = z_obs_per_site.shape[1]
+    if bounds is None:
+        bounds = _build_bounds_joint(n_sites, n_freqs, bounds_override)
+    lower, upper = bounds
+
+    starting_points = _generate_starting_points_joint(
+        z_obs_per_site,
+        sigma_per_site,
+        periods,
+        lower,
+        upper,
+        n_starts,
+        rng,
+        perturbation_scale=perturbation_scale,
+    )
+
+    band_results: list[_BandResult] = []
+    for x0 in starting_points:
+        try:
+            br = _solve_band_joint(
+                z_obs_per_site=z_obs_per_site,
+                sigma_per_site=sigma_per_site,
+                periods=periods,
+                x0=x0,
+                bounds=bounds,
+                max_nfev=max_nfev,
+                ftol=ftol,
+                xtol=xtol,
+            )
+            band_results.append(br)
+        except Exception:
+            continue
+
+    if not band_results:
+        raise RuntimeError("_solve_band_joint_multistart: all starting points failed")
+
+    modes = _cluster_modes_joint(band_results, n_sites, n_freqs, mode_tolerance)
+    probabilities = _compute_mode_probabilities_joint(modes, n_sites)
+    for mode, prob in zip(modes, probabilities):
+        mode.probability = prob
+    return modes
+
+
+def _decompose_bands_with_modes_joint(
+    z_obs_per_site_full: np.ndarray,
+    sigma_per_site_full: np.ndarray,
+    selected_periods: np.ndarray,
+    bands: list[np.ndarray],
+    n_starts: int,
+    bounds_override: dict | None,
+    rng: np.random.Generator,
+    mode_tolerance: dict | None,
+    perturbation_scale: float,
+) -> list[tuple[np.ndarray, list[_Mode]]]:
+    """Run joint multi-start optimisation per band; return per-band
+    mode lists. Joint analogue of :func:`_decompose_bands_with_modes`.
+    """
+    band_modes_list: list[tuple[np.ndarray, list[_Mode]]] = []
+    for band_idx in bands:
+        z_b = z_obs_per_site_full[:, band_idx, :, :]
+        sigma_b = sigma_per_site_full[:, band_idx, :, :]
+        periods_b = selected_periods[band_idx]
+        modes = _solve_band_joint_multistart(
+            z_obs_per_site=z_b,
+            sigma_per_site=sigma_b,
+            periods=periods_b,
+            n_starts=n_starts,
+            bounds_override=bounds_override,
+            rng=rng,
+            mode_tolerance=mode_tolerance,
+            perturbation_scale=perturbation_scale,
+        )
+        band_modes_list.append((band_idx, modes))
+    return band_modes_list
+
+
+def _normalise_collection_input(
+    collection_or_list,
+) -> list[tuple[str, "Z"]]:
+    """Convert MTCollection or list[MT] into (station_id, Z) tuples."""
+    if isinstance(collection_or_list, list):
+        return [
+            (getattr(mt, "station", str(i)), mt.Z)
+            for i, mt in enumerate(collection_or_list)
+        ]
+    if hasattr(collection_or_list, "dataframe") and hasattr(
+        collection_or_list, "get_tf"
+    ):
+        out: list[tuple[str, "Z"]] = []
+        df = collection_or_list.dataframe
+        if df is None or len(df) == 0:
+            return out
+        for row in df.itertuples():
+            tf_id = getattr(row, "tf_id", getattr(row, "station", None))
+            if tf_id is None:
+                continue
+            mt = collection_or_list.get_tf(tf_id)
+            out.append((getattr(mt, "station", tf_id), mt.Z))
+        return out
+    raise TypeError(
+        f"decompose_joint: unexpected input type "
+        f"{type(collection_or_list)!r}; expected list of MT or MTCollection"
+    )
+
+
+def _validate_joint_input(stations: list[tuple[str, "Z"]]) -> None:
+    """Sanity-check joint input compatibility."""
+    if not stations:
+        raise ValueError("decompose_joint: no stations provided")
+
+    for station_id, z in stations:
+        if z.z_error is None:
+            raise ValueError(
+                f"decompose_joint: station {station_id!r} has no "
+                f"z_error; required for weighted least squares"
+            )
+        if np.any(np.asarray(z.z_error) <= 0):
+            raise ValueError(
+                f"decompose_joint: station {station_id!r} has "
+                f"non-positive z_error entries"
+            )
+
+    ref_freq = np.asarray(stations[0][1].frequency, dtype=np.float64)
+    for station_id, z in stations[1:]:
+        freq_i = np.asarray(z.frequency, dtype=np.float64)
+        if freq_i.shape != ref_freq.shape or not np.allclose(
+            freq_i, ref_freq, rtol=1e-6
+        ):
+            raise ValueError(
+                f"decompose_joint: station {station_id!r} has a "
+                f"different frequency grid than the first station; "
+                f"joint analysis requires a common frequency grid"
+            )
+
+
+def _bootstrap_decompose_joint(
+    z_obs_per_site_full: np.ndarray,
+    sigma_per_site_full: np.ndarray,
+    selected_periods: np.ndarray,
+    bands: list[np.ndarray],
+    band_modes_list: list[tuple[np.ndarray, list[_Mode]]],
+    realisations: int,
+    n_starts: int,
+    bounds_override: dict | None,
+    rng: np.random.Generator,
+    mode_tolerance: dict | None,
+    perturbation_scale: float,
+    mode_warning_threshold: float,
+) -> dict[str, np.ndarray]:
+    """Joint parametric bootstrap (minimal: strike/twist/shear/gain CIs).
+
+    Generates per-site parametric noise around the original-data
+    primary-mode prediction, runs joint multi-start per band per
+    replica, extracts per-replica primary-mode canonical-form
+    parameters. Per-station regional Z bootstrap CIs are not stored;
+    the per-replica primary-mode parameters are sufficient for users
+    to compute custom CIs offline.
+
+    Parameters
+    ----------
+    z_obs_per_site_full : (n_sites, n_periods, 2, 2) complex128
+    sigma_per_site_full : (n_sites, n_periods, 2, 2) float64
+    selected_periods : (n_periods,) float64
+    bands : list of int ndarrays
+    band_modes_list : list of (band_idx, modes) from the original-
+        data joint fit; used to build per-replica predictions.
+    realisations : int, >= 1
+    n_starts, bounds_override, rng, mode_tolerance,
+        perturbation_scale, mode_warning_threshold
+        Passed through.
+
+    Returns
+    -------
+    dict with keys:
+        'strike'      : (realisations, n_periods) float, degrees
+        'twist'       : (realisations, n_periods, n_sites) float
+        'shear'       : (realisations, n_periods, n_sites) float
+        'gain'        : (realisations, n_periods, n_sites) float
+        'rms_misfit'  : (realisations,) float
+        'mode_warning': (realisations,) bool
+    """
+    if realisations < 1:
+        raise ValueError(
+            f"_bootstrap_decompose_joint: realisations must be >= 1, "
+            f"got {realisations}"
+        )
+
+    n_sites = z_obs_per_site_full.shape[0]
+    n_periods = z_obs_per_site_full.shape[1]
+
+    # Build per-site predictions from the original-data primary modes.
+    # Reuse single-site _predict_z_from_primary_modes by viewing each
+    # site's modes as if it were a stand-alone single-site problem;
+    # we only need the forward-model predictions, so rebuild here.
+    z_predicted_per_site = np.full(
+        (n_sites, n_periods, 2, 2), np.nan, dtype=np.complex128
+    )
+    best_rms = np.full((n_sites, n_periods), np.inf)
+    mu0 = 4.0 * np.pi * 1.0e-7
+    factor = 2.0 * np.pi * mu0
+    for band_idx, modes in band_modes_list:
+        primary = modes[0]
+        n_band_freqs = len(band_idx)
+        band_periods = selected_periods[band_idx]
+        unpacked = _unpack_x_joint(primary.band_result.x_opt, n_sites, n_band_freqs)
+        theta = unpacked[0]
+        twist = unpacked[1]
+        shear = unpacked[2]
+        log10_gain = unpacked[3]
+        log10_rho_a = unpacked[5]
+        phase_a = unpacked[6]
+        log10_rho_b = unpacked[7]
+        phase_b = unpacked[8]
+        for i in range(n_sites):
+            t_i = np.tan(twist[i])
+            e_i = np.tan(shear[i])
+            gain_i = 10.0 ** log10_gain[i]
+            rho_a = 10.0 ** log10_rho_a[i]
+            rho_b = 10.0 ** log10_rho_b[i]
+            abs_a = np.sqrt(rho_a * factor / band_periods)
+            abs_b = np.sqrt(rho_b * factor / band_periods)
+            a_band = abs_a * np.exp(1j * phase_a[i])
+            b_band = abs_b * np.exp(1j * phase_b[i])
+            for local_k, global_k in enumerate(band_idx):
+                if primary.rms_misfit < best_rms[i, global_k]:
+                    z_predicted_per_site[i, global_k] = gain_i * _estim_imp(
+                        a_band[local_k], b_band[local_k], t_i, e_i, theta
+                    )
+                    best_rms[i, global_k] = primary.rms_misfit
+
+    if np.any(np.isnan(z_predicted_per_site)):
+        raise RuntimeError(
+            "_bootstrap_decompose_joint: some periods not covered by "
+            "any band's primary-mode prediction"
+        )
+
+    replicates = {
+        "strike": np.full((realisations, n_periods), np.nan),
+        "twist": np.full((realisations, n_periods, n_sites), np.nan),
+        "shear": np.full((realisations, n_periods, n_sites), np.nan),
+        "gain": np.full((realisations, n_periods, n_sites), np.nan),
+        "rms_misfit": np.full(realisations, np.nan),
+        "mode_warning": np.full(realisations, False),
+    }
+
+    for rep_i in range(realisations):
+        z_replica = np.empty_like(z_predicted_per_site)
+        for i in range(n_sites):
+            z_replica[i] = _resample_residuals(
+                z_obs_per_site_full[i],
+                sigma_per_site_full[i],
+                z_predicted_per_site[i],
+                rng,
+            )
+
+        try:
+            bm_list = _decompose_bands_with_modes_joint(
+                z_obs_per_site_full=z_replica,
+                sigma_per_site_full=sigma_per_site_full,
+                selected_periods=selected_periods,
+                bands=bands,
+                n_starts=n_starts,
+                bounds_override=bounds_override,
+                rng=rng,
+                mode_tolerance=mode_tolerance,
+                perturbation_scale=perturbation_scale,
+            )
+        except Exception:
+            continue
+
+        for band_idx, modes in bm_list:
+            primary = modes[0]
+            n_band_freqs = len(band_idx)
+            cf = _canonical_form_summary_joint(
+                primary.band_result, n_sites, n_band_freqs
+            )
+            for global_k in band_idx:
+                replicates["strike"][rep_i, global_k] = cf["strike_deg"]
+                replicates["twist"][rep_i, global_k, :] = cf["per_site_twist_deg"]
+                replicates["shear"][rep_i, global_k, :] = cf["per_site_shear_deg"]
+                replicates["gain"][rep_i, global_k, :] = (
+                    10.0 ** cf["per_site_log10_gain"]
+                )
+
+        all_rms = np.array([m[0].rms_misfit for _, m in bm_list])
+        replicates["rms_misfit"][rep_i] = float(np.sqrt(np.mean(all_rms**2)))
+        for _, modes in bm_list:
+            if len(modes) >= 2:
+                ratio = modes[1].rms_misfit / max(modes[0].rms_misfit, 1e-30)
+                if ratio <= mode_warning_threshold:
+                    replicates["mode_warning"][rep_i] = True
                     break
 
     return replicates
