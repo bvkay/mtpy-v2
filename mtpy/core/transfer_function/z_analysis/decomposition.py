@@ -48,10 +48,12 @@ from __future__ import annotations
 
 import warnings
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, TYPE_CHECKING
 
 import numpy as np
 import xarray as xr
+from loguru import logger
 from scipy.optimize import least_squares
 
 
@@ -64,6 +66,7 @@ if TYPE_CHECKING:
 __all__ = [
     "DecompositionResult",
     "decompose",
+    "decompose_each_station",
     "decompose_joint",
 ]
 
@@ -163,6 +166,109 @@ class DecompositionResult:
     options: dict[str, Any] = field(default_factory=dict)
     metadata: dict[str, Any] = field(default_factory=dict)
     frame: str = "measurement"
+
+    def __getstate__(self):
+        """Pickle-friendly state.
+
+        ``Z`` instances hold loguru references that cannot pickle
+        (loguru sinks include open file handles). We convert each
+        Z to a plain ``(z, z_error, frequency)`` tuple at pickle
+        time and reconstitute on unpickle.
+        """
+        state = self.__dict__.copy()
+        state["regional_z"] = _z_to_serialisable(self.regional_z)
+        return state
+
+    def __setstate__(self, state):
+        state["regional_z"] = _z_from_serialisable(state["regional_z"])
+        self.__dict__.update(state)
+
+    def save(self, path: "str | Path") -> None:
+        """Save this result to a pickle file.
+
+        Pickle is the simplest and fastest serialisation, suitable for
+        "save my session, restart Python, plot the same result"
+        workflows. It is not robust across mtpy-v2 version changes —
+        if class internals change, old pickles may fail to load. For
+        archival or sharing, use :meth:`to_netcdf` instead.
+
+        Parameters
+        ----------
+        path : str or Path
+            Output path. Convention: ``.pkl`` extension.
+
+        See Also
+        --------
+        load : Inverse operation.
+        to_netcdf : Archival serialisation (more robust).
+        """
+        import pickle as _pickle
+
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("wb") as f:
+            _pickle.dump(self, f, protocol=_pickle.HIGHEST_PROTOCOL)
+        logger.info(f"DecompositionResult saved to {path}")
+
+    @classmethod
+    def load(cls, path: "str | Path") -> "DecompositionResult":
+        """Load a result previously written by :meth:`save`.
+
+        Parameters
+        ----------
+        path : str or Path
+
+        Returns
+        -------
+        DecompositionResult
+
+        Raises
+        ------
+        FileNotFoundError
+            If the file is missing.
+        TypeError
+            If the unpickled object is not a DecompositionResult.
+        """
+        import pickle as _pickle
+
+        path = Path(path)
+        with path.open("rb") as f:
+            obj = _pickle.load(f)
+        if not isinstance(obj, cls):
+            raise TypeError(
+                f"DecompositionResult.load: file at {path} unpickled "
+                f"to {type(obj).__name__}, not DecompositionResult"
+            )
+        logger.info(f"DecompositionResult loaded from {path}")
+        return obj
+
+    def to_netcdf(self, path: "str | Path") -> None:
+        """Save this result to NetCDF + sidecar JSON for archival.
+
+        The ``parameters`` Dataset is written as a NetCDF file. The
+        ``regional_z`` (Z object for single-site, ``dict[str, Z]``
+        for joint) is serialised into additional groups within the
+        same NetCDF file. The ``metadata`` dict is written to a
+        sidecar JSON file (``<path>.metadata.json``) with NumPy
+        arrays converted to a tagged-list form that round-trips back
+        to ndarrays on load.
+
+        More robust than :meth:`save` (pickle) across mtpy-v2 version
+        changes because NetCDF and JSON are stable formats. More
+        expensive (~100x slower for large results).
+
+        Parameters
+        ----------
+        path : str or Path
+            NetCDF output path. Convention: ``.nc`` extension. The
+            sidecar JSON is written to ``<path>.metadata.json``.
+        """
+        return _save_to_netcdf(self, path)
+
+    @classmethod
+    def from_netcdf(cls, path: "str | Path") -> "DecompositionResult":
+        """Inverse of :meth:`to_netcdf`."""
+        return _load_from_netcdf(cls, path)
 
 
 def decompose(
@@ -1362,6 +1468,90 @@ def decompose_joint(
         metadata=metadata,
         frame="measurement",
     )
+
+
+def decompose_each_station(
+    collection_or_list: "MTCollection | list[MT]",
+    *,
+    skip_failed: bool = True,
+    **decompose_kwargs,
+) -> dict[str, DecompositionResult]:
+    """Run single-site :func:`decompose` per station; return as dict.
+
+    For surveys where per-station period grids differ enough that
+    :func:`decompose_joint` cannot run (the common case for real
+    data — see ``~/MT_Decomp/findings/real_data_exploration.md``),
+    this function provides the per-station equivalent. Each station's
+    impedance tensor is decomposed independently using
+    :func:`decompose`; results are returned in a dict keyed by
+    station identifier.
+
+    The plotting module accepts ``dict[station_id,
+    DecompositionResult]`` directly for multi-station overlay plots,
+    so this is the natural input path for plot functions when joint
+    fitting isn't usable.
+
+    Parameters
+    ----------
+    collection_or_list : MTCollection or list of MT
+        Input stations. Same accepted types as :func:`decompose_joint`.
+    skip_failed : bool, default True
+        If True, stations whose :func:`decompose` raises are logged
+        and skipped (excluded from the result dict). If False, the
+        first failure raises.
+    **decompose_kwargs
+        Forwarded to :func:`decompose` for each station. Common
+        choices: ``n_starts``, ``realisations``, ``mode_tolerance``,
+        ``seed``.
+
+    Returns
+    -------
+    dict
+        Mapping from station identifier (``mt.station``) to
+        :class:`DecompositionResult`.
+
+    Raises
+    ------
+    ValueError
+        If no stations are provided.
+
+    Notes
+    -----
+    Cost scales as ``n_stations × decompose() cost``. On real BBMT
+    data this is typically 5-30 s per station with default settings.
+    With bootstrap (``realisations=100``), 1-5 minutes per station.
+    Long-running scripts should save the result via
+    :meth:`DecompositionResult.save` for later plotting rather than
+    re-running.
+    """
+    stations = _normalise_collection_input(collection_or_list)
+    if not stations:
+        raise ValueError("decompose_each_station: no stations provided")
+
+    results: dict[str, DecompositionResult] = {}
+    failed: list[tuple[str, str]] = []
+
+    for station_id, z in stations:
+        try:
+            result = decompose(z, **decompose_kwargs)
+            results[station_id] = result
+        except Exception as exc:
+            if skip_failed:
+                logger.warning(
+                    f"decompose_each_station: station {station_id!r} "
+                    f"failed: {type(exc).__name__}: {exc}"
+                )
+                failed.append((station_id, str(exc)))
+            else:
+                raise
+
+    if failed:
+        logger.info(
+            f"decompose_each_station: {len(failed)} of {len(stations)} "
+            f"stations failed; {len(results)} succeeded"
+        )
+
+    return results
 
 
 # ---------------------------------------------------------------------------
@@ -4774,3 +4964,309 @@ def _bootstrap_decompose_joint(
                     break
 
     return replicates
+
+
+# ---------------------------------------------------------------------------
+# Serialisation helpers (Session 8)
+# ---------------------------------------------------------------------------
+
+
+def _z_to_serialisable(regional_z):
+    """Convert a Z or dict[str, Z] into pickle/JSON-friendly arrays.
+
+    Z instances hold loguru references that cannot pickle. The
+    plain (z, z_error, frequency) form round-trips via
+    :func:`_z_from_serialisable`.
+    """
+    from mtpy.core.transfer_function.z import Z
+
+    if isinstance(regional_z, dict):
+        return {
+            "_kind": "dict",
+            "items": {sid: _z_to_serialisable(z) for sid, z in regional_z.items()},
+        }
+    if isinstance(regional_z, Z):
+        return {
+            "_kind": "Z",
+            "z": np.asarray(regional_z.z),
+            "z_error": (
+                None if regional_z.z_error is None else np.asarray(regional_z.z_error)
+            ),
+            "frequency": np.asarray(regional_z.frequency),
+        }
+    return regional_z
+
+
+def _z_from_serialisable(payload):
+    """Inverse of :func:`_z_to_serialisable`."""
+    from mtpy.core.transfer_function.z import Z
+
+    if not isinstance(payload, dict):
+        return payload
+    kind = payload.get("_kind")
+    if kind == "Z":
+        return Z(
+            z=payload["z"],
+            z_error=payload["z_error"],
+            frequency=payload["frequency"],
+        )
+    if kind == "dict":
+        return {sid: _z_from_serialisable(v) for sid, v in payload["items"].items()}
+    return payload
+
+
+def _sanitize_station_id(station_id: str) -> str:
+    """Encode a station_id for use as a NetCDF group name.
+
+    NetCDF group names follow CDL identifier rules: alphanumeric and
+    underscore only, must start with a letter or underscore. Real
+    station IDs (e.g. ``"KD-P5 R=KD-RR"``) routinely violate this.
+    We percent-encode disallowed characters so the encoding is
+    reversible.
+    """
+    import re
+    import urllib.parse
+
+    encoded = urllib.parse.quote(station_id, safe="").replace("%", "_p_")
+    # Hyphens are not in CDL identifiers either; replace.
+    encoded = encoded.replace("-", "_d_").replace(".", "_dt_")
+    if not re.match(r"^[A-Za-z_]", encoded):
+        encoded = "s_" + encoded
+    return encoded
+
+
+def _desanitize_station_id(group_name: str) -> str:
+    """Inverse of :func:`_sanitize_station_id`."""
+    import urllib.parse
+
+    s = group_name
+    if s.startswith("s_"):
+        s = s[2:]
+    s = s.replace("_d_", "-").replace("_dt_", ".")
+    s = s.replace("_p_", "%")
+    return urllib.parse.unquote(s)
+
+
+def _json_serialise_numpy(obj):
+    """Default function for json.dump when encountering NumPy types
+    or Python complex numbers (which appear in bootstrap regional_z
+    replicates)."""
+    if isinstance(obj, np.ndarray):
+        if np.issubdtype(obj.dtype, np.complexfloating):
+            return {
+                "__complex_array__": True,
+                "real": obj.real.tolist(),
+                "imag": obj.imag.tolist(),
+                "dtype": str(obj.dtype),
+                "shape": list(obj.shape),
+            }
+        return {
+            "__numpy_array__": True,
+            "data": obj.tolist(),
+            "dtype": str(obj.dtype),
+            "shape": list(obj.shape),
+        }
+    if isinstance(obj, np.bool_):
+        return bool(obj)
+    if isinstance(obj, np.generic):
+        return obj.item()
+    if isinstance(obj, complex):
+        return {"__complex__": True, "real": obj.real, "imag": obj.imag}
+    raise TypeError(f"_json_serialise_numpy: unhandled type {type(obj)}")
+
+
+def _json_deserialise_numpy(d):
+    """object_hook for json.load that reconstructs NumPy arrays and
+    complex scalars."""
+    if isinstance(d, dict):
+        if d.get("__numpy_array__"):
+            arr = np.array(d["data"], dtype=d["dtype"])
+            return arr.reshape(d["shape"])
+        if d.get("__complex_array__"):
+            real = np.array(d["real"])
+            imag = np.array(d["imag"])
+            arr = (real + 1j * imag).astype(d["dtype"])
+            return arr.reshape(d["shape"])
+        if d.get("__complex__"):
+            return complex(d["real"], d["imag"])
+    return d
+
+
+def _z_to_dataset(z) -> xr.Dataset:
+    """Convert a Z to an xarray Dataset for NetCDF storage."""
+    z_arr = np.asarray(z.z)
+    return xr.Dataset(
+        {
+            "z_real": (("period", "i", "j"), z_arr.real),
+            "z_imag": (("period", "i", "j"), z_arr.imag),
+            "z_error": (
+                ("period", "i", "j"),
+                np.asarray(z.z_error)
+                if z.z_error is not None
+                else np.full(z_arr.shape, np.nan),
+            ),
+            "frequency": (("period",), np.asarray(z.frequency)),
+        },
+        attrs={"z_error_present": bool(z.z_error is not None)},
+    )
+
+
+def _dataset_to_z(ds: xr.Dataset):
+    """Inverse of :func:`_z_to_dataset`."""
+    from mtpy.core.transfer_function.z import Z
+
+    z_complex = ds["z_real"].values + 1j * ds["z_imag"].values
+    z_error = ds["z_error"].values
+    if not bool(ds.attrs.get("z_error_present", True)):
+        z_error = None
+    elif np.all(np.isnan(z_error)):
+        z_error = None
+    return Z(
+        z=z_complex,
+        z_error=z_error,
+        frequency=ds["frequency"].values,
+    )
+
+
+def _save_to_netcdf(result, path):
+    """Implementation of :meth:`DecompositionResult.to_netcdf`.
+
+    Writes a single flat NetCDF file (scipy backend, no groups) with
+    parameters + chi_squared + regional_z merged into one Dataset.
+    Metadata and scalar fields go to a sidecar JSON.
+    """
+    import json
+
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    combined = result.parameters.copy()
+    combined["chi_squared_per_period"] = result.chi_squared
+
+    if isinstance(result.regional_z, dict):
+        station_ids = list(result.parameters.coords["station"].values)
+        n_periods = len(result.parameters.coords["period"])
+        n_sites = len(station_ids)
+        rz_real = np.full((n_sites, n_periods, 2, 2), np.nan)
+        rz_imag = np.full((n_sites, n_periods, 2, 2), np.nan)
+        rz_err = np.full((n_sites, n_periods, 2, 2), np.nan)
+        err_present_all = True
+        for i, sid in enumerate(station_ids):
+            z = result.regional_z[sid]
+            z_arr = np.asarray(z.z)
+            rz_real[i] = z_arr.real
+            rz_imag[i] = z_arr.imag
+            if z.z_error is None:
+                err_present_all = False
+            else:
+                rz_err[i] = np.asarray(z.z_error)
+        combined["regional_z_real"] = (("station", "period", "i", "j"), rz_real)
+        combined["regional_z_imag"] = (("station", "period", "i", "j"), rz_imag)
+        combined["regional_z_error"] = (("station", "period", "i", "j"), rz_err)
+        combined.attrs["regional_z_error_present"] = "1" if err_present_all else "0"
+        combined.attrs["regional_z_kind"] = "dict"
+        # All stations share frequency grid (validated at decompose_joint)
+        first_z = next(iter(result.regional_z.values()))
+        combined["regional_z_frequency"] = (
+            ("period",),
+            np.asarray(first_z.frequency),
+        )
+    else:
+        z = result.regional_z
+        z_arr = np.asarray(z.z)
+        combined["regional_z_real"] = (("period", "i", "j"), z_arr.real)
+        combined["regional_z_imag"] = (("period", "i", "j"), z_arr.imag)
+        if z.z_error is None:
+            combined["regional_z_error"] = (
+                ("period", "i", "j"),
+                np.full(z_arr.shape, np.nan),
+            )
+            combined.attrs["regional_z_error_present"] = "0"
+        else:
+            combined["regional_z_error"] = (
+                ("period", "i", "j"),
+                np.asarray(z.z_error),
+            )
+            combined.attrs["regional_z_error_present"] = "1"
+        combined.attrs["regional_z_kind"] = "single"
+        combined["regional_z_frequency"] = (
+            ("period",),
+            np.asarray(z.frequency),
+        )
+
+    combined.to_netcdf(path, mode="w")
+
+    metadata_path = Path(str(path) + ".metadata.json")
+    payload = {
+        "_method": result.method,
+        "_frame": result.frame,
+        "_rms_misfit": float(result.rms_misfit),
+        "_options": result.options,
+        "metadata": result.metadata,
+    }
+    with metadata_path.open("w") as f:
+        json.dump(payload, f, indent=2, default=_json_serialise_numpy)
+
+    logger.info(f"DecompositionResult written to {path} (+ {metadata_path.name})")
+
+
+def _load_from_netcdf(cls, path):
+    """Implementation of :meth:`DecompositionResult.from_netcdf`."""
+    import json
+
+    from mtpy.core.transfer_function.z import Z
+
+    path = Path(path)
+    metadata_path = Path(str(path) + ".metadata.json")
+    if not path.exists():
+        raise FileNotFoundError(f"NetCDF file not found: {path}")
+    if not metadata_path.exists():
+        raise FileNotFoundError(f"Metadata sidecar not found: {metadata_path}")
+
+    combined = xr.open_dataset(path).load()
+    kind = str(combined.attrs.get("regional_z_kind", "single"))
+    err_present = combined.attrs.get("regional_z_error_present", "1") == "1"
+
+    rz_real = combined["regional_z_real"].values
+    rz_imag = combined["regional_z_imag"].values
+    rz_err = combined["regional_z_error"].values
+    rz_freq = combined["regional_z_frequency"].values
+    chi_squared = combined["chi_squared_per_period"]
+
+    if kind == "dict":
+        station_ids = [str(s) for s in combined.coords["station"].values]
+        regional_z = {}
+        for i, sid in enumerate(station_ids):
+            z_complex = rz_real[i] + 1j * rz_imag[i]
+            z_error = rz_err[i] if err_present else None
+            regional_z[sid] = Z(z=z_complex, z_error=z_error, frequency=rz_freq)
+    else:
+        z_complex = rz_real + 1j * rz_imag
+        z_error = rz_err if err_present else None
+        regional_z = Z(z=z_complex, z_error=z_error, frequency=rz_freq)
+
+    drop_vars = [
+        "regional_z_real",
+        "regional_z_imag",
+        "regional_z_error",
+        "regional_z_frequency",
+        "chi_squared_per_period",
+    ]
+    parameters = combined.drop_vars([v for v in drop_vars if v in combined])
+    for attr_key in ("regional_z_kind", "regional_z_error_present"):
+        if attr_key in parameters.attrs:
+            del parameters.attrs[attr_key]
+
+    with metadata_path.open() as f:
+        payload = json.load(f, object_hook=_json_deserialise_numpy)
+
+    return cls(
+        parameters=parameters,
+        regional_z=regional_z,
+        chi_squared=chi_squared,
+        rms_misfit=float(payload.get("_rms_misfit", float("nan"))),
+        method=payload.get("_method", "groom_bailey"),
+        options=payload.get("_options", {}) or {},
+        metadata=payload.get("metadata", {}) or {},
+        frame=payload.get("_frame", "measurement"),
+    )

@@ -14,6 +14,8 @@ existing fixture system rather than rolling their own Z factories.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import numpy as np
 import pytest
 import xarray as xr
@@ -2573,3 +2575,234 @@ class TestDecomposeJointBootstrap:
         replicas = result.metadata["bootstrap_replicates"]
         assert replicas["strike"].shape[0] == 3
         assert replicas["twist"].shape == (3, 4, 2)
+
+
+# ============================================================
+# Session 8 — decompose_each_station + serialisation tests
+# ============================================================
+
+
+from mtpy.core.transfer_function.z_analysis.decomposition import decompose_each_station
+
+
+class TestDecomposeEachStation:
+    """decompose_each_station handles per-station decomposition."""
+
+    def test_returns_dict_keyed_by_station(self):
+        stations, _ = _make_synthetic_joint_collection(n_sites=3, n_freqs=4)
+        results = decompose_each_station(stations, n_starts=2)
+        assert isinstance(results, dict)
+        assert len(results) == 3
+        for station_id, result in results.items():
+            assert isinstance(result, DecompositionResult)
+            assert result.method == "groom_bailey"
+        assert set(results.keys()) == {"s0", "s1", "s2"}
+
+    def test_skip_failed_default(self):
+        stations, _ = _make_synthetic_joint_collection(n_sites=3, n_freqs=4)
+        # Replace second station's Z with one missing z_error
+        bad_z = Z(
+            z=np.asarray(stations[1].Z.z),
+            frequency=np.asarray(stations[1].Z.frequency),
+        )
+        stations[1].Z = bad_z
+        results = decompose_each_station(stations, n_starts=2)
+        assert "s1" not in results
+        assert "s0" in results
+        assert "s2" in results
+
+    def test_skip_failed_false_raises(self):
+        stations, _ = _make_synthetic_joint_collection(n_sites=3, n_freqs=4)
+        bad_z = Z(
+            z=np.asarray(stations[1].Z.z),
+            frequency=np.asarray(stations[1].Z.frequency),
+        )
+        stations[1].Z = bad_z
+        with pytest.raises(ValueError):
+            decompose_each_station(stations, skip_failed=False, n_starts=2)
+
+    def test_empty_list_raises(self):
+        with pytest.raises(ValueError, match="no stations"):
+            decompose_each_station([])
+
+    def test_kwargs_forwarded(self):
+        stations, _ = _make_synthetic_joint_collection(n_sites=2, n_freqs=4)
+        results = decompose_each_station(stations, n_starts=3, seed=42)
+        for result in results.values():
+            assert result.metadata["n_starts_per_band"] == 3
+
+
+# ============================================================
+# Session 8 — DecompositionResult pickle round-trip
+# ============================================================
+
+
+def _make_simple_result(seed=0):
+    """Small synthetic single-site result for serialisation tests."""
+    z, _ = _build_synthetic_z(theta_deg=30.0, n_freqs=8, seed=seed)
+    return decompose(z, n_starts=2, seed=seed)
+
+
+def _make_simple_result_with_bootstrap(seed=0):
+    z, _ = _build_synthetic_z(theta_deg=30.0, n_freqs=8, seed=seed)
+    return decompose(z, n_starts=2, realisations=3, seed=seed)
+
+
+def _make_simple_joint_result(n_stations=3, seed=0):
+    stations, _ = _make_synthetic_joint_collection(
+        n_sites=n_stations, n_freqs=8, seed=seed
+    )
+    return decompose_joint(stations, n_starts=2, seed=seed)
+
+
+class TestDecompositionResultPickle:
+    """save() / load() round-trip preserves all fields."""
+
+    def test_round_trip_preserves_parameters(self, tmp_path):
+        result = _make_simple_result()
+        path = tmp_path / "result.pkl"
+        result.save(path)
+        loaded = DecompositionResult.load(path)
+        for var in result.parameters.data_vars:
+            np.testing.assert_array_equal(
+                result.parameters[var].values,
+                loaded.parameters[var].values,
+            )
+
+    def test_round_trip_preserves_regional_z(self, tmp_path):
+        result = _make_simple_result()
+        path = tmp_path / "result.pkl"
+        result.save(path)
+        loaded = DecompositionResult.load(path)
+        np.testing.assert_array_equal(result.regional_z.z, loaded.regional_z.z)
+
+    def test_round_trip_preserves_metadata(self, tmp_path):
+        result = _make_simple_result()
+        path = tmp_path / "result.pkl"
+        result.save(path)
+        loaded = DecompositionResult.load(path)
+        assert result.metadata.keys() == loaded.metadata.keys()
+        assert result.metadata["n_bands"] == loaded.metadata["n_bands"]
+        assert (
+            result.metadata["primary_mode_warning"]
+            == loaded.metadata["primary_mode_warning"]
+        )
+
+    def test_round_trip_with_bootstrap(self, tmp_path):
+        result = _make_simple_result_with_bootstrap()
+        path = tmp_path / "result.pkl"
+        result.save(path)
+        loaded = DecompositionResult.load(path)
+        assert "strike_ci_lower" in loaded.parameters
+        np.testing.assert_array_equal(
+            result.metadata["bootstrap_replicates"]["strike"],
+            loaded.metadata["bootstrap_replicates"]["strike"],
+        )
+
+    def test_round_trip_method_and_frame(self, tmp_path):
+        result = _make_simple_result()
+        path = tmp_path / "result.pkl"
+        result.save(path)
+        loaded = DecompositionResult.load(path)
+        assert loaded.method == result.method
+        assert loaded.frame == result.frame
+        assert loaded.rms_misfit == result.rms_misfit
+
+    def test_load_wrong_type_raises(self, tmp_path):
+        import pickle
+
+        path = tmp_path / "wrong.pkl"
+        with path.open("wb") as f:
+            pickle.dump({"not": "a result"}, f)
+        with pytest.raises(TypeError, match="unpickled to"):
+            DecompositionResult.load(path)
+
+
+class TestDecompositionResultNetcdf:
+    """to_netcdf() / from_netcdf() round-trip preserves all fields."""
+
+    def test_round_trip_single_site(self, tmp_path):
+        result = _make_simple_result()
+        path = tmp_path / "result.nc"
+        result.to_netcdf(path)
+        assert path.exists()
+        assert (path.parent / (path.name + ".metadata.json")).exists()
+
+        loaded = DecompositionResult.from_netcdf(path)
+        for var in result.parameters.data_vars:
+            np.testing.assert_array_equal(
+                result.parameters[var].values,
+                loaded.parameters[var].values,
+            )
+        np.testing.assert_array_equal(
+            np.asarray(result.regional_z.z),
+            np.asarray(loaded.regional_z.z),
+        )
+
+    def test_round_trip_method_frame_rms(self, tmp_path):
+        result = _make_simple_result()
+        path = tmp_path / "result.nc"
+        result.to_netcdf(path)
+        loaded = DecompositionResult.from_netcdf(path)
+        assert loaded.method == result.method
+        assert loaded.frame == result.frame
+        np.testing.assert_allclose(loaded.rms_misfit, result.rms_misfit)
+
+    def test_round_trip_joint(self, tmp_path):
+        result = _make_simple_joint_result(n_stations=3)
+        path = tmp_path / "joint.nc"
+        result.to_netcdf(path)
+        loaded = DecompositionResult.from_netcdf(path)
+        assert isinstance(loaded.regional_z, dict)
+        assert set(result.regional_z.keys()) == set(loaded.regional_z.keys())
+        for sid in result.regional_z:
+            np.testing.assert_array_equal(
+                np.asarray(result.regional_z[sid].z),
+                np.asarray(loaded.regional_z[sid].z),
+            )
+
+    def test_round_trip_with_special_station_ids(self, tmp_path):
+        # NetCDF group names need sanitisation; verify reversible
+        from mtpy.core.transfer_function.z_analysis.decomposition import (
+            _desanitize_station_id,
+            _sanitize_station_id,
+        )
+
+        for sid in ("KD-P5 R=KD-RR", "Burra01.edi", "1station", "abc"):
+            safe = _sanitize_station_id(sid)
+            assert _desanitize_station_id(safe) == sid
+
+    def test_round_trip_with_bootstrap(self, tmp_path):
+        result = _make_simple_result_with_bootstrap()
+        path = tmp_path / "result.nc"
+        result.to_netcdf(path)
+        loaded = DecompositionResult.from_netcdf(path)
+        assert "strike_ci_lower" in loaded.parameters
+        np.testing.assert_array_equal(
+            result.metadata["bootstrap_replicates"]["strike"],
+            loaded.metadata["bootstrap_replicates"]["strike"],
+        )
+
+    def test_metadata_nested_dict_preserved(self, tmp_path):
+        result = _make_simple_result()
+        path = tmp_path / "nested.nc"
+        result.to_netcdf(path)
+        loaded = DecompositionResult.from_netcdf(path)
+        assert len(result.metadata["per_band"]) == len(loaded.metadata["per_band"])
+        for ba, bb in zip(result.metadata["per_band"], loaded.metadata["per_band"]):
+            assert ba["modes"][0]["rms_misfit"] == pytest.approx(
+                bb["modes"][0]["rms_misfit"]
+            )
+
+    def test_missing_sidecar_raises(self, tmp_path):
+        result = _make_simple_result()
+        path = tmp_path / "result.nc"
+        result.to_netcdf(path)
+        sidecar = Path(str(path) + ".metadata.json")
+        sidecar.unlink()
+        with pytest.raises(FileNotFoundError, match="Metadata sidecar"):
+            DecompositionResult.from_netcdf(path)
+
+    def test_missing_netcdf_raises(self, tmp_path):
+        with pytest.raises(FileNotFoundError, match="NetCDF file"):
+            DecompositionResult.from_netcdf(tmp_path / "nonexistent.nc")
