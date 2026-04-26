@@ -2806,3 +2806,37 @@ class TestDecompositionResultNetcdf:
     def test_missing_netcdf_raises(self, tmp_path):
         with pytest.raises(FileNotFoundError, match="NetCDF file"):
             DecompositionResult.from_netcdf(tmp_path / "nonexistent.nc")
+
+
+class TestRegionalZAsZ:
+    """regional_z_as_z dispatcher unifies single-site / joint results."""
+
+    def test_single_site_returns_z(self):
+        result = _make_simple_result()
+        z = result.regional_z_as_z()
+        assert isinstance(z, Z)
+        assert z.z.shape[0] == result.parameters.sizes["period"]
+        assert z.z.shape[1:] == (2, 2)
+
+    def test_single_site_ignores_station_id(self):
+        result = _make_simple_result()
+        z1 = result.regional_z_as_z()
+        z2 = result.regional_z_as_z(station_id="anything")
+        np.testing.assert_array_equal(z1.z, z2.z)
+
+    def test_joint_requires_station_id(self):
+        result = _make_simple_joint_result(n_stations=3)
+        with pytest.raises(ValueError, match="station_id is required"):
+            result.regional_z_as_z()
+
+    def test_joint_station_id_returns_correct_station(self):
+        result = _make_simple_joint_result(n_stations=3)
+        first = sorted(result.regional_z)[0]
+        z = result.regional_z_as_z(station_id=first)
+        assert isinstance(z, Z)
+        np.testing.assert_array_equal(z.z, result.regional_z[first].z)
+
+    def test_joint_unknown_station_raises(self):
+        result = _make_simple_joint_result(n_stations=3)
+        with pytest.raises(ValueError, match="not in result"):
+            result.regional_z_as_z(station_id="DOES_NOT_EXIST")

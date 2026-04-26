@@ -270,6 +270,62 @@ class DecompositionResult:
         """Inverse of :meth:`to_netcdf`."""
         return _load_from_netcdf(cls, path)
 
+    def regional_z_as_z(self, station_id: "str | None" = None) -> "Z":
+        """Return the regional impedance for one station as a :class:`Z`.
+
+        Single-site results store ``regional_z`` as a :class:`Z`
+        directly; joint results store ``dict[station_id, Z]``. This
+        helper is a unified dispatcher so callers can write the same
+        code regardless of which kind of result they hold:
+
+        - For single-site results, returns ``self.regional_z``
+          unchanged. ``station_id`` is ignored.
+        - For joint results, returns ``self.regional_z[station_id]``.
+
+        Parameters
+        ----------
+        station_id : str, optional
+            Required for joint results.
+
+        Returns
+        -------
+        Z
+            Regional impedance for the requested station, in
+            measurement frame.
+
+        Raises
+        ------
+        ValueError
+            If the result is joint and ``station_id`` is None, or
+            if ``station_id`` is not in the result's stations.
+
+        Examples
+        --------
+        Single-site result, feed straight into mtpy-v2's phase-tensor
+        tooling:
+
+        >>> result = decompose(z)
+        >>> z_regional = result.regional_z_as_z()
+        >>> phase_tensor = z_regional.phase_tensor
+
+        Joint result, pull a specific station:
+
+        >>> joint = decompose_joint(stations)
+        >>> z_sta1 = joint.regional_z_as_z(station_id="STA001")
+        """
+        if isinstance(self.regional_z, dict):
+            if station_id is None:
+                raise ValueError(
+                    "regional_z_as_z: this is a joint result; " "station_id is required"
+                )
+            if station_id not in self.regional_z:
+                raise ValueError(
+                    f"regional_z_as_z: station_id={station_id!r} not "
+                    f"in result; available: {sorted(self.regional_z)}"
+                )
+            return self.regional_z[station_id]
+        return self.regional_z
+
 
 def decompose(
     z: "Z",
@@ -449,6 +505,49 @@ def decompose(
     ``metadata['bootstrap_mode_warning_fraction']``; if that
     exceeds 50%, ``metadata['bootstrap_robustness_warning']`` flags
     that single-mode CIs are unreliable for this dataset.
+
+    Gauge equivalences and non-identifiability. The Groom-Bailey
+    parameterisation has two structural identifiability issues that
+    surface in the result:
+
+    - ``anisotropy``: structurally non-identifiable from MT data
+      alone. The forward model has no anisotropy dependence, so
+      this column of the Jacobian is identically zero; the
+      reported ``anisotropy_error`` is ``inf``.
+    - ``gain``: gauge-equivalent at the band level — the forward
+      model satisfies ``(a, b, gain) -> (gain*a, gain*b, 1)`` so
+      different starts converge to physically-equivalent solutions
+      with different gain / |a| / |b| splits. Reported gain values
+      are the optimiser's chosen gauge, not a discriminating
+      physical signal.
+
+    Both parameters are kept in the result for symmetric structure;
+    plot the regional impedance magnitudes (or apparent resistivity)
+    rather than gain alone for physical interpretation.
+
+    Examples
+    --------
+    Single-site decomposition with default settings:
+
+    >>> from mtpy.core.transfer_function.z_analysis.decomposition import (
+    ...     decompose,
+    ... )
+    >>> result = decompose(z, n_starts=5, seed=42)
+    >>> float(result.parameters["strike"].median())
+    >>> result.metadata["primary_mode_warning"]
+
+    With bootstrap for empirical CIs:
+
+    >>> result = decompose(z, n_starts=5, realisations=100, seed=42)
+    >>> result.parameters["strike_ci_lower"].values
+
+    Save and reload:
+
+    >>> result.save("decomp.pkl")
+    >>> from mtpy.core.transfer_function.z_analysis.decomposition import (
+    ...     DecompositionResult,
+    ... )
+    >>> result2 = DecompositionResult.load("decomp.pkl")
 
     For the McNeice-Jones multi-site joint decomposition, see
     :func:`decompose_joint`.
@@ -1025,9 +1124,31 @@ def decompose_joint(
     n_freqs)`` parameters. With 5 sites and 5 freqs/band, that is
     ~120 parameters per band. TRF with the analytic Jacobian handles
     this efficiently; per-band fits typically converge in well under
-    a second. Bootstrap multiplies cost by ``realisations`` (default
-    when opted in: 100). Recommend exploratory analysis with
-    ``realisations=0`` and ``n_starts=2``.
+    a second on synthetic data.
+
+    Real-data observations from the Vulcan_2022 BBMT dataset (62
+    periods per station, ~5 bands at default ``bandwidth=1.0``):
+
+      - ``decompose_joint`` on 9 stations, ``n_starts=5``,
+        ``realisations=0``: ~19 minutes
+      - With ``realisations=50``: ~22 minutes
+      - With ``realisations=100``: extrapolates to ~30+ minutes
+
+    Cost scales as roughly
+    ``realisations × n_starts × n_bands × per_band_cost``, with
+    ``per_band_cost`` rising sharply with ``n_sites`` (more sites
+    means more parameters and slower TRF iterations). For
+    exploratory analysis on real data, start with
+    ``realisations=0`` and ``n_starts=2``; promote to the full
+    multi-start with bootstrap for final analysis only.
+
+    Real data also routinely has ragged frequency grids across
+    stations (only ~1 of 25 stations matched the first station's
+    grid in the Burra_2017-18 and Kalkaroo_2022 datasets).
+    :func:`decompose_joint` requires a common grid and raises if
+    inputs disagree. For surveys with ragged grids, either
+    pre-resample to a common grid or use
+    :func:`decompose_each_station` for per-station analysis.
 
     For ``n_sites == 1``, joint decomposition reduces to single-site
     :func:`decompose` modulo the result data structure (verified by
@@ -5077,7 +5198,14 @@ def _json_serialise_numpy(obj):
 
 def _json_deserialise_numpy(d):
     """object_hook for json.load that reconstructs NumPy arrays and
-    complex scalars."""
+    complex scalars.
+
+    Bootstrap regional_z replicates contain both np.complex128
+    arrays (the typed paths) and Python complex scalars (the latter
+    arise when NumPy indexing returns a 0-d slice and is converted
+    via .item()). The ``__complex_array__`` and ``__complex__`` tags
+    handle both forms so round-trip via JSON is exact.
+    """
     if isinstance(d, dict):
         if d.get("__numpy_array__"):
             arr = np.array(d["data"], dtype=d["dtype"])

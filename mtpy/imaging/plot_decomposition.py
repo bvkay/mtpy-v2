@@ -410,7 +410,8 @@ class PlotDecompositionTwistShear:
 
         _annotate_rms(ax_twist, self.result, x=0.02, y=0.95, ha="left", va="top")
         ax_twist.set_title("Recovered distortion: twist and shear")
-        fig.tight_layout()
+        if fig.get_layout_engine() is None:
+            fig.tight_layout()
         return fig
 
 
@@ -493,7 +494,8 @@ class PlotDecompositionApparentResistivity:
 
         _annotate_rms(ax_rho, self.result, x=0.02, y=0.05, ha="left", va="bottom")
         ax_rho.set_title("Recovered regional apparent resistivity and phase")
-        fig.tight_layout()
+        if fig.get_layout_engine() is None:
+            fig.tight_layout()
         return fig
 
 
@@ -562,7 +564,8 @@ class PlotDecompositionChiSquared:
 
         _annotate_rms(ax, self.result, x=0.02, y=0.95, ha="left", va="top")
         ax.set_title("Per-period chi-squared")
-        fig.tight_layout()
+        if fig.get_layout_engine() is None:
+            fig.tight_layout()
         return fig
 
 
@@ -656,7 +659,8 @@ class PlotDecompositionModeLandscape:
             ax.legend(seen.values(), seen.keys(), loc="best", fontsize=8)
         ax.set_title("Per-band mode landscape")
         _annotate_rms(ax, self.result, x=0.98, y=0.95, ha="right", va="top")
-        fig.tight_layout()
+        if fig.get_layout_engine() is None:
+            fig.tight_layout()
         return fig
 
 
@@ -758,7 +762,8 @@ class PlotDecompositionBootstrap:
             f"Bootstrap distributions ({replicates['strike'].shape[0]} reps)",
             fontsize=12,
         )
-        fig.tight_layout()
+        if fig.get_layout_engine() is None:
+            fig.tight_layout()
         return fig
 
 
@@ -801,7 +806,11 @@ def plot_decomposition_summary(
         1 if (show_diagnostics and has_bootstrap) else 0
     )
 
-    fig = plt.figure(figsize=figsize)
+    # constrained_layout handles the polar+Cartesian axis combinations
+    # cleanly. Per-plotter tight_layout calls are guarded to skip when
+    # a layout engine is already set on the figure (i.e., when this
+    # summary is the parent).
+    fig = plt.figure(figsize=figsize, constrained_layout=True)
     nrows = 2 + n_extra
     gs = fig.add_gridspec(nrows, 2, hspace=0.38, wspace=0.28)
 
