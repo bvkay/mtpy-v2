@@ -1,20 +1,9 @@
-"""Groom-Bailey / McNeice-Jones magnetotelluric tensor decomposition.
+"""Groom-Bailey single-site and McNeice-Jones joint decomposition.
 
-This module provides single-site (Groom & Bailey, 1989) and multi-site
-joint (McNeice & Jones, 2001) decomposition of the magnetotelluric
-impedance tensor, recovering the regional 2-D impedance and the
-galvanic distortion parameters at each site.
-
-It is a sibling to the existing
-:mod:`mtpy.core.transfer_function.z_analysis.distortion` module which
-provides Bibby et al. (2005) decomposition. The two methods are
-distinct: Bibby fits a single 2x2 distortion matrix per site by
-frequency-averaging; Groom-Bailey factorises the distortion into named
-geometric parameters (gain, twist, shear, anisotropy) and fits these
-jointly with the regional strike and impedances across multiple
-frequencies. For most use cases, Groom-Bailey gives a richer and more
-interpretable result; Bibby is faster and more robust at sites with
-poor multi-frequency coverage.
+Implements the public :func:`decompose`, :func:`decompose_joint`, and
+:func:`decompose_each_station` entry points and the per-band
+optimisation, multi-start orchestration, and parametric-bootstrap
+machinery they rely on.
 
 References
 ----------
@@ -23,39 +12,42 @@ impedance tensors in the presence of local three-dimensional galvanic
 distortion. Journal of Geophysical Research: Solid Earth, 94(B2),
 1913-1925.
 
-McNeice, G. W., & Jones, A. G. (2001). Multisite, multifrequency
-tensor decomposition of magnetotelluric data. Geophysics, 66(1),
-158-173.
-
-See also
---------
-:mod:`mtpy.core.transfer_function.z_analysis.distortion` :
-    Bibby (2005) decomposition.
-:mod:`mtpy.core.transfer_function.pt` :
-    Phase tensor (Caldwell et al. 2004); distortion-invariant
-    representation.
-
-Notes
------
-This module ships pure-Python implementations of the GB and MJ
-algorithms. Validation has been performed against historical Fortran
-implementations (Strike, McNeice-Jones); see the project's
-documentation for tolerance specifications and the optimiser-gap
-analysis.
+McNeice, G. W., & Jones, A. G. (2001). Multisite, multifrequency tensor
+decomposition of magnetotelluric data. Geophysics, 66(1), 158-173.
 """
 
 from __future__ import annotations
 
-import warnings
-from dataclasses import dataclass, field
-from pathlib import Path
-from typing import Any, TYPE_CHECKING
+from typing import TYPE_CHECKING
 
 import numpy as np
 import xarray as xr
 from loguru import logger
 from scipy.optimize import least_squares
 
+from .common import (
+    _BandResult,
+    _band_arrays_to_z,
+    _estim_imp,
+    _extract_bands,
+    _normalise_collection_input,
+    _unpack_x,
+    _unpack_x_joint,
+    _validate_joint_input,
+)
+from .results import DecompositionResult
+from .symmetries import (
+    _DEFAULT_MODE_TOLERANCE,
+    _Mode,
+    _canonical_form_summary_joint,
+    _canonicalise_solution,
+    _cluster_modes,
+    _cluster_modes_joint,
+    _compute_mode_probabilities,
+    _compute_mode_probabilities_joint,
+    _detect_band_disagreement,
+    _detect_primary_mode_warning,
+)
 
 if TYPE_CHECKING:
     from mtpy.core.mt import MT
@@ -64,267 +56,10 @@ if TYPE_CHECKING:
 
 
 __all__ = [
-    "DecompositionResult",
     "decompose",
     "decompose_each_station",
     "decompose_joint",
 ]
-
-
-@dataclass
-class DecompositionResult:
-    """Result of a Groom-Bailey or McNeice-Jones decomposition.
-
-    Attributes
-    ----------
-    parameters : xarray.Dataset
-        Per-period decomposition parameters. Coordinates: ``period``
-        (in seconds). For multi-site joint decompositions an
-        additional ``station`` coordinate.
-
-        Data variables (all real-valued):
-
-        - ``strike`` : regional azimuth in degrees, in
-          ``[0, 180)``.
-        - ``twist``, ``shear`` : Groom-Bailey distortion angles in
-          degrees.
-        - ``gain`` : Groom-Bailey site gain (dimensionless).
-        - ``anisotropy`` : Groom-Bailey anisotropy parameter
-          (dimensionless; structurally non-identifiable from MT
-          alone, reported as fitted but flagged in metadata).
-        - ``strike_error``, ``twist_error``, ``shear_error``,
-          ``gain_error``, ``anisotropy_error`` : 1-sigma
-          uncertainties from the analytic Jacobian, in matching
-          units.
-
-    regional_z : Z
-        The decomposed regional impedance, as a fresh
-        :class:`mtpy.core.transfer_function.z.Z` object with
-        propagated errors.
-
-    chi_squared : xarray.DataArray
-        Per-period (or per-band) chi-squared values; coordinate
-        ``period``.
-
-    rms_misfit : float
-        Overall RMS misfit, weighted by the input ``z_error`` (or
-        ``z_model_error`` if used).
-
-    method : str
-        Identifier for the algorithm used:
-
-        - ``"groom_bailey"`` for single-site GB.
-        - ``"mcneice_jones_joint"`` for multi-site joint.
-
-    options : dict
-        Options passed to :func:`decompose` or
-        :func:`decompose_joint` for this result.
-
-    metadata : dict
-        Provenance: software versions, input identifier, RNG seed,
-        coordinate frame, strike convention, timestamp.
-
-    frame : str, default ``"measurement"``
-        Coordinate frame of ``regional_z``. ``"measurement"`` means
-        ``regional_z`` is in the same frame as the input ``z``;
-        rotating it by ``-strike`` per period recovers the
-        anti-diagonal strike-frame regional tensor. ``"strike"``
-        means ``regional_z`` is already in the strike frame
-        (anti-diagonal). Public callers receive ``"measurement"``
-        by default so plotting and downstream tools behave
-        consistently with the input ``z``.
-
-    Notes
-    -----
-    The 90-degree strike branch is folded into a canonical form:
-    each band's ``(strike, twist, shear)`` is mapped through the
-    ``(strike + 90 mod 180, -shear, twist)`` symmetry so that
-    ``strike`` lands in ``[0, 90)`` after the fold. The shear sign
-    is flipped together with the strike shift; twist is unchanged.
-    See :func:`_canonicalise_solution`.
-
-    The static-shift convention of ``gain`` matches that of
-    :meth:`mtpy.core.mt.MT.remove_static_shift`. Applying
-    :meth:`~mtpy.core.mt.MT.remove_static_shift` with the fitted
-    ``gain`` recovers the un-shifted regional impedance.
-
-    Examples
-    --------
-    Single-site decomposition of a station's impedance::
-
-        from mtpy.core.transfer_function.z_analysis.decomposition import decompose
-        result = decompose(my_mt.Z)
-        result.regional_z.plot_resistivity_phase()
-        print(result.parameters['strike'].values)
-    """
-
-    parameters: xr.Dataset
-    regional_z: "Z"
-    chi_squared: xr.DataArray
-    rms_misfit: float
-    method: str
-    options: dict[str, Any] = field(default_factory=dict)
-    metadata: dict[str, Any] = field(default_factory=dict)
-    frame: str = "measurement"
-
-    def __getstate__(self):
-        """Pickle-friendly state.
-
-        ``Z`` instances hold loguru references that cannot pickle
-        (loguru sinks include open file handles). We convert each
-        Z to a plain ``(z, z_error, frequency)`` tuple at pickle
-        time and reconstitute on unpickle.
-        """
-        state = self.__dict__.copy()
-        state["regional_z"] = _z_to_serialisable(self.regional_z)
-        return state
-
-    def __setstate__(self, state):
-        state["regional_z"] = _z_from_serialisable(state["regional_z"])
-        self.__dict__.update(state)
-
-    def save(self, path: "str | Path") -> None:
-        """Save this result to a pickle file.
-
-        Pickle is the simplest and fastest serialisation, suitable for
-        "save my session, restart Python, plot the same result"
-        workflows. It is not robust across mtpy-v2 version changes —
-        if class internals change, old pickles may fail to load. For
-        archival or sharing, use :meth:`to_netcdf` instead.
-
-        Parameters
-        ----------
-        path : str or Path
-            Output path. Convention: ``.pkl`` extension.
-
-        See Also
-        --------
-        load : Inverse operation.
-        to_netcdf : Archival serialisation (more robust).
-        """
-        import pickle as _pickle
-
-        path = Path(path)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("wb") as f:
-            _pickle.dump(self, f, protocol=_pickle.HIGHEST_PROTOCOL)
-        logger.info(f"DecompositionResult saved to {path}")
-
-    @classmethod
-    def load(cls, path: "str | Path") -> "DecompositionResult":
-        """Load a result previously written by :meth:`save`.
-
-        Parameters
-        ----------
-        path : str or Path
-
-        Returns
-        -------
-        DecompositionResult
-
-        Raises
-        ------
-        FileNotFoundError
-            If the file is missing.
-        TypeError
-            If the unpickled object is not a DecompositionResult.
-        """
-        import pickle as _pickle
-
-        path = Path(path)
-        with path.open("rb") as f:
-            obj = _pickle.load(f)
-        if not isinstance(obj, cls):
-            raise TypeError(
-                f"DecompositionResult.load: file at {path} unpickled "
-                f"to {type(obj).__name__}, not DecompositionResult"
-            )
-        logger.info(f"DecompositionResult loaded from {path}")
-        return obj
-
-    def to_netcdf(self, path: "str | Path") -> None:
-        """Save this result to NetCDF + sidecar JSON for archival.
-
-        The ``parameters`` Dataset is written as a NetCDF file. The
-        ``regional_z`` (Z object for single-site, ``dict[str, Z]``
-        for joint) is serialised into additional groups within the
-        same NetCDF file. The ``metadata`` dict is written to a
-        sidecar JSON file (``<path>.metadata.json``) with NumPy
-        arrays converted to a tagged-list form that round-trips back
-        to ndarrays on load.
-
-        More robust than :meth:`save` (pickle) across mtpy-v2 version
-        changes because NetCDF and JSON are stable formats. More
-        expensive (~100x slower for large results).
-
-        Parameters
-        ----------
-        path : str or Path
-            NetCDF output path. Convention: ``.nc`` extension. The
-            sidecar JSON is written to ``<path>.metadata.json``.
-        """
-        return _save_to_netcdf(self, path)
-
-    @classmethod
-    def from_netcdf(cls, path: "str | Path") -> "DecompositionResult":
-        """Inverse of :meth:`to_netcdf`."""
-        return _load_from_netcdf(cls, path)
-
-    def regional_z_as_z(self, station_id: "str | None" = None) -> "Z":
-        """Return the regional impedance for one station as a :class:`Z`.
-
-        Single-site results store ``regional_z`` as a :class:`Z`
-        directly; joint results store ``dict[station_id, Z]``. This
-        helper is a unified dispatcher so callers can write the same
-        code regardless of which kind of result they hold:
-
-        - For single-site results, returns ``self.regional_z``
-          unchanged. ``station_id`` is ignored.
-        - For joint results, returns ``self.regional_z[station_id]``.
-
-        Parameters
-        ----------
-        station_id : str, optional
-            Required for joint results.
-
-        Returns
-        -------
-        Z
-            Regional impedance for the requested station, in
-            measurement frame.
-
-        Raises
-        ------
-        ValueError
-            If the result is joint and ``station_id`` is None, or
-            if ``station_id`` is not in the result's stations.
-
-        Examples
-        --------
-        Single-site result, feed straight into mtpy-v2's phase-tensor
-        tooling:
-
-        >>> result = decompose(z)
-        >>> z_regional = result.regional_z_as_z()
-        >>> phase_tensor = z_regional.phase_tensor
-
-        Joint result, pull a specific station:
-
-        >>> joint = decompose_joint(stations)
-        >>> z_sta1 = joint.regional_z_as_z(station_id="STA001")
-        """
-        if isinstance(self.regional_z, dict):
-            if station_id is None:
-                raise ValueError(
-                    "regional_z_as_z: this is a joint result; " "station_id is required"
-                )
-            if station_id not in self.regional_z:
-                raise ValueError(
-                    f"regional_z_as_z: station_id={station_id!r} not "
-                    f"in result; available: {sorted(self.regional_z)}"
-                )
-            return self.regional_z[station_id]
-        return self.regional_z
 
 
 def decompose(
@@ -1061,7 +796,6 @@ def decompose(
         frame="measurement",
     )
 
-
 def decompose_joint(
     collection_or_list: "MTCollection | list[MT]",
     periods: tuple[float, float] | None = None,
@@ -1613,7 +1347,6 @@ def decompose_joint(
         frame="measurement",
     )
 
-
 def decompose_each_station(
     collection_or_list: "MTCollection | list[MT]",
     *,
@@ -1705,391 +1438,6 @@ def decompose_each_station(
 # the cross-validation tests against the Fortran reference. All are
 # pure-NumPy implementations of the GB89 specification, not
 # transcriptions of the Fortran reference.
-# ---------------------------------------------------------------------------
-
-
-def _mat_multiply(a: np.ndarray, b: np.ndarray) -> np.ndarray:
-    """Multiply two complex 2x2 matrices.
-
-    Implementation note: this is a one-liner via ``a @ b``. It exists
-    as a named helper because the Groom-Bailey forward model uses
-    matrix products in named steps, and giving them a name makes the
-    higher-level code (:func:`_estim_imp`) read closer to the
-    mathematical spec.
-
-    Parameters
-    ----------
-    a, b : (2, 2) complex ndarray
-        Input matrices.
-
-    Returns
-    -------
-    (2, 2) complex ndarray
-        The matrix product ``a @ b``.
-
-    Notes
-    -----
-    No shape or type checking. Internal helper; callers ensure
-    inputs.
-    """
-    return a @ b
-
-
-def _extreme(values: np.ndarray) -> tuple[float, float]:
-    """Return the (min, max) of a 1-D array.
-
-    Used in the bootstrap path when the number of realisations is
-    below the threshold for jackknife variance: extremal bounds are
-    reported instead of standard deviations.
-
-    Parameters
-    ----------
-    values : (n,) float ndarray
-        Real-valued samples.
-
-    Returns
-    -------
-    (vmin, vmax) : tuple of float
-        Minimum and maximum of ``values``.
-
-    Raises
-    ------
-    ValueError
-        If ``values`` is empty.
-
-    Notes
-    -----
-    The Fortran reference returns ``(vmax, vmin)`` (max first) per
-    its argument list; this Python helper returns ``(vmin, vmax)``
-    in the more conventional ascending order. Cross-validation
-    tests adapt the order at the call site.
-    """
-    if values.size == 0:
-        raise ValueError("_extreme: input array is empty")
-    return float(np.min(values)), float(np.max(values))
-
-
-def _convz2r(z: complex, period: float) -> float:
-    """Convert a complex impedance to apparent resistivity.
-
-    Formula: ``rho = |Z|**2 * T / (2 * pi * mu_0)``, where
-    ``mu_0 = 4*pi*1e-7`` H/m. Z is in SI units (V/m/T); period in
-    seconds; rho in ohm-metres.
-
-    Parameters
-    ----------
-    z : complex
-        Impedance, SI units.
-    period : float
-        Period in seconds.
-
-    Returns
-    -------
-    float
-        Apparent resistivity in ohm-metres.
-
-    Notes
-    -----
-    The Fortran reference uses a hardcoded ``factor = 1.0`` and
-    expects Z in SI units; so does this. If the input is in field
-    units (mV/km/nT), the caller must convert beforehand --
-    :class:`mtpy.core.transfer_function.z.Z` exposes ``.z`` in SI.
-    """
-    mu0 = 4.0 * np.pi * 1.0e-7
-    return float(abs(z) ** 2 * period / (2.0 * np.pi * mu0))
-
-
-def _convz2p(z: complex, period: float = 1.0) -> float:
-    """Phase of a complex impedance, in degrees.
-
-    Parameters
-    ----------
-    z : complex
-        Impedance.
-    period : float, default 1.0
-        Period argument retained for signature compatibility with
-        the Fortran reference; the value does not affect the output.
-        See Notes.
-
-    Returns
-    -------
-    float
-        Phase in degrees, in ``(-180, 180]`` via ``atan2``.
-
-    Notes
-    -----
-    The ``period`` parameter is vestigial: the Fortran ``convz2p``
-    declares it in its signature but never references it in the
-    body. We retain it for API parity to keep cross-validation
-    direct, and document this explicitly here so that a future
-    reviewer doesn't conclude the parameter is meaningful.
-    """
-    return float(np.degrees(np.arctan2(z.imag, z.real)))
-
-
-def _calc_error(z_data: np.ndarray, z_pred: np.ndarray, sigma: np.ndarray) -> float:
-    """Chi-squared residual between two impedance tensors.
-
-    Computes ``sum_{ij} |z_data[i,j] - z_pred[i,j]|**2 /
-    sigma[i,j]**2``, the standard chi-squared for complex-Gaussian
-    residuals.
-
-    Parameters
-    ----------
-    z_data, z_pred : (2, 2) complex ndarray
-        Observed and model-predicted impedance tensors.
-    sigma : (2, 2) float ndarray
-        Per-component standard deviations. Must be strictly
-        positive.
-
-    Returns
-    -------
-    float
-        Chi-squared value.
-
-    Raises
-    ------
-    ValueError
-        If ``sigma`` contains non-positive entries (the Fortran
-        reference does not check; we are stricter here).
-    """
-    if np.any(sigma <= 0):
-        raise ValueError(
-            "_calc_error: sigma contains non-positive entries; "
-            "cannot compute chi-squared"
-        )
-    diff = z_data - z_pred
-    return float(np.sum((diff.real**2 + diff.imag**2) / sigma**2))
-
-
-def _jkvar(values: np.ndarray) -> float:
-    """Delete-1 jackknife variance estimator.
-
-    For a sample ``values`` of size ``n >= 2``, computes the
-    jackknife variance of the mean: ``((n - 1)/n) * sum_i (m_i -
-    m_dot)^2``, where ``m_i`` is the mean omitting sample ``i`` and
-    ``m_dot`` is the overall mean.
-
-    Parameters
-    ----------
-    values : (n,) float ndarray
-        Real-valued samples, n >= 2.
-
-    Returns
-    -------
-    float
-        Jackknife variance estimate, or ``-1.0`` as a sentinel if
-        ``n < 2`` (matching the Fortran reference's behaviour).
-
-    Notes
-    -----
-    The ``-1.0`` sentinel for ``n < 2`` is a Fortran-era convention
-    and not how a modern Python API would handle the case; we keep
-    it here for cross-validation parity. Callers in the modern
-    Python code should check ``n`` themselves before calling this.
-
-    The Fortran reference also writes "jkvar: n too small" to
-    stderr when n is small; we silently return the sentinel
-    instead. (mtpy-v2 uses loguru, but emitting a log line here is
-    overkill for an internal helper.)
-    """
-    n = values.size
-    if n < 2:
-        return -1.0
-    total = float(values.sum())
-    mean = total / n
-    means_minus_i = (total - values) / (n - 1)
-    return float((n - 1) / n * np.sum((means_minus_i - mean) ** 2))
-
-
-def _estim_imp(
-    a: complex,
-    b: complex,
-    twist_tan: float,
-    shear_tan: float,
-    theta: float,
-) -> np.ndarray:
-    """Groom-Bailey forward model: regional impedance from
-    parameters.
-
-    Computes the measured-frame 2x2 impedance tensor predicted by
-    the Groom-Bailey model given the regional impedances ``a``,
-    ``b`` (the off-diagonal-frame TE and TM responses), the
-    distortion parameters in tangent form (``twist_tan``,
-    ``shear_tan``), and the regional azimuth.
-
-    Parameters
-    ----------
-    a : complex
-        Regional impedance ``Z_TE`` in the strike frame, SI units.
-    b : complex
-        Regional impedance ``Z_TM`` in the strike frame, SI units.
-    twist_tan : float
-        Tangent of the twist angle. The twist itself is
-        ``arctan(twist_tan)``.
-    shear_tan : float
-        Tangent of the shear angle.
-    theta : float
-        Regional azimuth in radians, clockwise from x-axis.
-
-    Returns
-    -------
-    z : (2, 2) complex ndarray
-        The forward-modelled measured-frame impedance tensor.
-
-    Notes
-    -----
-    Implementation: this is the cleaner mathematical form derived
-    from the GB89 formulas, computing the four Pauli-spin
-    combinations (alpha) directly and reconstructing the tensor
-    from them. The Fortran reference internally negates and
-    restores ``twist_tan`` and ``theta`` during construction, with
-    no net effect; the cleaner form skips that. Cross-validation
-    against the Fortran reference confirms agreement at machine
-    precision (see ``test_kernels_against_fortran.py``).
-
-    The four alpha values (Pauli-spin combinations) are::
-
-        alpha[0] = Z_xx + Z_yy   (trace)
-        alpha[1] = Z_xy + Z_yx
-        alpha[2] = Z_yx - Z_xy
-        alpha[3] = Z_xx - Z_yy
-
-    Inverting::
-
-        Z_xx = (alpha[0] + alpha[3]) / 2
-        Z_yy = (alpha[0] - alpha[3]) / 2
-        Z_xy = (alpha[1] - alpha[2]) / 2
-        Z_yx = (alpha[1] + alpha[2]) / 2
-
-    The Fortran ``estim_imp`` signature is
-    ``(gamma1, gamma2, a, b, theta)`` with ``gamma1 = shear_tan``
-    and ``gamma2 = twist_tan``; this Python signature reorders to
-    ``(a, b, twist_tan, shear_tan, theta)`` to match the natural
-    grouping (regional impedances first, then distortion, then
-    rotation). Cross-validation tests adapt the call order.
-    """
-    c2 = np.cos(2.0 * theta)
-    s2 = np.sin(2.0 * theta)
-    t = twist_tan
-    e = shear_tan
-
-    # GB89 alpha combinations (Pauli-spin form). See the
-    # docstring above for the inversion to Z and the strike_py
-    # forensic_report 17 for the derivation from the GB89
-    # scattering matrix.
-    alpha0 = -b * (e - t) + a * (t + e)
-    alpha1 = (
-        s2 * (-b * (e - t))
-        + c2 * (-b * (1.0 + t * e))
-        + c2 * (a * (1.0 - e * t))
-        - s2 * (a * (t + e))
-    )
-    alpha2 = -b * (1.0 + t * e) - a * (1.0 - e * t)
-    alpha3 = (
-        c2 * (-b * (e - t))
-        - s2 * (-b * (1.0 + t * e))
-        - s2 * (a * (1.0 - e * t))
-        - c2 * (a * (t + e))
-    )
-
-    z = np.empty((2, 2), dtype=np.complex128)
-    z[0, 0] = (alpha0 + alpha3) / 2.0
-    z[1, 1] = (alpha0 - alpha3) / 2.0
-    z[0, 1] = (alpha1 - alpha2) / 2.0
-    z[1, 0] = (alpha1 + alpha2) / 2.0
-    return z
-
-
-def _unpack_x(
-    x: np.ndarray, n_freqs: int
-) -> tuple[
-    float,
-    float,
-    float,
-    float,
-    float,
-    np.ndarray,
-    np.ndarray,
-    np.ndarray,
-    np.ndarray,
-]:
-    """Unpack the GB optimisation state vector.
-
-    Inverse of the packing convention used by :func:`_objfun` and
-    (in a subsequent session) ``_solve_band``. Returns the named
-    parameters as a tuple, suitable for unpacking with multiple-
-    assignment.
-
-    Parameters
-    ----------
-    x : (5 + 4*n_freqs,) float ndarray
-        Flat parameter vector.
-
-        - ``x[0]`` : strike theta in radians
-        - ``x[1]`` : twist t in radians
-        - ``x[2]`` : shear e in radians
-        - ``x[3]`` : log10 of site gain g
-        - ``x[4]`` : anisotropy s (dimensionless)
-        - ``x[5 : 5 + n_freqs]`` : log10(rho_a) per frequency
-        - ``x[5 + n_freqs : 5 + 2*n_freqs]`` : phase_a (radians)
-          per frequency
-        - ``x[5 + 2*n_freqs : 5 + 3*n_freqs]`` : log10(rho_b) per
-          frequency
-        - ``x[5 + 3*n_freqs : 5 + 4*n_freqs]`` : phase_b (radians)
-          per frequency
-
-    n_freqs : int
-        Number of frequencies in the band.
-
-    Returns
-    -------
-    theta, twist, shear, log10_gain, anisotropy : float
-        Scalar parameters.
-    log10_rho_a, phase_a, log10_rho_b, phase_b : (n_freqs,) ndarray
-        Per-frequency parameters.
-
-    Raises
-    ------
-    ValueError
-        If ``len(x) != 5 + 4*n_freqs``.
-
-    Notes
-    -----
-    The packing places scalar parameters first so that the
-    optimiser's preconditioner (TRF's column scaling) can be set
-    independently for the structurally distinct parameter blocks.
-    """
-    expected_len = 5 + 4 * n_freqs
-    if x.size != expected_len:
-        raise ValueError(
-            f"_unpack_x: expected x of size {expected_len} for "
-            f"n_freqs={n_freqs}, got {x.size}"
-        )
-    theta = float(x[0])
-    twist = float(x[1])
-    shear = float(x[2])
-    log10_gain = float(x[3])
-    anisotropy = float(x[4])
-
-    base = 5
-    log10_rho_a = x[base : base + n_freqs]
-    phase_a = x[base + n_freqs : base + 2 * n_freqs]
-    log10_rho_b = x[base + 2 * n_freqs : base + 3 * n_freqs]
-    phase_b = x[base + 3 * n_freqs : base + 4 * n_freqs]
-
-    return (
-        theta,
-        twist,
-        shear,
-        log10_gain,
-        anisotropy,
-        log10_rho_a,
-        phase_a,
-        log10_rho_b,
-        phase_b,
-    )
-
 
 def _objfun(
     x: np.ndarray,
@@ -2418,263 +1766,6 @@ def _objfun(
 # Banded driver and Z<->band-array translation. These are the pieces that
 # turn _objfun into a working public decompose() entrypoint. Private; the
 # public API is decompose() above.
-# ---------------------------------------------------------------------------
-
-
-@dataclass
-class _BandResult:
-    """Result of a single-band optimisation. Internal type."""
-
-    x_opt: np.ndarray
-    x_err: np.ndarray
-    residuals: np.ndarray
-    chi_squared: float
-    rms_misfit: float
-    n_iter: int
-    converged: bool
-    cost_at_opt: float
-    jacobian: np.ndarray | None = None
-
-
-def _canonicalise_solution(
-    strike: float,
-    twist: float,
-    shear: float,
-    canonicalise: bool = True,
-) -> tuple[float, float, float]:
-    """Apply the GB 90-degree / shear-sign symmetry to fold a
-    solution to a canonical branch.
-
-    The Groom-Bailey decomposition has a discrete symmetry: the
-    triple ``(strike, twist, shear)`` and ``(strike + 90 mod 180,
-    twist, -shear)`` represent the same physical solution (twist is
-    invariant; the strike shift by 90 degrees is paired with a sign
-    flip on shear). This function chooses the branch with strike in
-    ``[0, 90)``, which matches the strike_py reference's
-    ``symmetry.compare_band_against_dcmp`` convention.
-
-    Parameters
-    ----------
-    strike, twist, shear : float
-        Radians.
-    canonicalise : bool, default True
-        If True (historical behaviour), fold strike into
-        ``[0, pi/2)`` and flip the sign of shear when the fold
-        triggers. If False, only wrap strike to ``[0, pi)`` via
-        ``strike % pi`` and leave shear unchanged. The False mode
-        is provided so callers can study the unfolded GB output
-        directly (e.g. for cross-tool comparison with phase-tensor
-        strike, which uses a 180-degree fold).
-
-    Returns
-    -------
-    strike_c, twist_c, shear_c : float
-        Canonicalised values. ``strike_c`` lies in ``[0, pi/2)``
-        when ``canonicalise`` is True, otherwise in ``[0, pi)``.
-    """
-    if not canonicalise:
-        return float(strike % np.pi), float(twist), float(shear)
-    half_pi = np.pi / 2.0
-    # Tolerance for the boundary at strike = pi/2 (90 deg). Without
-    # this, a strike that lands exactly at pi/2 can be rounded to one
-    # ULP below pi/2 by ``% np.pi`` and miss the fold.
-    fold_tol = 1e-9
-    strike_mod_pi = strike % np.pi
-    if strike_mod_pi >= half_pi - fold_tol:
-        strike_c = strike_mod_pi - half_pi
-        shear_c = -shear
-        # Re-fold strike_c into [0, pi/2): if the input was very close
-        # to pi/2 from below, strike_c is a tiny negative; map to 0.
-        if strike_c < 0.0:
-            strike_c = 0.0
-    else:
-        strike_c = strike_mod_pi
-        shear_c = shear
-    return float(strike_c), float(twist), float(shear_c)
-
-
-def _extract_bands(
-    periods: np.ndarray,
-    bandwidth: float = 1.0,
-    overlap: float = 0.0,
-) -> list[np.ndarray]:
-    """Partition periods into (possibly overlapping) bands.
-
-    Each band is described by the array of indices into ``periods``
-    that fall within the band. Bands span ``bandwidth`` decades in
-    ``log10(period)`` and successive bands shift by
-    ``bandwidth - overlap`` decades.
-
-    Parameters
-    ----------
-    periods : (n_periods,) float64
-        Strictly positive periods in seconds. Need not be sorted;
-        the returned indices index the input array as given.
-    bandwidth : float, default 1.0
-        Band width in ``log10(period)`` decades.
-    overlap : float, default 0.0
-        Overlap between adjacent bands. Must satisfy
-        ``0 <= overlap < bandwidth``.
-
-    Returns
-    -------
-    list[ndarray]
-        One ``int`` ndarray of indices per band. Bands containing
-        fewer than 2 periods are dropped (under-determined).
-    """
-    if periods.size == 0:
-        raise ValueError("_extract_bands: periods is empty")
-    if np.any(periods <= 0):
-        raise ValueError("_extract_bands: periods must be strictly positive")
-    if overlap >= bandwidth:
-        raise ValueError(
-            f"_extract_bands: overlap ({overlap}) must be less "
-            f"than bandwidth ({bandwidth})"
-        )
-
-    log_periods = np.log10(periods)
-    log_min = float(log_periods.min())
-    log_max = float(log_periods.max())
-    step = bandwidth - overlap
-    eps = 1e-12
-
-    bands: list[np.ndarray] = []
-    band_start = log_min
-    while band_start < log_max + eps:
-        band_end = band_start + bandwidth
-        in_band = (log_periods >= band_start - eps) & (log_periods < band_end - eps)
-        # Include the maximum period in the band whose band_end is
-        # at-or-past it (right-open elsewhere, right-closed at the
-        # global maximum). Without this, a period exactly on a band
-        # boundary that is also log_max can fall through the cracks.
-        if band_end >= log_max - eps:
-            in_band = in_band | (np.abs(log_periods - log_max) < eps)
-        idx = np.where(in_band)[0]
-        if idx.size >= 2:
-            bands.append(idx)
-        band_start += step
-
-    if not bands:
-        raise ValueError(
-            "_extract_bands: no band has 2 or more periods. "
-            "Reduce bandwidth or use a wider period range."
-        )
-    return bands
-
-
-def _z_to_band_arrays(
-    z: "Z", band_idx: np.ndarray
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Extract per-band ``(z_obs, sigma, periods)`` arrays from a Z.
-
-    Reads through the public ``Z.z`` and ``Z.z_error`` attributes
-    (the unit-corrected, user-facing values), per CLAUDE.md
-    invariant 4. Never via internal storage attributes.
-
-    Parameters
-    ----------
-    z : Z
-        Full impedance object.
-    band_idx : (n_band_freqs,) int ndarray
-        Indices into ``z.frequency`` of the periods in this band.
-
-    Returns
-    -------
-    z_obs : (n_band_freqs, 2, 2) complex128
-    sigma : (n_band_freqs, 2, 2) float64
-    periods : (n_band_freqs,) float64
-
-    Raises
-    ------
-    ValueError
-        If ``z.z_error`` is None or contains non-positive entries.
-    """
-    z_full = np.asarray(z.z, dtype=np.complex128)
-    z_err = z.z_error
-    if z_err is None:
-        raise ValueError(
-            "_z_to_band_arrays: z.z_error is None; cannot run "
-            "weighted least squares without per-component errors."
-        )
-    sigma_full = np.asarray(z_err, dtype=np.float64)
-    if np.any(sigma_full <= 0):
-        raise ValueError(
-            "_z_to_band_arrays: z.z_error contains non-positive " "entries"
-        )
-
-    z_obs = z_full[band_idx]
-    sigma = sigma_full[band_idx]
-    frequencies = np.asarray(z.frequency, dtype=np.float64)[band_idx]
-    periods = 1.0 / frequencies
-    return z_obs, sigma, periods
-
-
-def _band_arrays_to_z(
-    log10_rho_a: np.ndarray,
-    phase_a: np.ndarray,
-    log10_rho_b: np.ndarray,
-    phase_b: np.ndarray,
-    log10_rho_a_err: np.ndarray,
-    phase_a_err: np.ndarray,
-    log10_rho_b_err: np.ndarray,
-    phase_b_err: np.ndarray,
-    periods: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Build a strike-frame regional impedance and error arrays from
-    the recovered ``(log10_rho, phase)`` parameters.
-
-    The regional impedance is the canonical anti-diagonal 2D tensor
-    in the strike frame: ``Z_2D = [[0, a], [-b, 0]]`` where ``a``
-    is the TE-mode impedance and ``b`` the TM-mode impedance.
-
-    Parameters
-    ----------
-    log10_rho_a, phase_a, log10_rho_b, phase_b : (n_periods,) float64
-        Recovered regional parameters per period.
-    log10_rho_a_err, phase_a_err, log10_rho_b_err, phase_b_err
-        : (n_periods,) float64. 1-sigma uncertainties.
-    periods : (n_periods,) float64
-        Periods in seconds.
-
-    Returns
-    -------
-    z_regional : (n_periods, 2, 2) complex128
-        Strike-frame regional tensors.
-    z_regional_error : (n_periods, 2, 2) float64
-        Per-component 1-sigma propagated uncertainties.
-    """
-    n_periods = len(periods)
-    mu0 = 4.0 * np.pi * 1.0e-7
-    factor = 2.0 * np.pi * mu0
-    ln10 = np.log(10.0)
-
-    rho_a = 10.0**log10_rho_a
-    rho_b = 10.0**log10_rho_b
-    abs_a = np.sqrt(rho_a * factor / periods)
-    abs_b = np.sqrt(rho_b * factor / periods)
-    a = abs_a * np.exp(1j * phase_a)
-    b = abs_b * np.exp(1j * phase_b)
-
-    z_regional = np.zeros((n_periods, 2, 2), dtype=np.complex128)
-    z_regional[:, 0, 1] = a
-    z_regional[:, 1, 0] = -b
-
-    abs_a_err = np.sqrt(
-        (abs_a * ln10 / 2.0) ** 2
-        * np.where(np.isfinite(log10_rho_a_err), log10_rho_a_err, 0.0) ** 2
-        + abs_a**2 * np.where(np.isfinite(phase_a_err), phase_a_err, 0.0) ** 2
-    )
-    abs_b_err = np.sqrt(
-        (abs_b * ln10 / 2.0) ** 2
-        * np.where(np.isfinite(log10_rho_b_err), log10_rho_b_err, 0.0) ** 2
-        + abs_b**2 * np.where(np.isfinite(phase_b_err), phase_b_err, 0.0) ** 2
-    )
-
-    z_regional_error = np.zeros((n_periods, 2, 2), dtype=np.float64)
-    z_regional_error[:, 0, 1] = abs_a_err
-    z_regional_error[:, 1, 0] = abs_b_err
-    return z_regional, z_regional_error
-
 
 def _canonical_initial_guess(
     z_obs: np.ndarray,
@@ -2750,7 +1841,6 @@ def _canonical_initial_guess(
     )
     return x0
 
-
 def _build_bounds(
     n_freqs: int,
     bounds_override: dict[str, tuple[float, float]] | None = None,
@@ -2814,7 +1904,6 @@ def _build_bounds(
     lower[base + 3 * n_freqs : base + 4 * n_freqs] = defaults["phase_b"][0]
     upper[base + 3 * n_freqs : base + 4 * n_freqs] = defaults["phase_b"][1]
     return lower, upper
-
 
 def _solve_band(
     z_obs: np.ndarray,
@@ -2914,7 +2003,6 @@ def _solve_band(
         jacobian=J,
     )
 
-
 def _rotated_initial_guess(
     z_obs: np.ndarray,
     sigma: np.ndarray,
@@ -2960,7 +2048,6 @@ def _rotated_initial_guess(
 
     return rotated
 
-
 def _perturbed_initial_guess(
     canonical_x0: np.ndarray,
     lower: np.ndarray,
@@ -2994,7 +2081,6 @@ def _perturbed_initial_guess(
     perturbation = rng.normal(scale=sigma_per_param)
     x0 = canonical_x0 + perturbation
     return np.clip(x0, lower, upper)
-
 
 def _generate_starting_points(
     z_obs: np.ndarray,
@@ -3053,257 +2139,6 @@ def _generate_starting_points(
         )
 
     return starts
-
-
-_DEFAULT_MODE_TOLERANCE = {
-    "strike_deg": 0.5,
-    "twist_deg": 0.5,
-    "shear_deg": 0.5,
-}
-# Note: log10_gain was originally intended as a fourth discriminator
-# but is gauge-equivalent at the band level (the forward model
-# satisfies (a, b, gain) -> (gain*a, gain*b, 1)), so different starts
-# converge to physically-equivalent solutions with different
-# gain/|a|/|b| splits. Including it as a clustering criterion would
-# fragment a single physical mode into multiple gauge-equivalent
-# clusters; we exclude it.
-
-
-@dataclass
-class _Mode:
-    """Internal type: one discovered mode of a multi-start fit.
-
-    Each mode collects the converged starts that landed in the same
-    physical basin (matching strike/twist/shear/gain within the
-    user-configurable tolerances). The representative
-    :class:`_BandResult` is the lowest-RMS member of the cluster.
-    """
-
-    rms_misfit: float
-    chi_squared: float
-    n_starts_landing_here: int
-    band_result: _BandResult
-    canonical_form: dict
-    probability: float | None = None
-
-
-def _canonical_form_summary(br: _BandResult) -> dict:
-    """Extract canonical-form scalar parameters for clustering.
-
-    Applies :func:`_canonicalise_solution` so that two converged
-    points differing only by the GB 90-degree symmetry produce
-    identical summaries.
-
-    Returns a dict with keys: ``strike_deg``, ``twist_deg``,
-    ``shear_deg``, ``log10_gain``, ``rms_misfit``.
-    """
-    strike_rad, twist_rad, shear_rad = _canonicalise_solution(
-        float(br.x_opt[0]), float(br.x_opt[1]), float(br.x_opt[2])
-    )
-    return {
-        "strike_deg": float(np.degrees(strike_rad)),
-        "twist_deg": float(np.degrees(twist_rad)),
-        "shear_deg": float(np.degrees(shear_rad)),
-        "log10_gain": float(br.x_opt[3]),
-        "rms_misfit": float(br.rms_misfit),
-    }
-
-
-def _modes_match_within_band(cf_a: dict, cf_b: dict, tolerance: dict) -> bool:
-    """Three physical-parameter conditions, used during clustering
-    of starts within a single band.
-
-    Two converged points within a band are the same mode when
-    strike, twist, and shear all agree within their respective
-    tolerances. We deliberately exclude log10_gain (gauge-equivalent;
-    see :data:`_DEFAULT_MODE_TOLERANCE` notes) and RMS (TRF's path-
-    dependent numerical noise produces O(1e-4) relative RMS
-    differences between starts converging to the same physical
-    basin).
-    """
-    return (
-        abs(cf_a["strike_deg"] - cf_b["strike_deg"]) <= tolerance["strike_deg"]
-        and abs(cf_a["twist_deg"] - cf_b["twist_deg"]) <= tolerance["twist_deg"]
-        and abs(cf_a["shear_deg"] - cf_b["shear_deg"]) <= tolerance["shear_deg"]
-    )
-
-
-def _modes_match_across_bands(cf_a: dict, cf_b: dict, tolerance: dict) -> bool:
-    """Same four physical-parameter conditions, used to compare
-    bands' primary modes.
-
-    The within-band and across-band matchers check the same fields
-    today; the function exists as a separate name because the
-    intents at the two call sites differ. Within a band, RMS is
-    the natural tie-breaker but we deliberately don't use it (see
-    :func:`_modes_match_within_band` notes). Across bands, RMS is
-    meaningless to compare because each band fits a different
-    period subset, so any RMS-aware matcher would always report
-    disagreement.
-    """
-    return _modes_match_within_band(cf_a, cf_b, tolerance)
-
-
-def _cluster_modes(
-    band_results: list[_BandResult],
-    mode_tolerance: dict | None = None,
-) -> list[_Mode]:
-    """Greedy clustering of converged points into modes.
-
-    Algorithm:
-      1. Compute canonical-form summary for each
-         :class:`_BandResult`.
-      2. Sort summaries ascending by RMS misfit.
-      3. The lowest-RMS point seeds mode 0 and becomes its
-         representative.
-      4. Each subsequent point is compared to all existing modes
-         via :func:`_modes_match_within_band`; if it matches any,
-         increment that mode's count, else open a new mode.
-
-    By sorting first, each mode's representative is always the
-    best converged point in its cluster.
-
-    Parameters
-    ----------
-    band_results : list of _BandResult
-    mode_tolerance : dict, optional
-        Overrides for the per-parameter tolerances. Keys:
-        ``strike_deg``, ``twist_deg``, ``shear_deg``. Defaults
-        applied for missing keys. The deprecated ``rms_relative``
-        and ``log10_gain`` keys raise :class:`UserWarning` and are
-        ignored.
-
-    Returns
-    -------
-    list of _Mode
-        Sorted ascending by RMS misfit. Mode 0 is primary.
-    """
-    if not band_results:
-        return []
-
-    tol = dict(_DEFAULT_MODE_TOLERANCE)
-    if mode_tolerance:
-        deprecated = {"rms_relative", "log10_gain"} & set(mode_tolerance)
-        if deprecated:
-            warnings.warn(
-                f"mode_tolerance keys {sorted(deprecated)} are no longer "
-                "used and will be ignored. Clustering uses strike_deg, "
-                "twist_deg, and shear_deg only: rms_relative was "
-                "fragile under TRF's path-dependent noise, and "
-                "log10_gain is gauge-equivalent with the regional "
-                "impedance magnitudes at the band level.",
-                UserWarning,
-                stacklevel=2,
-            )
-            mode_tolerance = {
-                k: v for k, v in mode_tolerance.items() if k not in deprecated
-            }
-        tol.update(mode_tolerance)
-
-    summaries = [(br, _canonical_form_summary(br)) for br in band_results]
-    summaries.sort(key=lambda x: x[1]["rms_misfit"])
-
-    modes: list[_Mode] = []
-    for br, cf in summaries:
-        matched = False
-        for mode in modes:
-            if _modes_match_within_band(mode.canonical_form, cf, tol):
-                mode.n_starts_landing_here += 1
-                matched = True
-                break
-        if not matched:
-            modes.append(
-                _Mode(
-                    rms_misfit=br.rms_misfit,
-                    chi_squared=br.chi_squared,
-                    n_starts_landing_here=1,
-                    band_result=br,
-                    canonical_form=cf,
-                )
-            )
-    return modes
-
-
-def _compute_mode_probabilities(modes: list[_Mode]) -> list[float]:
-    """Laplace approximation of mode probabilities.
-
-    For each mode i, the unnormalised log-weight is::
-
-        log_w_i = -0.5 * chi_squared_i + 0.5 * log det(cov_i)
-
-    where ``cov_i = (J_eff^T J_eff)^{-1}`` is the parameter
-    covariance restricted to identifiable parameters (the
-    anisotropy column of the Jacobian is identically zero, so we
-    drop it from the determinant calculation).
-
-    Probabilities are obtained by max-subtract on the log-weights
-    for numerical stability::
-
-        log_w_max = max(log_w_i)
-        w_i = exp(log_w_i - log_w_max)
-        p_i = w_i / sum_j w_j
-
-    Parameters
-    ----------
-    modes : list of _Mode
-        Each mode's ``band_result.jacobian`` must be populated.
-
-    Returns
-    -------
-    list of float
-        Mode probabilities, summing to 1, in the same order as
-        the input.
-
-    Notes
-    -----
-    The Laplace approximation assumes a Gaussian likelihood near
-    each mode. For MT decomposition the residuals are complex-
-    Gaussian by assumption, so the approximation is reasonable.
-
-    For modes whose effective Gram matrix is rank-deficient (more
-    than the anisotropy column unidentifiable), the determinant
-    is evaluated via eigenvalues of the pseudo-inverse with a
-    small floor.
-    """
-    if not modes:
-        return []
-    if len(modes) == 1:
-        return [1.0]
-
-    log_weights: list[float] = []
-    for mode in modes:
-        chi_sq = mode.chi_squared
-        J = mode.band_result.jacobian
-        if J is None:
-            # Should not happen in normal use; fall back to a
-            # likelihood-only weight.
-            log_weights.append(-0.5 * chi_sq)
-            continue
-        # Drop anisotropy column (index 4) from the Jacobian for
-        # the determinant: it's identically zero so det(J^T J)
-        # would otherwise be exactly zero.
-        J_eff = np.delete(J, 4, axis=1)
-        gram = J_eff.T @ J_eff
-        sign, log_det_gram = np.linalg.slogdet(gram)
-        if sign > 0:
-            log_det_cov = -log_det_gram
-        else:
-            cov = np.linalg.pinv(gram)
-            eigenvalues = np.linalg.eigvalsh(cov)
-            eigenvalues = eigenvalues[eigenvalues > 1e-30]
-            if eigenvalues.size == 0:
-                log_det_cov = -np.inf
-            else:
-                log_det_cov = float(np.sum(np.log(eigenvalues)))
-        log_weights.append(-0.5 * chi_sq + 0.5 * log_det_cov)
-
-    log_w_max = max(log_weights)
-    weights = [float(np.exp(lw - log_w_max)) for lw in log_weights]
-    total = sum(weights)
-    if total <= 0.0:
-        # Degenerate; fall back to uniform.
-        return [1.0 / len(modes)] * len(modes)
-    return [w / total for w in weights]
 
 
 def _solve_band_multistart(
@@ -3401,7 +2236,6 @@ def _solve_band_multistart(
 
     return modes
 
-
 def _decompose_bands_with_modes(
     z_obs_full: np.ndarray,
     sigma_full: np.ndarray,
@@ -3450,92 +2284,6 @@ def _decompose_bands_with_modes(
         )
         band_modes_list.append((band_idx, modes))
     return band_modes_list
-
-
-def _detect_band_disagreement(
-    band_modes_list: list[tuple[np.ndarray, list[_Mode]]],
-    mode_tolerance: dict,
-) -> dict | None:
-    """Check whether bands' primary modes agree on physical params.
-
-    Uses :func:`_modes_match_across_bands`, which checks
-    strike/twist/shear/gain only (RMS comparison is meaningless
-    across bands fitting different period subsets).
-
-    Returns ``None`` if all primaries agree. Otherwise returns a
-    dict listing each disagreeing band pair with their canonical-
-    form summaries.
-    """
-    if len(band_modes_list) < 2:
-        return None
-
-    tol = dict(_DEFAULT_MODE_TOLERANCE)
-    if mode_tolerance:
-        # Tolerate deprecated keys silently here; _cluster_modes has
-        # already warned upstream.
-        tol.update(
-            {
-                k: v
-                for k, v in mode_tolerance.items()
-                if k not in ("rms_relative", "log10_gain")
-            }
-        )
-
-    primaries = [modes[0].canonical_form for _, modes in band_modes_list]
-
-    disagreements: list[dict] = []
-    for i in range(len(primaries)):
-        for j in range(i + 1, len(primaries)):
-            if not _modes_match_across_bands(primaries[i], primaries[j], tol):
-                disagreements.append(
-                    {
-                        "bands": [i, j],
-                        "values_i": primaries[i],
-                        "values_j": primaries[j],
-                    }
-                )
-
-    if not disagreements:
-        return None
-
-    return {
-        "disagreements": disagreements,
-        "interpretation": (
-            "Bands' primary modes disagree on canonical-form "
-            "physical parameters. This may indicate model "
-            "misspecification (deeper/shallower structure differs "
-            "across the period range) or that one band's primary "
-            "mode is not the global minimum. Inspect "
-            "metadata['per_band'] to see all modes per band."
-        ),
-    }
-
-
-def _detect_primary_mode_warning(
-    band_modes_list: list[tuple[np.ndarray, list[_Mode]]],
-    threshold: float,
-) -> tuple[bool, str]:
-    """Warn when any band's second-best mode is within ``threshold``
-    of its primary by RMS ratio.
-
-    Returns ``(True, text)`` if any band has a competitive second
-    mode, else ``(False, "")``.
-    """
-    for _, modes in band_modes_list:
-        if len(modes) < 2:
-            continue
-        ratio = modes[1].rms_misfit / max(modes[0].rms_misfit, 1e-30)
-        if ratio <= threshold:
-            text = (
-                f"At least one band discovered multiple modes within "
-                f"{threshold}x RMS of each other. Single-mode "
-                f"confidence intervals are misleading; the data does "
-                f"not strongly distinguish between competing physical "
-                f"solutions. See metadata['per_band']."
-            )
-            return True, text
-    return False, ""
-
 
 def _build_per_mode_parameters_dataset(
     band_modes_list: list[tuple[np.ndarray, list[_Mode]]],
@@ -3633,7 +2381,6 @@ def _build_per_mode_parameters_dataset(
     )
     return ds
 
-
 def _resample_residuals(
     z_obs: np.ndarray,
     sigma: np.ndarray,
@@ -3688,7 +2435,6 @@ def _resample_residuals(
     real_noise = rng.normal(scale=sigma)
     imag_noise = rng.normal(scale=sigma)
     return z_predicted + real_noise + 1j * imag_noise
-
 
 def _predict_z_from_primary_modes(
     band_modes_list: list[tuple[np.ndarray, list[_Mode]]],
@@ -3764,7 +2510,6 @@ def _predict_z_from_primary_modes(
         )
     return z_predicted
 
-
 def _compute_ci_percentile(
     replicates: np.ndarray,
     level: float = 0.95,
@@ -3823,7 +2568,6 @@ def _compute_ci_percentile(
         np.nanpercentile(replicates, lower_pct, axis=axis),
         np.nanpercentile(replicates, upper_pct, axis=axis),
     )
-
 
 def _bootstrap_decompose(
     z_obs_full: np.ndarray,
@@ -3973,103 +2717,6 @@ def _bootstrap_decompose(
 
     return replicates
 
-
-def _unpack_x_joint(
-    x: np.ndarray, n_sites: int, n_freqs: int
-) -> tuple[
-    float,
-    np.ndarray,
-    np.ndarray,
-    np.ndarray,
-    np.ndarray,
-    np.ndarray,
-    np.ndarray,
-    np.ndarray,
-    np.ndarray,
-]:
-    """Unpack the joint multi-site optimisation state vector.
-
-    Layout (all units consistent with single-site :func:`_unpack_x`)::
-
-        x[0]                                         theta_shared
-        x[1 + 4*i + 0..3]                            site i's
-                                                     (twist, shear,
-                                                      log10_gain,
-                                                      anisotropy)
-        x[1 + 4*n_sites + 4*n_freqs*i + 0*n_freqs + k]
-                                                     site i's
-                                                     log10_rho_a at
-                                                     freq k
-        x[... + 1*n_freqs + k]                       site i's phase_a
-        x[... + 2*n_freqs + k]                       site i's
-                                                     log10_rho_b
-        x[... + 3*n_freqs + k]                       site i's phase_b
-
-    Total length: ``1 + 4 * n_sites * (1 + n_freqs)``.
-
-    For ``n_sites == 1`` the length coincides with the single-site
-    layout (``5 + 4*n_freqs``), and the leading-five layout matches
-    bit-for-bit. This is the foundation of the single-site reduction
-    sanity tests.
-
-    Parameters
-    ----------
-    x : (1 + 4*n_sites*(1+n_freqs),) float ndarray
-    n_sites : int
-    n_freqs : int
-
-    Returns
-    -------
-    theta_shared : float
-    twist, shear, log10_gain, anisotropy : (n_sites,) ndarrays
-    log10_rho_a, phase_a, log10_rho_b, phase_b : (n_sites, n_freqs)
-        ndarrays.
-
-    Raises
-    ------
-    ValueError
-        If ``len(x)`` does not match the joint layout.
-    """
-    expected_len = 1 + 4 * n_sites * (1 + n_freqs)
-    if x.size != expected_len:
-        raise ValueError(
-            f"_unpack_x_joint: expected x of size {expected_len} "
-            f"for n_sites={n_sites}, n_freqs={n_freqs}, got {x.size}"
-        )
-
-    theta_shared = float(x[0])
-
-    site_scalars = x[1 : 1 + 4 * n_sites].reshape(n_sites, 4)
-    twist = site_scalars[:, 0].copy()
-    shear = site_scalars[:, 1].copy()
-    log10_gain = site_scalars[:, 2].copy()
-    anisotropy = site_scalars[:, 3].copy()
-
-    regional_base = 1 + 4 * n_sites
-    log10_rho_a = np.empty((n_sites, n_freqs))
-    phase_a = np.empty((n_sites, n_freqs))
-    log10_rho_b = np.empty((n_sites, n_freqs))
-    phase_b = np.empty((n_sites, n_freqs))
-    for i in range(n_sites):
-        site_start = regional_base + 4 * n_freqs * i
-        log10_rho_a[i] = x[site_start : site_start + n_freqs]
-        phase_a[i] = x[site_start + n_freqs : site_start + 2 * n_freqs]
-        log10_rho_b[i] = x[site_start + 2 * n_freqs : site_start + 3 * n_freqs]
-        phase_b[i] = x[site_start + 3 * n_freqs : site_start + 4 * n_freqs]
-
-    return (
-        theta_shared,
-        twist,
-        shear,
-        log10_gain,
-        anisotropy,
-        log10_rho_a,
-        phase_a,
-        log10_rho_b,
-        phase_b,
-    )
-
-
 def _build_bounds_joint(
     n_sites: int,
     n_freqs: int,
@@ -4133,7 +2780,6 @@ def _build_bounds_joint(
         ][1]
 
     return lower, upper
-
 
 def _objfun_joint(
     x: np.ndarray,
@@ -4423,7 +3069,6 @@ def _objfun_joint(
 
     return residuals, jacobian
 
-
 def _canonical_initial_guess_joint(
     z_obs_per_site: np.ndarray,
     sigma_per_site: np.ndarray,
@@ -4486,7 +3131,6 @@ def _canonical_initial_guess_joint(
 
     return x_joint
 
-
 def _rotated_initial_guess_joint(
     z_obs_per_site: np.ndarray,
     sigma_per_site: np.ndarray,
@@ -4521,7 +3165,6 @@ def _rotated_initial_guess_joint(
         rotated[site_start + 3 * n_freqs : site_start + 4 * n_freqs] = phase_a
 
     return rotated
-
 
 def _generate_starting_points_joint(
     z_obs_per_site: np.ndarray,
@@ -4558,7 +3201,6 @@ def _generate_starting_points_joint(
             _perturbed_initial_guess(canonical, lower, upper, rng, perturbation_scale)
         )
     return starts
-
 
 def _solve_band_joint(
     z_obs_per_site: np.ndarray,
@@ -4637,178 +3279,6 @@ def _solve_band_joint(
         jacobian=J,
     )
 
-
-def _canonical_form_summary_joint(br: _BandResult, n_sites: int, n_freqs: int) -> dict:
-    """Joint canonical-form summary for clustering converged points.
-
-    Strike is shared across sites, so canonicalisation is decided by
-    the shared theta alone; if it rotates by pi/2, every site's shear
-    flips sign simultaneously.
-
-    Returns
-    -------
-    dict with keys:
-        strike_deg : float
-        per_site_twist_deg : (n_sites,) ndarray
-        per_site_shear_deg : (n_sites,) ndarray
-        per_site_log10_gain : (n_sites,) ndarray (gauge — not used
-                              for clustering, kept for diagnostics)
-        rms_misfit : float
-    """
-    (
-        theta_shared,
-        twist,
-        shear,
-        log10_gain,
-        _aniso,
-        _,
-        _,
-        _,
-        _,
-    ) = _unpack_x_joint(br.x_opt, n_sites, n_freqs)
-
-    strike_can, _, _ = _canonicalise_solution(
-        theta_shared, float(twist[0]), float(shear[0])
-    )
-    rotated = abs(strike_can - (theta_shared % np.pi)) > 1e-9
-    canonical_shear = -shear if rotated else shear
-
-    return {
-        "strike_deg": float(np.degrees(strike_can)),
-        "per_site_twist_deg": np.degrees(twist).copy(),
-        "per_site_shear_deg": np.degrees(canonical_shear).copy(),
-        "per_site_log10_gain": log10_gain.copy(),
-        "rms_misfit": float(br.rms_misfit),
-    }
-
-
-def _modes_match_within_band_joint(cf_a: dict, cf_b: dict, tolerance: dict) -> bool:
-    """Two joint canonical-form summaries match if shared strike
-    agrees within tolerance and every site's (twist, shear) agree.
-
-    log10_gain and rms are NOT checked — gauge-equivalent and path-
-    dependent respectively (see Sessions 5 and 6).
-    """
-    if abs(cf_a["strike_deg"] - cf_b["strike_deg"]) > tolerance["strike_deg"]:
-        return False
-    if np.any(
-        np.abs(cf_a["per_site_twist_deg"] - cf_b["per_site_twist_deg"])
-        > tolerance["twist_deg"]
-    ):
-        return False
-    if np.any(
-        np.abs(cf_a["per_site_shear_deg"] - cf_b["per_site_shear_deg"])
-        > tolerance["shear_deg"]
-    ):
-        return False
-    return True
-
-
-def _modes_match_across_bands_joint(cf_a: dict, cf_b: dict, tolerance: dict) -> bool:
-    """Cross-band joint mode-equivalence predicate.
-
-    Same as :func:`_modes_match_within_band_joint`. Exists as a
-    separate name for documented intent: cross-band RMS comparison
-    is meaningless because bands fit different period subsets.
-    """
-    return _modes_match_within_band_joint(cf_a, cf_b, tolerance)
-
-
-def _cluster_modes_joint(
-    band_results: list[_BandResult],
-    n_sites: int,
-    n_freqs: int,
-    mode_tolerance: dict | None = None,
-) -> list[_Mode]:
-    """Greedy single-pass clustering of joint converged points."""
-    if not band_results:
-        return []
-
-    tol = dict(_DEFAULT_MODE_TOLERANCE)
-    if mode_tolerance:
-        deprecated = {"rms_relative", "log10_gain"} & set(mode_tolerance)
-        if deprecated:
-            warnings.warn(
-                f"mode_tolerance keys {sorted(deprecated)} are no longer "
-                "used and will be ignored. Joint clustering uses "
-                "strike_deg, twist_deg, and shear_deg only.",
-                UserWarning,
-                stacklevel=2,
-            )
-            mode_tolerance = {
-                k: v for k, v in mode_tolerance.items() if k not in deprecated
-            }
-        tol.update(mode_tolerance)
-
-    summaries = [
-        (br, _canonical_form_summary_joint(br, n_sites, n_freqs)) for br in band_results
-    ]
-    summaries.sort(key=lambda x: x[1]["rms_misfit"])
-
-    modes: list[_Mode] = []
-    for br, cf in summaries:
-        matched = False
-        for mode in modes:
-            if _modes_match_within_band_joint(mode.canonical_form, cf, tol):
-                mode.n_starts_landing_here += 1
-                matched = True
-                break
-        if not matched:
-            modes.append(
-                _Mode(
-                    rms_misfit=br.rms_misfit,
-                    chi_squared=br.chi_squared,
-                    n_starts_landing_here=1,
-                    band_result=br,
-                    canonical_form=cf,
-                )
-            )
-    return modes
-
-
-def _compute_mode_probabilities_joint(modes: list[_Mode], n_sites: int) -> list[float]:
-    """Laplace approximation, dropping per-site anisotropy columns.
-
-    Same algebra as :func:`_compute_mode_probabilities` but with
-    n_sites zero columns removed from the Gram matrix instead of one.
-    """
-    if not modes:
-        return []
-    if len(modes) == 1:
-        return [1.0]
-
-    aniso_cols = [1 + 4 * i + 3 for i in range(n_sites)]
-
-    log_weights: list[float] = []
-    for mode in modes:
-        chi_sq = mode.chi_squared
-        J = mode.band_result.jacobian
-        if J is None:
-            log_weights.append(-0.5 * chi_sq)
-            continue
-        J_eff = np.delete(J, aniso_cols, axis=1)
-        gram = J_eff.T @ J_eff
-        sign, log_det_gram = np.linalg.slogdet(gram)
-        if sign > 0:
-            log_det_cov = -log_det_gram
-        else:
-            cov = np.linalg.pinv(gram)
-            eigenvalues = np.linalg.eigvalsh(cov)
-            eigenvalues = eigenvalues[eigenvalues > 1e-30]
-            if eigenvalues.size == 0:
-                log_det_cov = -np.inf
-            else:
-                log_det_cov = float(np.sum(np.log(eigenvalues)))
-        log_weights.append(-0.5 * chi_sq + 0.5 * log_det_cov)
-
-    log_w_max = max(log_weights)
-    weights = [float(np.exp(lw - log_w_max)) for lw in log_weights]
-    total = sum(weights)
-    if total <= 0.0:
-        return [1.0 / len(modes)] * len(modes)
-    return [w / total for w in weights]
-
-
 def _solve_band_joint_multistart(
     z_obs_per_site: np.ndarray,
     sigma_per_site: np.ndarray,
@@ -4870,7 +3340,6 @@ def _solve_band_joint_multistart(
         mode.probability = prob
     return modes
 
-
 def _decompose_bands_with_modes_joint(
     z_obs_per_site_full: np.ndarray,
     sigma_per_site_full: np.ndarray,
@@ -4902,66 +3371,6 @@ def _decompose_bands_with_modes_joint(
         )
         band_modes_list.append((band_idx, modes))
     return band_modes_list
-
-
-def _normalise_collection_input(
-    collection_or_list,
-) -> list[tuple[str, "Z"]]:
-    """Convert MTCollection or list[MT] into (station_id, Z) tuples."""
-    if isinstance(collection_or_list, list):
-        return [
-            (getattr(mt, "station", str(i)), mt.Z)
-            for i, mt in enumerate(collection_or_list)
-        ]
-    if hasattr(collection_or_list, "dataframe") and hasattr(
-        collection_or_list, "get_tf"
-    ):
-        out: list[tuple[str, "Z"]] = []
-        df = collection_or_list.dataframe
-        if df is None or len(df) == 0:
-            return out
-        for row in df.itertuples():
-            tf_id = getattr(row, "tf_id", getattr(row, "station", None))
-            if tf_id is None:
-                continue
-            mt = collection_or_list.get_tf(tf_id)
-            out.append((getattr(mt, "station", tf_id), mt.Z))
-        return out
-    raise TypeError(
-        f"decompose_joint: unexpected input type "
-        f"{type(collection_or_list)!r}; expected list of MT or MTCollection"
-    )
-
-
-def _validate_joint_input(stations: list[tuple[str, "Z"]]) -> None:
-    """Sanity-check joint input compatibility."""
-    if not stations:
-        raise ValueError("decompose_joint: no stations provided")
-
-    for station_id, z in stations:
-        if z.z_error is None:
-            raise ValueError(
-                f"decompose_joint: station {station_id!r} has no "
-                f"z_error; required for weighted least squares"
-            )
-        if np.any(np.asarray(z.z_error) <= 0):
-            raise ValueError(
-                f"decompose_joint: station {station_id!r} has "
-                f"non-positive z_error entries"
-            )
-
-    ref_freq = np.asarray(stations[0][1].frequency, dtype=np.float64)
-    for station_id, z in stations[1:]:
-        freq_i = np.asarray(z.frequency, dtype=np.float64)
-        if freq_i.shape != ref_freq.shape or not np.allclose(
-            freq_i, ref_freq, rtol=1e-6
-        ):
-            raise ValueError(
-                f"decompose_joint: station {station_id!r} has a "
-                f"different frequency grid than the first station; "
-                f"joint analysis requires a common frequency grid"
-            )
-
 
 def _bootstrap_decompose_joint(
     z_obs_per_site_full: np.ndarray,
@@ -5126,312 +3535,3 @@ def _bootstrap_decompose_joint(
 
 # ---------------------------------------------------------------------------
 # Serialisation helpers (Session 8)
-# ---------------------------------------------------------------------------
-
-
-def _z_to_serialisable(regional_z):
-    """Convert a Z or dict[str, Z] into pickle/JSON-friendly arrays.
-
-    Z instances hold loguru references that cannot pickle. The
-    plain (z, z_error, frequency) form round-trips via
-    :func:`_z_from_serialisable`.
-    """
-    from mtpy.core.transfer_function.z import Z
-
-    if isinstance(regional_z, dict):
-        return {
-            "_kind": "dict",
-            "items": {sid: _z_to_serialisable(z) for sid, z in regional_z.items()},
-        }
-    if isinstance(regional_z, Z):
-        return {
-            "_kind": "Z",
-            "z": np.asarray(regional_z.z),
-            "z_error": (
-                None if regional_z.z_error is None else np.asarray(regional_z.z_error)
-            ),
-            "frequency": np.asarray(regional_z.frequency),
-        }
-    return regional_z
-
-
-def _z_from_serialisable(payload):
-    """Inverse of :func:`_z_to_serialisable`."""
-    from mtpy.core.transfer_function.z import Z
-
-    if not isinstance(payload, dict):
-        return payload
-    kind = payload.get("_kind")
-    if kind == "Z":
-        return Z(
-            z=payload["z"],
-            z_error=payload["z_error"],
-            frequency=payload["frequency"],
-        )
-    if kind == "dict":
-        return {sid: _z_from_serialisable(v) for sid, v in payload["items"].items()}
-    return payload
-
-
-def _sanitize_station_id(station_id: str) -> str:
-    """Encode a station_id for use as a NetCDF group name.
-
-    NetCDF group names follow CDL identifier rules: alphanumeric and
-    underscore only, must start with a letter or underscore. Real
-    station IDs (e.g. ``"KD-P5 R=KD-RR"``) routinely violate this.
-    We percent-encode disallowed characters so the encoding is
-    reversible.
-    """
-    import re
-    import urllib.parse
-
-    encoded = urllib.parse.quote(station_id, safe="").replace("%", "_p_")
-    # Hyphens are not in CDL identifiers either; replace.
-    encoded = encoded.replace("-", "_d_").replace(".", "_dt_")
-    if not re.match(r"^[A-Za-z_]", encoded):
-        encoded = "s_" + encoded
-    return encoded
-
-
-def _desanitize_station_id(group_name: str) -> str:
-    """Inverse of :func:`_sanitize_station_id`."""
-    import urllib.parse
-
-    s = group_name
-    if s.startswith("s_"):
-        s = s[2:]
-    s = s.replace("_d_", "-").replace("_dt_", ".")
-    s = s.replace("_p_", "%")
-    return urllib.parse.unquote(s)
-
-
-def _json_serialise_numpy(obj):
-    """Default function for json.dump when encountering NumPy types
-    or Python complex numbers (which appear in bootstrap regional_z
-    replicates)."""
-    if isinstance(obj, np.ndarray):
-        if np.issubdtype(obj.dtype, np.complexfloating):
-            return {
-                "__complex_array__": True,
-                "real": obj.real.tolist(),
-                "imag": obj.imag.tolist(),
-                "dtype": str(obj.dtype),
-                "shape": list(obj.shape),
-            }
-        return {
-            "__numpy_array__": True,
-            "data": obj.tolist(),
-            "dtype": str(obj.dtype),
-            "shape": list(obj.shape),
-        }
-    if isinstance(obj, np.bool_):
-        return bool(obj)
-    if isinstance(obj, np.generic):
-        return obj.item()
-    if isinstance(obj, complex):
-        return {"__complex__": True, "real": obj.real, "imag": obj.imag}
-    raise TypeError(f"_json_serialise_numpy: unhandled type {type(obj)}")
-
-
-def _json_deserialise_numpy(d):
-    """object_hook for json.load that reconstructs NumPy arrays and
-    complex scalars.
-
-    Bootstrap regional_z replicates contain both np.complex128
-    arrays (the typed paths) and Python complex scalars (the latter
-    arise when NumPy indexing returns a 0-d slice and is converted
-    via .item()). The ``__complex_array__`` and ``__complex__`` tags
-    handle both forms so round-trip via JSON is exact.
-    """
-    if isinstance(d, dict):
-        if d.get("__numpy_array__"):
-            arr = np.array(d["data"], dtype=d["dtype"])
-            return arr.reshape(d["shape"])
-        if d.get("__complex_array__"):
-            real = np.array(d["real"])
-            imag = np.array(d["imag"])
-            arr = (real + 1j * imag).astype(d["dtype"])
-            return arr.reshape(d["shape"])
-        if d.get("__complex__"):
-            return complex(d["real"], d["imag"])
-    return d
-
-
-def _z_to_dataset(z) -> xr.Dataset:
-    """Convert a Z to an xarray Dataset for NetCDF storage."""
-    z_arr = np.asarray(z.z)
-    return xr.Dataset(
-        {
-            "z_real": (("period", "i", "j"), z_arr.real),
-            "z_imag": (("period", "i", "j"), z_arr.imag),
-            "z_error": (
-                ("period", "i", "j"),
-                np.asarray(z.z_error)
-                if z.z_error is not None
-                else np.full(z_arr.shape, np.nan),
-            ),
-            "frequency": (("period",), np.asarray(z.frequency)),
-        },
-        attrs={"z_error_present": bool(z.z_error is not None)},
-    )
-
-
-def _dataset_to_z(ds: xr.Dataset):
-    """Inverse of :func:`_z_to_dataset`."""
-    from mtpy.core.transfer_function.z import Z
-
-    z_complex = ds["z_real"].values + 1j * ds["z_imag"].values
-    z_error = ds["z_error"].values
-    if not bool(ds.attrs.get("z_error_present", True)):
-        z_error = None
-    elif np.all(np.isnan(z_error)):
-        z_error = None
-    return Z(
-        z=z_complex,
-        z_error=z_error,
-        frequency=ds["frequency"].values,
-    )
-
-
-def _save_to_netcdf(result, path):
-    """Implementation of :meth:`DecompositionResult.to_netcdf`.
-
-    Writes a single flat NetCDF file (scipy backend, no groups) with
-    parameters + chi_squared + regional_z merged into one Dataset.
-    Metadata and scalar fields go to a sidecar JSON.
-    """
-    import json
-
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-
-    combined = result.parameters.copy()
-    combined["chi_squared_per_period"] = result.chi_squared
-
-    if isinstance(result.regional_z, dict):
-        station_ids = list(result.parameters.coords["station"].values)
-        n_periods = len(result.parameters.coords["period"])
-        n_sites = len(station_ids)
-        rz_real = np.full((n_sites, n_periods, 2, 2), np.nan)
-        rz_imag = np.full((n_sites, n_periods, 2, 2), np.nan)
-        rz_err = np.full((n_sites, n_periods, 2, 2), np.nan)
-        err_present_all = True
-        for i, sid in enumerate(station_ids):
-            z = result.regional_z[sid]
-            z_arr = np.asarray(z.z)
-            rz_real[i] = z_arr.real
-            rz_imag[i] = z_arr.imag
-            if z.z_error is None:
-                err_present_all = False
-            else:
-                rz_err[i] = np.asarray(z.z_error)
-        combined["regional_z_real"] = (("station", "period", "i", "j"), rz_real)
-        combined["regional_z_imag"] = (("station", "period", "i", "j"), rz_imag)
-        combined["regional_z_error"] = (("station", "period", "i", "j"), rz_err)
-        combined.attrs["regional_z_error_present"] = "1" if err_present_all else "0"
-        combined.attrs["regional_z_kind"] = "dict"
-        # All stations share frequency grid (validated at decompose_joint)
-        first_z = next(iter(result.regional_z.values()))
-        combined["regional_z_frequency"] = (
-            ("period",),
-            np.asarray(first_z.frequency),
-        )
-    else:
-        z = result.regional_z
-        z_arr = np.asarray(z.z)
-        combined["regional_z_real"] = (("period", "i", "j"), z_arr.real)
-        combined["regional_z_imag"] = (("period", "i", "j"), z_arr.imag)
-        if z.z_error is None:
-            combined["regional_z_error"] = (
-                ("period", "i", "j"),
-                np.full(z_arr.shape, np.nan),
-            )
-            combined.attrs["regional_z_error_present"] = "0"
-        else:
-            combined["regional_z_error"] = (
-                ("period", "i", "j"),
-                np.asarray(z.z_error),
-            )
-            combined.attrs["regional_z_error_present"] = "1"
-        combined.attrs["regional_z_kind"] = "single"
-        combined["regional_z_frequency"] = (
-            ("period",),
-            np.asarray(z.frequency),
-        )
-
-    combined.to_netcdf(path, mode="w")
-
-    metadata_path = Path(str(path) + ".metadata.json")
-    payload = {
-        "_method": result.method,
-        "_frame": result.frame,
-        "_rms_misfit": float(result.rms_misfit),
-        "_options": result.options,
-        "metadata": result.metadata,
-    }
-    with metadata_path.open("w") as f:
-        json.dump(payload, f, indent=2, default=_json_serialise_numpy)
-
-    logger.info(f"DecompositionResult written to {path} (+ {metadata_path.name})")
-
-
-def _load_from_netcdf(cls, path):
-    """Implementation of :meth:`DecompositionResult.from_netcdf`."""
-    import json
-
-    from mtpy.core.transfer_function.z import Z
-
-    path = Path(path)
-    metadata_path = Path(str(path) + ".metadata.json")
-    if not path.exists():
-        raise FileNotFoundError(f"NetCDF file not found: {path}")
-    if not metadata_path.exists():
-        raise FileNotFoundError(f"Metadata sidecar not found: {metadata_path}")
-
-    combined = xr.open_dataset(path).load()
-    kind = str(combined.attrs.get("regional_z_kind", "single"))
-    err_present = combined.attrs.get("regional_z_error_present", "1") == "1"
-
-    rz_real = combined["regional_z_real"].values
-    rz_imag = combined["regional_z_imag"].values
-    rz_err = combined["regional_z_error"].values
-    rz_freq = combined["regional_z_frequency"].values
-    chi_squared = combined["chi_squared_per_period"]
-
-    if kind == "dict":
-        station_ids = [str(s) for s in combined.coords["station"].values]
-        regional_z = {}
-        for i, sid in enumerate(station_ids):
-            z_complex = rz_real[i] + 1j * rz_imag[i]
-            z_error = rz_err[i] if err_present else None
-            regional_z[sid] = Z(z=z_complex, z_error=z_error, frequency=rz_freq)
-    else:
-        z_complex = rz_real + 1j * rz_imag
-        z_error = rz_err if err_present else None
-        regional_z = Z(z=z_complex, z_error=z_error, frequency=rz_freq)
-
-    drop_vars = [
-        "regional_z_real",
-        "regional_z_imag",
-        "regional_z_error",
-        "regional_z_frequency",
-        "chi_squared_per_period",
-    ]
-    parameters = combined.drop_vars([v for v in drop_vars if v in combined])
-    for attr_key in ("regional_z_kind", "regional_z_error_present"):
-        if attr_key in parameters.attrs:
-            del parameters.attrs[attr_key]
-
-    with metadata_path.open() as f:
-        payload = json.load(f, object_hook=_json_deserialise_numpy)
-
-    return cls(
-        parameters=parameters,
-        regional_z=regional_z,
-        chi_squared=chi_squared,
-        rms_misfit=float(payload.get("_rms_misfit", float("nan"))),
-        method=payload.get("_method", "groom_bailey"),
-        options=payload.get("_options", {}) or {},
-        metadata=payload.get("metadata", {}) or {},
-        frame=payload.get("_frame", "measurement"),
-    )
