@@ -868,6 +868,32 @@ class TestCanonicaliseSolution:
             )
             assert np.isclose(np.degrees(t_out), 7.5, atol=1e-9)
 
+    def test_canonicalise_off_skips_fold(self):
+        # canonicalise=False: strike in [90, 180) is *not* folded;
+        # shear sign is preserved.
+        s, t, sh = _canonicalise_solution(
+            np.radians(120.0),
+            np.radians(10.0),
+            np.radians(5.0),
+            canonicalise=False,
+        )
+        assert np.isclose(np.degrees(s), 120.0, atol=1e-9)
+        assert np.isclose(np.degrees(t), 10.0, atol=1e-9)
+        assert np.isclose(np.degrees(sh), 5.0, atol=1e-9)
+
+    def test_canonicalise_off_wraps_to_zero_pi(self):
+        # Negative or > pi inputs still get wrapped to [0, pi).
+        s, _, sh = _canonicalise_solution(
+            np.radians(-30.0), 0.0, np.radians(7.0), canonicalise=False
+        )
+        assert np.isclose(np.degrees(s), 150.0, atol=1e-9)
+        assert np.isclose(np.degrees(sh), 7.0, atol=1e-9)
+        s2, _, sh2 = _canonicalise_solution(
+            np.radians(200.0), 0.0, np.radians(3.0), canonicalise=False
+        )
+        assert np.isclose(np.degrees(s2), 20.0, atol=1e-9)
+        assert np.isclose(np.degrees(sh2), 3.0, atol=1e-9)
+
 
 class TestExtractBands:
     """_extract_bands partitions periods into log10-decade bands."""
@@ -1213,6 +1239,136 @@ class TestDecomposeEndToEnd:
         with pytest.raises(ValueError):
             # An empty window (no periods inside it)
             decompose(z, periods=(1e10, 1e11))
+
+
+def _c_meas_from_params_deg(strike_deg, twist_deg, shear_deg, gain):
+    """Reconstruct the measurement-frame galvanic-distortion tensor
+    ``C_meas = g * R(strike) T(twist) S(shear) R(strike).T`` from
+    GB output parameters in degrees. Used by the canonicalise-flag
+    invariance test.
+    """
+    strike = np.radians(strike_deg)
+    twist = np.radians(twist_deg)
+    shear = np.radians(shear_deg)
+    R = np.array(
+        [[np.cos(strike), -np.sin(strike)], [np.sin(strike), np.cos(strike)]]
+    )
+    T = np.array([[np.cos(twist), -np.sin(twist)], [np.sin(twist), np.cos(twist)]])
+    S = np.array([[np.cos(shear), np.sin(shear)], [np.sin(shear), np.cos(shear)]])
+    return gain * R @ T @ S @ R.T
+
+
+class TestDecomposeCanonicaliseFlag:
+    """The ``canonicalise`` flag toggles the GB 90-degree fold on
+    the user-facing strike/shear reporting without changing any
+    physical observable (predicted Z, residuals, C tensor)."""
+
+    def test_default_strike_in_canonical_range(self):
+        # Backward compatibility: with canonicalise=True (default),
+        # all reported strikes lie in [0, 90).
+        z, _ = _build_synthetic_z(theta_deg=120.0)
+        result = decompose(z)
+        strikes = result.parameters["strike"].values
+        finite = strikes[np.isfinite(strikes)]
+        assert finite.size > 0
+        assert np.all(finite >= 0.0 - 1e-9)
+        assert np.all(finite < 90.0 + 1e-9)
+        assert result.parameters["strike"].attrs.get("range") == "[0, 90)"
+        assert result.metadata["strike_range_degrees"] == "[0, 90)"
+
+    def test_canonicalise_off_returns_unfolded_strike(self):
+        # theta_deg=120 lies in [90, 180). Without bounds the GB
+        # symmetry lets the optimiser land in either branch; we
+        # constrain strike to [pi/2, pi) to pin it to the [90, 180)
+        # branch and verify that canonicalise=False reports it
+        # unfolded.
+        z, _ = _build_synthetic_z(theta_deg=120.0)
+        result = decompose(
+            z,
+            canonicalise=False,
+            bounds_override={"strike": (np.pi / 2.0, np.pi)},
+        )
+        strikes = result.parameters["strike"].values
+        finite = strikes[np.isfinite(strikes)]
+        assert finite.size > 0
+        assert np.all(finite >= 0.0 - 1e-9)
+        assert np.all(finite < 180.0 + 1e-9)
+        # All converged bands are inside [90, 180); their reported
+        # strike must stay there under canonicalise=False.
+        assert np.all(finite >= 90.0 - 1e-6)
+        median_strike = float(np.nanmedian(strikes))
+        assert abs(median_strike - 120.0) < 5.0
+        assert result.parameters["strike"].attrs.get("range") == "[0, 180)"
+        assert result.metadata["strike_range_degrees"] == "[0, 180)"
+        assert result.options["canonicalise"] is False
+
+    def test_c_tensor_invariant_under_flag(self):
+        # Decomposing the same Z with canonicalise=True vs False
+        # must leave every physical observable unchanged: predicted
+        # residuals, total RMS, per-band x_opt, and the reconstructed
+        # C tensor in the measurement frame. Constrain strike to
+        # [pi/2, pi) so the optimiser lands in the upper branch and
+        # the canonicalisation fold actually triggers; otherwise the
+        # comparison would be vacuous.
+        z, _ = _build_synthetic_z(theta_deg=120.0, twist_deg=8.0, shear_deg=4.0)
+        upper_branch_bounds = {"strike": (np.pi / 2.0, np.pi)}
+
+        result_true = decompose(
+            z, seed=123, bounds_override=upper_branch_bounds
+        )
+        result_false = decompose(
+            z, seed=123, canonicalise=False, bounds_override=upper_branch_bounds
+        )
+
+        # The optimisation is independent of the reporting flag, so
+        # per-band x_opt and band RMS must match exactly.
+        per_band_t = result_true.metadata["per_band"]
+        per_band_f = result_false.metadata["per_band"]
+        assert len(per_band_t) == len(per_band_f)
+        for band_t, band_f in zip(per_band_t, per_band_f):
+            x_t = np.asarray(band_t["modes"][0]["x_opt"])
+            x_f = np.asarray(band_f["modes"][0]["x_opt"])
+            np.testing.assert_array_equal(x_t, x_f)
+
+        # Total RMS misfit is a function of x_opt and observations.
+        assert result_true.rms_misfit == pytest.approx(result_false.rms_misfit)
+
+        # Reconstruct C_meas per period from the reported parameters
+        # and check pointwise equality. The GB 90-degree symmetry
+        # guarantees R(s+pi/2) T(t) S(-e) R(s+pi/2).T = R(s) T(t) S(+e) R(s).T,
+        # so the two reports must yield identical C_meas matrices.
+        strike_t = result_true.parameters["strike"].values
+        twist_t = result_true.parameters["twist"].values
+        shear_t = result_true.parameters["shear"].values
+        gain_t = result_true.parameters["gain"].values
+        strike_f = result_false.parameters["strike"].values
+        twist_f = result_false.parameters["twist"].values
+        shear_f = result_false.parameters["shear"].values
+        gain_f = result_false.parameters["gain"].values
+
+        n_periods = strike_t.size
+        any_compared = False
+        for k in range(n_periods):
+            if not (
+                np.isfinite(strike_t[k])
+                and np.isfinite(strike_f[k])
+                and np.isfinite(twist_t[k])
+                and np.isfinite(shear_t[k])
+            ):
+                continue
+            c_t = _c_meas_from_params_deg(
+                strike_t[k], twist_t[k], shear_t[k], gain_t[k]
+            )
+            c_f = _c_meas_from_params_deg(
+                strike_f[k], twist_f[k], shear_f[k], gain_f[k]
+            )
+            np.testing.assert_allclose(c_t, c_f, atol=1e-9, rtol=1e-9)
+            any_compared = True
+        assert any_compared, "no finite periods were available to compare"
+
+        # Sanity: at least one band's reporting actually differs
+        # between the two flag settings, otherwise the test is vacuous.
+        assert not np.allclose(strike_t, strike_f, atol=1e-6)
 
 
 class TestRotatedInitialGuess:

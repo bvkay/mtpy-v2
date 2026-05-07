@@ -344,6 +344,7 @@ def decompose(
     perturbation_scale: float = 0.1,
     ci_level: float = 0.95,
     ci_method: str = "percentile",
+    canonicalise: bool = True,
 ) -> DecompositionResult:
     """Single-site Groom-Bailey decomposition with multi-start.
 
@@ -440,6 +441,18 @@ def decompose(
         ``'percentile'`` is implemented; passing anything else
         raises :class:`NotImplementedError`. BCa (bias-corrected
         and accelerated) is planned for a future session.
+
+    canonicalise : bool, default True
+        If True (default), fold each band's reported strike into
+        ``[0, 90)`` via the GB 90-degree / shear-sign symmetry
+        (matching the historical Fortran-validated convention).
+        If False, skip the fold so reported strike lies in
+        ``[0, 180)`` and shear keeps its optimised sign. The
+        underlying optimisation, predicted Z, residuals, and
+        reconstructed C tensor are independent of this choice;
+        only the per-band and per-period reporting of strike and
+        shear changes. The bootstrap and mode-clustering paths
+        always canonicalise internally regardless of this flag.
 
     Returns
     -------
@@ -654,7 +667,7 @@ def decompose(
     canon_per_band = []
     for band_idx, br in band_results:
         theta_c, twist_c, shear_c = _canonicalise_solution(
-            br.x_opt[0], br.x_opt[1], br.x_opt[2]
+            br.x_opt[0], br.x_opt[1], br.x_opt[2], canonicalise=canonicalise
         )
         canon_per_band.append((theta_c, twist_c, shear_c))
 
@@ -758,6 +771,13 @@ def decompose(
         # Average chi-squared across bands containing this period
         chi_squared_pp[global_i] = float(np.mean(chi_sq_at_period))
 
+    if not canonicalise:
+        # Circular mean of strikes in [0, pi) lands in (-pi/2, pi/2];
+        # wrap into [0, pi) so reported strike covers the full
+        # un-folded range.
+        finite_mask = np.isfinite(strike_pp)
+        strike_pp[finite_mask] = strike_pp[finite_mask] % np.pi
+
     # Build regional Z in strike frame, then rotate to measurement
     # frame.
     z_regional_strike, z_regional_strike_err = _band_arrays_to_z(
@@ -838,7 +858,7 @@ def decompose(
     )
     params["strike"].attrs.update(
         units="degrees",
-        range="[0, 90)",
+        range="[0, 90)" if canonicalise else "[0, 180)",
         convention="clockwise from x-axis",
     )
     params["twist"].attrs.update(units="degrees")
@@ -902,11 +922,13 @@ def decompose(
 
     metadata = {
         "convention": "clockwise from x-axis",
-        "strike_range_degrees": "[0, 90)",
+        "strike_range_degrees": "[0, 90)" if canonicalise else "[0, 180)",
         "canonicalisation": (
             "(strike + 90 mod 180, -shear, twist) symmetry folded "
             "so strike in [0, 90); shear sign flipped if pre-fold "
             "strike was in [90, 180)"
+            if canonicalise
+            else "disabled; strike wrapped to [0, 180) and shear sign preserved"
         ),
         "static_shift_convention": ("gain consistent with MT.remove_static_shift"),
         "regional_z_frame": "measurement",
@@ -1025,6 +1047,7 @@ def decompose(
         "perturbation_scale": perturbation_scale,
         "ci_level": ci_level,
         "ci_method": ci_method,
+        "canonicalise": canonicalise,
     }
 
     return DecompositionResult(
@@ -2414,7 +2437,10 @@ class _BandResult:
 
 
 def _canonicalise_solution(
-    strike: float, twist: float, shear: float
+    strike: float,
+    twist: float,
+    shear: float,
+    canonicalise: bool = True,
 ) -> tuple[float, float, float]:
     """Apply the GB 90-degree / shear-sign symmetry to fold a
     solution to a canonical branch.
@@ -2431,12 +2457,23 @@ def _canonicalise_solution(
     ----------
     strike, twist, shear : float
         Radians.
+    canonicalise : bool, default True
+        If True (historical behaviour), fold strike into
+        ``[0, pi/2)`` and flip the sign of shear when the fold
+        triggers. If False, only wrap strike to ``[0, pi)`` via
+        ``strike % pi`` and leave shear unchanged. The False mode
+        is provided so callers can study the unfolded GB output
+        directly (e.g. for cross-tool comparison with phase-tensor
+        strike, which uses a 180-degree fold).
 
     Returns
     -------
     strike_c, twist_c, shear_c : float
-        Canonicalised values, with ``strike_c in [0, pi/2)``.
+        Canonicalised values. ``strike_c`` lies in ``[0, pi/2)``
+        when ``canonicalise`` is True, otherwise in ``[0, pi)``.
     """
+    if not canonicalise:
+        return float(strike % np.pi), float(twist), float(shear)
     half_pi = np.pi / 2.0
     # Tolerance for the boundary at strike = pi/2 (90 deg). Without
     # this, a strike that lands exactly at pi/2 can be rounded to one
