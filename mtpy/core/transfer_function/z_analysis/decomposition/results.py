@@ -673,6 +673,23 @@ class LilleyResult:
         in-phase / quadrature radial arm onto the horizontal axis,
         which Lilley reads as a 2-D-strike candidate from each
         circle. Equal to ``-beta / 2`` in Lilley 2018 notation.
+        **Convention: across-strike azimuth.** This is the
+        direction *perpendicular* to the principal (along-strike)
+        direction, so it differs from the GB-tradition ``strike``
+        field returned by :func:`...groom_bailey.decompose` by
+        90° (modulo 180°). The Mohr-circle algebra cannot
+        distinguish along-strike from across-strike on its own
+        (the two are related by the GB 90-degree symmetry); this
+        implementation consistently returns the across-strike
+        branch. To compare against a GB ``strike`` value, add
+        90° (mod 180°). Worked example: a clean 2-D synthetic
+        with TE / TM strike at 30° (GB ``strike = 30°``) yields
+        ``rotation_real_rad = -60°`` (≡ 120° mod 180°); adding
+        90° gives 30°. Renaming this field to
+        ``across_strike_azimuth_rad`` is a candidate follow-up
+        to make the convention explicit at the call site as well
+        as in this docstring; deferred for now to avoid a
+        breaking attribute change.
     central_impedance_real, central_impedance_imag : ndarray of float
         Lilley's ``Z^L_p`` and ``Z^L_q``: the distance from the
         origin to the circle centre. 1-D scale of the tensor.

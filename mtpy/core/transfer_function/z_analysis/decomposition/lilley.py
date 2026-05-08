@@ -70,9 +70,21 @@ Strike
 For a clean 2-D regional structure the in-phase and quadrature
 Mohr circles both have their centres on the horizontal axis
 (``μ_p = μ_q = 0``) and their radial arms are parallel
-(``δβ = 0``). The strike is then the rotation that takes either
-radial arm onto the horizontal axis, which is ``-β_p / 2`` (with
-the usual 90° ambiguity).
+(``δβ = 0``). The strike candidate is the rotation that takes
+either radial arm onto the horizontal axis, which is ``-β_p / 2``
+in Lilley 2018 notation. **Convention: ``-β / 2`` is the
+across-strike azimuth — the direction perpendicular to the
+principal (along-strike) direction.** Mohr-circle algebra has
+no way to pick along-strike vs across-strike on its own (the
+two are related by the GB 90-degree symmetry: rotating by 90°
+swaps "TE" and "TM" without changing the radial arms' positions
+on the Mohr diagram). This module consistently returns the
+across-strike branch; to compare against a GB-tradition
+``strike`` (e.g. from :func:`...groom_bailey.decompose`), add
+90° modulo 180°. Worked example: a clean 2-D synthetic with TE /
+TM strike at 30° (GB ``strike = 30°``) yields
+``rotation_real_rad = -60°`` (≡ 120° mod 180°); folding by +90°
+recovers the GB strike at 30°.
 
 For non-2-D data this rotation is still a candidate strike — a
 "closest 2-D strike" in the per-part sense. The
@@ -200,8 +212,36 @@ def mohr_circle_parameters(z: np.ndarray) -> dict:
         - ``radius_real`` and ``radius_imag`` are real positive
           scalars: Lilley's ``C_p`` and ``C_q``.
         - ``rotation_real_rad`` and ``rotation_imag_rad`` are
-          real (radians): the per-circle 2-D-strike candidate
-          ``-β / 2`` from each part.
+          real (radians): the per-circle rotation that brings each
+          radial arm onto the horizontal axis, equal to ``-β / 2``
+          in Lilley 2018 notation. **Convention: this is the
+          across-strike azimuth — perpendicular to the principal
+          (along-strike) direction**, i.e. the GB-tradition
+          ``strike`` rotated by 90°. Mohr-circle algebra has no
+          way to pick "along-strike" vs "across-strike" on its
+          own (the GB 90-degree symmetry maps the two onto each
+          other); this implementation consistently returns the
+          across-strike branch. To compare with
+          :func:`...groom_bailey.decompose`'s ``strike`` field,
+          add 90° (modulo 180°). Both directions are equally
+          valid as a 2-D-strike candidate; they are distinguished
+          downstream only by which off-diagonal Z component is
+          labelled "TE" vs "TM".
+
+    Examples
+    --------
+    For a clean 2-D synthetic generated with TE / TM strike at
+    30° (i.e. GB ``strike = 30°``)::
+
+        >>> z = _two_d_tensor(theta_rad=np.radians(30.0))
+        >>> p = mohr_circle_parameters(z)
+        >>> np.degrees(p["rotation_real_rad"])  # across-strike azimuth
+        -60.0
+        >>> (np.degrees(p["rotation_real_rad"]) + 90.0) % 180.0
+        30.0   # along-strike, matches GB strike
+
+    The across-strike value −60° is equivalent to 120° (modulo
+    180°); adding 90° folds either onto the GB strike of 30°.
     """
     z_arr = np.asarray(z, dtype=np.complex128)
     single = z_arr.ndim == 2
