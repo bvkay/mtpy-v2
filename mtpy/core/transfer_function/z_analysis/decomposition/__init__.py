@@ -44,14 +44,20 @@ Currently implemented
   fold strategies (``geometric``, ``identity``, ``pt_aligned``,
   ``min_shear``) and a callable hook for user-defined strategies,
   exposed on :func:`decompose`.
+- **Lilley Mohr-circle** (:func:`decompose_lilley`): per-period
+  Mohr-circle parametric-free decomposition with WAL invariants and
+  noise-stability strike.
+- **Marti WALDIM** (:func:`decompose_marti`,
+  :func:`wal_invariants`, :func:`waldim_dimensionality`): per-period
+  dimensionality classifier on the WAL invariants.
+- **Garcia-Jones extended** (:func:`decompose_garcia_jones`): the
+  3-D regional extension of MJ, Phase 1. Per-site real distortion
+  (twist, shear) plus a free 3-D regional Z per period, fitted
+  jointly across two-or-more sites.
 
 Planned
 -------
 - Bahr 1991 decomposition and class scheme.
-- Weaver-Agarwal-Lilley (2000) invariants.
-- Marti et al. (2009) WALDIM dimensionality classifier.
-- Lilley (1998) Mohr-circle decomposition.
-- García & Jones (2002) 3-D distortion decomposition.
 - A common :class:`DecompositionResult` flavour shared across all
   methods so cross-tradition comparison is a one-liner.
 
@@ -70,6 +76,10 @@ Package layout
   parametric-bootstrap machinery.
 - :mod:`.bibby` : the Bibby-Caldwell-Brown single-site
   decomposition (:func:`decompose_bibby`).
+- :mod:`.lilley` : the Lilley Mohr-circle decomposition.
+- :mod:`.marti` : the Marti WALDIM dimensionality classifier.
+- :mod:`.garcia_jones` : the Garcia-Jones (2002) 3-D-regional
+  extended decomposition.
 
 See also
 --------
@@ -166,12 +176,14 @@ from .groom_bailey import (  # noqa: F401  -- private helpers re-exported for ba
     decompose_joint,
 )
 from .bibby import decompose_bibby
+from .garcia_jones import decompose_garcia_jones
 from .lilley import decompose_lilley
 from .marti import decompose_marti, wal_invariants, waldim_dimensionality
 from .mcneice_jones import decompose_mcneice_jones
 from .results import (  # noqa: F401  -- private helpers re-exported for backward compatibility
     BibbyResult,
     DecompositionResult,
+    GarciaJonesResult,
     JointDecompositionResult,
     LilleyResult,
     MartiResult,
@@ -194,12 +206,14 @@ from .symmetries import (  # noqa: F401  -- private helpers re-exported for back
 __all__ = [
     "BibbyResult",
     "DecompositionResult",
+    "GarciaJonesResult",
     "JointDecompositionResult",
     "LilleyResult",
     "MartiResult",
     "decompose",
     "decompose_bibby",
     "decompose_each_station",
+    "decompose_garcia_jones",
     "decompose_joint",
     "decompose_lilley",
     "decompose_marti",

@@ -464,6 +464,75 @@ class JointDecompositionResult:
 
 
 @dataclass
+class GarciaJonesResult:
+    """Result of a Garcia-Jones (2002) extended decomposition.
+
+    Garcia-Jones is the 3-D extension of the Groom-Bailey / McNeice-
+    Jones tradition: the regional impedance is fitted as a free 3-D
+    tensor (four complex components per period) instead of an anti-
+    diagonal 2-D tensor, while each station retains its own real
+    galvanic distortion. The two-(or-more-)site assumption is that
+    neighbouring stations share the *same* regional response but
+    have *different* distortion (Garcia & Jones 2002 Section 2),
+    which makes the system over-determined for ``n_sites >= 2``.
+
+    Phase 1 scope (this implementation):
+
+    - Per-site distortion: real ``twist`` and ``shear`` only;
+      ``gain`` is fixed to 1 and ``anisotropy`` is fixed to 0. The
+      2002 paper demonstrates that the gain (and anisotropy) cannot
+      be reliably recovered from MT alone (Section 4.2) and the
+      added unknowns make the inverse problem unstable.
+    - Per-band fitting via TRF nonlinear least-squares with multi-
+      start.
+    - Single regional 3-D Z shared across sites within each band;
+      no smoothing across bands.
+
+    Attributes
+    ----------
+    per_site_distortion : dict[str, dict[str, float | np.ndarray]]
+        ``{site_id: {parameter_name: value}}`` with band-averaged
+        ``twist_deg``, ``shear_deg``, ``gain`` (always 1.0 in Phase
+        1), ``c_tensor`` (the real 2x2 distortion matrix in the
+        measurement frame), and per-band copies as
+        ``twist_deg_per_band``, ``shear_deg_per_band``.
+    per_band_3d_z_regional : dict[int, np.ndarray]
+        ``{band_id: z_regional}`` where ``z_regional`` is the
+        recovered 3-D regional impedance with shape
+        ``(n_band_periods, 2, 2)``, complex, in the measurement
+        frame.
+    chi_squared : float
+        Total chi-squared across all bands and sites.
+    rms_misfit_per_site : dict[str, float]
+        Per-site RMS misfit (over all bands and components),
+        weighted by the input ``z_error``.
+    metadata : dict
+        Provenance: ``method='garcia_jones'``, ``n_starts``,
+        ``seed``, ``share_distortion_within_period``,
+        ``per_band_3d``, ``period_bands`` actually fitted, and
+        ``per_band`` (mode info, n_iter, RMS, etc.).
+
+    References
+    ----------
+    Garcia, X., & Jones, A. G. (2002). Decomposition of three-
+    dimensional magnetotelluric data. In *Three-Dimensional
+    Electromagnetics* (M. S. Zhdanov & P. E. Wannamaker, eds.),
+    Methods in Geochemistry and Geophysics, 35, 235-250.
+
+    Garcia, X., Boerner, D., & Pedersen, L. B. (2003). Electric and
+    magnetic galvanic distortion decomposition of tensor CSAMT
+    data. Application to data from the Buchans Mine (Newfoundland,
+    Canada). Geophysical Journal International, 154, 957-969.
+    """
+
+    per_site_distortion: dict[str, dict[str, Any]] = field(default_factory=dict)
+    per_band_3d_z_regional: dict[int, np.ndarray] = field(default_factory=dict)
+    chi_squared: float = 0.0
+    rms_misfit_per_site: dict[str, float] = field(default_factory=dict)
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
 class MartiResult:
     """Result of a WAL-invariants / WALDIM dimensionality analysis.
 
