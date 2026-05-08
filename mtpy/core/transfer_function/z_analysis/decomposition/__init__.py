@@ -60,6 +60,42 @@ Currently implemented
   deviatoric shear, antisymmetric pseudo-scalar). The spin-2
   ``gamma`` field is the input to array-level E / B-mode analysis.
 
+Method-selection guide
+----------------------
+At-a-glance pointers; see ``docs/distortion_methods.md`` for the
+full discussion and tradeoffs.
+
+* **Single site, 2-D regional, want C and a regional Z** ->
+  :func:`decompose`. Pick a disambiguation strategy that matches
+  your prior knowledge (``"geometric"`` is the historical GB
+  default; ``"pt_aligned"`` aligns to the phase tensor).
+* **Multiple sites, shared 2-D regional** ->
+  :func:`decompose_mcneice_jones`. Per-site distortion plus a
+  shared per-band strike. The Phase 1 API
+  (:class:`JointDecompositionResult`) is the cleaner public
+  surface; :func:`decompose_joint` is retained for backward
+  compatibility.
+* **Sanity check on GB without any GB parametrisation** ->
+  :func:`decompose_bibby`. Fits a single real ``C`` per period
+  with the diagonal-unity gauge.
+* **Dimensionality classification** -> :func:`decompose_marti`
+  for the Marti 2009 WALDIM codes; :func:`waldim_dimensionality`
+  is the per-period classifier and :func:`wal_invariants` exposes
+  the underlying WAL invariants.
+* **Mohr-circle invariants and noise-stability strike** ->
+  :func:`decompose_lilley`. Gives the per-period Mohr-circle
+  centres / radii / angles plus the bootstrap-based strike
+  standard deviation.
+* **Multiple sites, genuinely 3-D regional** ->
+  :func:`decompose_garcia_jones`. Per-site distortion plus a free
+  3-D regional Z per period; out-performs MJ on a 3-D regional
+  synthetic.
+* **Spin-2 / E-mode analysis of a distortion field** ->
+  :func:`gamma_field`, :func:`principal_axis`, or
+  :func:`irreducible_decomposition` on each site's recovered
+  ``C``. The spin-2 shear ``gamma = gamma_1 + i gamma_2`` is the
+  station-level input to array-level E / B-mode decompositions.
+
 Planned
 -------
 - Bahr 1991 decomposition and class scheme.

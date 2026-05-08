@@ -18,13 +18,16 @@ components decompose into three irreducible representations:
   near-surface heterogeneity that is causing the distortion, and
   its magnitude (``|gamma|``) is the strength of the anisotropy.
 * **Spin-0 antisymmetric pseudo-scalar** (``beta``): scalar,
-  invariant under rotation but reverses sign under reflection. For
-  an *idealised* purely-galvanic distortion driven by static
-  near-surface charge accumulations, ``beta`` is identically zero
-  (the distortion is a real symmetric tensor); a non-zero ``beta``
-  is therefore a diagnostic of departures from the static-galvanic
-  model — instrument misalignment, residual induction, or the
-  numerical noise floor of the decomposition.
+  invariant under rotation but reverses sign under reflection.
+  Captures the rotation-like component of the distortion. The
+  *physical* galvanic distortion driven by symmetric static charge
+  accumulations is a real *symmetric* tensor with ``beta = 0``; a
+  non-zero ``beta`` arises from the *parameterisation* (the
+  Groom-Bailey ``T(twist)`` factor is a rotation matrix, which has
+  both symmetric and antisymmetric components), or from departures
+  from the symmetric-galvanic model (instrument misalignment,
+  residual induction). Pure-shear distortion (``twist = 0`` in GB
+  language) gives ``beta = 0``.
 
 The convention used in this module is
 

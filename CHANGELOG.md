@@ -70,37 +70,98 @@ the same API.
   `groom_bailey.py` (no algorithm reimplementation). Phase 2
   will add validation against published results (BC87) and
   edge-case coverage.
+- **Lilley Mohr-circle decomposition**
+  (`decompose_lilley`, `LilleyResult`). Per-period parametric-
+  free Mohr-circle decomposition: in-phase and quadrature
+  centres / radii / rotation angles, the WAL-equivalent
+  invariants (central impedance, anisotropy angle ``lambda``,
+  per-part 3-D measure ``mu``), the noise-stability strike
+  (Lilley 2018) computed via per-period bootstrap, and a
+  per-period dimensionality classifier (``"1D"`` / ``"2D"`` /
+  ``"3D-distorted"`` / ``"3D"``).
+- **Marti WALDIM dimensionality**
+  (`decompose_marti`, `MartiResult`, `wal_invariants`,
+  `waldim_dimensionality`). The Weaver-Agarwal-Lilley (2000)
+  seven rotational invariants ``I1`` ... ``I7`` plus the auxiliary
+  ``Q``, the Marti et al. (2009) WALDIM classifier (cases 1, 2,
+  3a, 4, 5, 7), Mohr-fold strikes ``St_3`` / ``St_4`` for 2-D
+  periods, and the Bahr equal-phase strike ``St_5`` solved
+  numerically. Cases 3c (diagonal-regional) and the full Smith
+  (1995) twist / shear angles are flagged Phase-2.
+- **Garcia-Jones extended decomposition**
+  (`decompose_garcia_jones`, `GarciaJonesResult`). Phase 1
+  implementation of the Garcia & Jones (2002) 3-D regional
+  extension: per-site real distortion (twist, shear) plus a free
+  3-D regional ``Z`` per period, fitted jointly across two-or-
+  more sites via TRF nonlinear least-squares with multi-start.
+  Gain and anisotropy fixed (the 2002 paper demonstrates these
+  are non-identifiable). Reduces gracefully to a 2-D regional
+  when the data warrant it; out-performs MJ on a genuinely 3-D
+  regional synthetic (verified in tests).
+- **Irreducible-decomposition utilities**
+  (`distortion_geometry.py`: `irreducible_decomposition`,
+  `gamma_field`, `gamma_magnitude`, `principal_axis`,
+  `gamma_to_complex`, `complex_to_gamma`). Splits a real
+  distortion ``D = C - I`` into its irreducible ``SO(2)``
+  representations: spin-0 trace, spin-2 deviatoric shear
+  (``gamma = gamma_1 + i gamma_2``, transforming as ``exp(2 i
+  theta) gamma`` under rotation), and spin-0 antisymmetric
+  pseudo-scalar. The spin-2 ``gamma`` field is the input to
+  array-level E / B-mode analysis of distortion fields.
+- **Synthetic test harness**
+  (`tests/synthetics.py`). Categorical knobs for regional type
+  (1-D / 2-D / 3-D), distortion strength, distortion shear, and
+  noise level produce a ground-truth synthetic ``Z`` and the
+  associated true ``C``. ``run_all_methods_on_synthetic`` runs
+  every implemented method end-to-end;
+  ``compute_method_accuracy`` returns the per-method Frobenius
+  recovery accuracy. Used for cross-method validation.
 - **CHANGELOG.md** (this file).
 
 ### Tests
-- 242 pass by default across the GB / MJ / BCB / disambiguation /
-  alternate-branch suites; 2 opt-in slow validations skip
-  cleanly. The 6 `TestDecompositionResultNetcdf` failures pre-date
-  this branch (a netCDF4 library limitation around boolean
-  attributes) and are unrelated to the refactor.
+- All decomposition test suites pass: GB single-site, MJ joint,
+  BCB, Lilley, Marti, Garcia-Jones, disambiguation, alternate-
+  branch, distortion-geometry, synthetic harness, and the new
+  end-to-end integration tests. Two opt-in slow validations
+  (BC87 and the integration tests) skip cleanly under
+  ``pytest -m "not slow"``. The 6 `TestDecompositionResultNetcdf`
+  failures pre-date this branch (a netCDF4 library limitation
+  around boolean attributes) and are unrelated.
 - New test files: `tests/test_disambiguation.py`,
   `tests/test_alternate_branch.py`, `tests/test_bibby.py`,
   `tests/test_mcneice_jones.py`,
-  `tests/test_mj_bc87_validation.py`.
+  `tests/test_mj_bc87_validation.py`,
+  `tests/test_lilley.py`, `tests/test_marti.py`,
+  `tests/test_garcia_jones.py`,
+  `tests/test_distortion_geometry.py`,
+  `tests/test_synthetics_harness.py`,
+  `tests/test_integration.py`.
+- New test utility module: `tests/synthetics.py`
+  (ground-truth synthetic generation, per-method accuracy).
 
 ### Documentation
 - `docs/decomposition_validation.md` records the validation
   strategy for each method and what is and is not validated
-  against published results. The BC87 strike-magnitude
-  comparison against McNeice & Jones (2001) Figure 12 is
-  explicitly Phase-2 work.
+  against published results.
+- `docs/distortion_methods.md` (new) provides a tradition-by-
+  tradition overview, when-to-use-which guidance, and known
+  limitations for every implemented method.
+- The package `__init__.py` docstring carries an at-a-glance
+  method-selection guide for callers.
 
 ### Planned
-- Implement Bahr (1991) decomposition and dimensionality classifier.
-- Implement Weaver-Agarwal-Lilley (2000) rotational invariants and
-  Marti et al. (2009) WALDIM dimensionality codes.
-- Implement Lilley (1998) Mohr-circle decomposition.
-- Implement García & Jones (2002) 3-D distortion decomposition.
+- Implement Bahr (1991) decomposition and class scheme.
 - Adopt a shared `DecompositionResult` flavour across every method
   so cross-tradition comparison is a one-liner.
 - Resolve the pre-existing `TestDecompositionResultNetcdf` failures
   by switching boolean metadata attributes to `int8` at the NetCDF
   boundary.
+- Garcia-Jones Phase 2: gain / anisotropy recovery experiments
+  (the 2002 paper notes both are unstable; verify on synthetic),
+  magnetic-distortion extension (Garcia, Boerner & Pedersen 2003).
+- Marti Phase 2: case 3c (diagonal regional) discriminator via
+  the Bahr ``xi_4`` / ``eta_4`` test, full Smith (1995) twist /
+  shear angle decomposition.
 - Investigate the BC87 LIT-line strike discrepancy
   (`test_mj_bc87_strike_recovery` finds ~5° in the geometric-fold
   convention vs Fig 12's ~25–40°). Likely follow-ups: per-period
