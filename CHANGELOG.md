@@ -53,6 +53,13 @@ the same API.
   (`strike + 90 mod 180`, `-shear`, with `Z_xy`/`Z_yx` swapped in
   `regional_z`). Idempotent; preserves chi-squared, RMS, errors,
   metadata, and the reconstructed C tensor.
+- **Bibby-Caldwell-Brown decomposition**
+  (`decompose_bibby`, `BibbyResult`). Fits a single real 2x2
+  distortion matrix per period and band-averages it. Uses the
+  diagonal-unity gauge to fix the BCB non-determinable scale.
+  Methodologically the simplest distortion-analysis method in
+  the package and a comparison baseline for the parameterised
+  Groom-Bailey result.
 - **CHANGELOG.md** (this file).
 
 ### Tests

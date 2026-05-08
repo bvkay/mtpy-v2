@@ -32,6 +32,10 @@ Currently implemented
   user-selectable strategy for resolving the GB 90-degree symmetry.
 - **MJ joint** (:func:`decompose_joint`): the multi-site extension
   with a shared regional strike across stations.
+- **BCB single-site** (:func:`decompose_bibby`): Bibby-Caldwell-
+  Brown decomposition. Fits a single real 2x2 distortion matrix
+  ``C`` per period and band-averages it; the methodologically
+  simplest comparison point for the parameterised GB result.
 - **Disambiguation framework** (:mod:`.symmetries`): four named
   fold strategies (``geometric``, ``identity``, ``pt_aligned``,
   ``min_shear``) and a callable hook for user-defined strategies,
@@ -60,6 +64,8 @@ Package layout
 - :mod:`.groom_bailey` : the GB single-site and MJ joint
   algorithms, public ``decompose*`` entry points, and the
   parametric-bootstrap machinery.
+- :mod:`.bibby` : the Bibby-Caldwell-Brown single-site
+  decomposition (:func:`decompose_bibby`).
 
 See also
 --------
@@ -155,7 +161,9 @@ from .groom_bailey import (  # noqa: F401  -- private helpers re-exported for ba
     decompose_each_station,
     decompose_joint,
 )
+from .bibby import decompose_bibby
 from .results import (  # noqa: F401  -- private helpers re-exported for backward compatibility
+    BibbyResult,
     DecompositionResult,
     _desanitize_station_id,
     _sanitize_station_id,
@@ -174,8 +182,10 @@ from .symmetries import (  # noqa: F401  -- private helpers re-exported for back
 )
 
 __all__ = [
+    "BibbyResult",
     "DecompositionResult",
     "decompose",
+    "decompose_bibby",
     "decompose_each_station",
     "decompose_joint",
 ]

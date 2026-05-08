@@ -399,6 +399,68 @@ class DecompositionResult:
         return replace(self, parameters=new_params, regional_z=new_regional_z)
 
 
+@dataclass
+class BibbyResult:
+    """Result of a Bibby-Caldwell-Brown decomposition.
+
+    BCB fits a single real 2x2 distortion tensor ``C`` per period
+    and band-averages it (Bibby et al., 2005). The output is
+    deliberately minimal — no per-period parameter set, no errors
+    or CIs — because the BCB decomposition is the *simplest*
+    distortion-analysis method in the package and is included as a
+    methodological-baseline comparison point for the parameterised
+    Groom-Bailey result.
+
+    Attributes
+    ----------
+    C : ndarray, shape (2, 2)
+        The band-averaged real distortion matrix in the measurement
+        frame. The averaging method (median or mean) is recorded in
+        :attr:`band_method`.
+    Z_regional : ndarray, shape (n_periods, 2, 2), complex
+        Per-period regional 2-D impedance tensor in the measurement
+        frame, anti-diagonal in the strike frame chosen from the
+        phase tensor's principal axis. Provided per period (not
+        band-averaged) so callers can plot or further-process the
+        regional response.
+    rms_misfit : float
+        Root-mean-square of the per-period residuals
+        ``Z_obs - C_period @ Z_R_period`` over all entries and all
+        periods in the band, computed from the un-averaged C
+        tensors.
+    n_periods : int
+        Number of valid periods in the band (periods with a finite
+        phase-tensor strike).
+    band_method : str
+        ``"median"`` or ``"mean"``; the method used to average the
+        per-period C tensors.
+    periods : ndarray, shape (n_periods,)
+        Periods (seconds) of the band, sorted ascending.
+    gauge : str
+        Identifier for the gauge convention used to fix the BCB
+        non-determinable scale (see the :mod:`.bibby` module
+        docstring). Defaults to ``"diagonal_unity"``: the regional
+        Z's strike-frame off-diagonals match the observed Z's
+        strike-frame off-diagonals, forcing C's strike-frame
+        diagonal entries to ~1.
+
+    References
+    ----------
+    Bibby, H. M., Caldwell, T. G., & Brown, C. (2005). Determinable
+    and non-determinable parameters of galvanic distortion in
+    magnetotellurics. Geophysical Journal International, 163(3),
+    915-930.
+    """
+
+    C: np.ndarray
+    Z_regional: np.ndarray
+    rms_misfit: float
+    n_periods: int
+    band_method: str = "median"
+    periods: np.ndarray = field(default_factory=lambda: np.empty(0))
+    gauge: str = "diagonal_unity"
+
+
 def _swap_off_diagonals(z_obj: "Z") -> "Z":
     """Return a fresh :class:`Z` with ``Z_xy`` and ``Z_yx`` swapped.
 
