@@ -901,6 +901,98 @@ class GomezTrevinoResult:
 
 
 @dataclass
+class LilleyDimensionalityResult:
+    """Per-period dimensionality classification by the unified
+    Lilley 2020 framework: phase-tensor invariants + Bahr / Lilley
+    eigenvector strike + Mohr-circle of the phase tensor.
+
+    Lilley 2020 (*Exploration Geophysics* 51:4, 401-421) establishes
+    the formal equivalence: the eigenvectors of the Caldwell-Bibby-
+    Brown phase tensor are the regional strike directions of
+    Bahr 1988, and the Mohr circle of the phase tensor encodes the
+    same dimensionality information. This dataclass packages all
+    three views per period.
+
+    Fields
+    ------
+    site : str
+        Identifier for the source site.
+    periods : ndarray, shape ``(n_periods,)``
+    phase_tensor : ndarray, shape ``(n_periods, 2, 2)``
+        Per-period CBB phase tensor ``Phi = X^{-1} Y`` with
+        ``X = Re(Z)``, ``Y = Im(Z)``.
+    pt_alpha_deg : ndarray
+        CBB principal-axis angle (degrees,
+        ``(1/2) arctan2(Phi_xy + Phi_yx, Phi_xx - Phi_yy)``). The
+        strike of the major eigenvector of the symmetric part of
+        Phi.
+    pt_beta_deg : ndarray
+        CBB skew angle (degrees,
+        ``(1/2) arctan2(Phi_xy - Phi_yx, Phi_xx + Phi_yy)``).
+        Beta is identically zero in 2-D; non-zero indicates 3-D
+        regional structure.
+    pt_ellipticity : ndarray
+        ``(lambda_max - lambda_min) / (lambda_max + lambda_min)``.
+        Zero when ``Phi`` is isotropic (1-D); larger when
+        anisotropic (2-D / 3-D).
+    pt_lambda_max, pt_lambda_min : ndarray
+        Eigenvalues of the symmetric part of ``Phi``.
+    eigenvector_strikes : ndarray, shape ``(n_periods, 2)``
+        Per-period angles (degrees, mod 180) of the two real
+        eigenvectors of ``Phi``. In 2-D the two are at
+        ``(alpha, alpha + 90°)``; in 3-D they may deviate.
+    eigenvector_disagreement_deg : ndarray
+        ``|90° - angle_between_eigenvectors|``. Zero when the
+        eigenvectors are exactly perpendicular (2-D); larger when
+        they aren't (3-D).
+    mohr_lambda_a_deg : ndarray
+        Lilley's anisotropy angle ``arcsin(C / Z^L)`` for the
+        phase-tensor Mohr circle, where ``C`` is the radius and
+        ``Z^L`` is the centroid distance from origin.
+    mohr_mu_deg : ndarray
+        Phase-tensor Mohr-circle centroid angle from horizontal
+        (degrees). By the Lilley 2020 equivalence
+        ``mu_deg = 2 * pt_beta_deg`` to numerical precision.
+    classification : list[str]
+        Per-period label: ``"1D"``, ``"2D"``, ``"3D-2D"``,
+        ``"3D"``, or ``"indeterminate"``.
+    classification_thresholds : dict
+        The thresholds used (``beta_1d``, ``beta_2d``,
+        ``ell_1d``, ``eigenvector_disagree``); recorded for
+        provenance.
+
+    References
+    ----------
+    Caldwell, T. G., Bibby, H. M., & Brown, C. (2004). The
+    magnetotelluric phase tensor. *Geophysical Journal
+    International* 158, 457-469.
+
+    Bahr, K. (1988). Interpretation of the magnetotelluric
+    impedance tensor: regional induction and local telluric
+    distortion. *Journal of Geophysics* 62(2), 119-127.
+
+    Lilley, F. E. M. (2020). Magnetotellurics: the CBB or phase
+    tensor and Bahr's 1988 analysis. *Exploration Geophysics*
+    51(4), 401-421. doi:10.1080/08123985.2020.1717333
+    """
+
+    site: str
+    periods: np.ndarray
+    phase_tensor: np.ndarray
+    pt_alpha_deg: np.ndarray
+    pt_beta_deg: np.ndarray
+    pt_ellipticity: np.ndarray
+    pt_lambda_max: np.ndarray
+    pt_lambda_min: np.ndarray
+    eigenvector_strikes: np.ndarray
+    eigenvector_disagreement_deg: np.ndarray
+    mohr_lambda_a_deg: np.ndarray
+    mohr_mu_deg: np.ndarray
+    classification: list[str] = field(default_factory=list)
+    classification_thresholds: dict[str, float] = field(default_factory=dict)
+
+
+@dataclass
 class CrossMethodResult:
     """Side-by-side comparison of multiple decomposition methods on a
     single site.

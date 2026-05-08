@@ -168,6 +168,44 @@ opt-in skipped.
   2775 lines (down from 3681 at the start of the refactor — −906
   / −25 %).
 
+### Unified dimensionality classifier
+- **Lilley 2020 unified phase-tensor / Bahr-eigenvector / Mohr-
+  circle dimensionality classifier**
+  (:mod:`...lilley_dimensionality`,
+  :func:`classify_dimensionality`,
+  :func:`compare_lilley_marti`,
+  :class:`LilleyDimensionalityResult`). Lilley 2020
+  (*Exploration Geophysics* 51:4, 401-421) establishes the
+  formal equivalence of three apparently-distinct dimensionality
+  tools — the Caldwell-Bibby-Brown phase tensor invariants
+  (``alpha``, ``beta``, eigenvalues), Bahr 1988 strike directions
+  (eigenvectors of ``Phi``), and the Mohr-circle representation
+  of the phase tensor — and this module makes that equivalence
+  operational. Per-period classification rules:
+
+  * ``"1D"``: ``|beta| < 1°`` and ``ellipticity < 0.05``.
+  * ``"2D"``: small skew with eigenvectors close to perpendicular.
+  * ``"3D-2D"``: small skew but eigenvectors deviate from
+    perpendicular (Lilley's "approximately 2-D" sub-case).
+  * ``"3D"``: ``|beta| >= 3°``.
+
+  Thresholds configurable via keyword arguments and exposed as
+  module constants (``BETA_1D_THRESHOLD_DEG``,
+  ``BETA_2D_THRESHOLD_DEG``, etc.).
+
+  Companion :func:`compare_lilley_marti` cross-checks against the
+  Marti / WALDIM classifier with a documented mapping (WALDIM
+  3-D / 2-D sub-cases 3, 4, 6, 7 → Lilley ``"2D"``, since galvanic
+  distortion is gauge-invisible to the phase tensor by
+  construction). 10 tests in
+  ``tests/.../distortion/test_lilley_dimensionality.py`` cover the
+  seven required scenarios — 1-D / 2-D-strike / 2-D-rotated /
+  2-D-galvanic / 3-D classifications, the Lilley 2020 formal
+  identities (``alpha`` = major-eigenvector strike,
+  ``Mohr radius = (lambda_max − lambda_min)/2``,
+  ``Mohr mu = 2 * beta``), and 5/5 Lilley-vs-Marti agreement on
+  canonical synthetics.
+
 ### Cross-method consolidation
 - **Cross-method comparison entry point**
   (:mod:`...cross_method`,
