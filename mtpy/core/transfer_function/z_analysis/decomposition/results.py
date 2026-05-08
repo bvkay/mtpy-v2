@@ -99,7 +99,9 @@ class DecompositionResult:
     ``(strike + 90 mod 180, -shear, twist)`` symmetry so that
     ``strike`` lands in ``[0, 90)`` after the fold. The shear sign
     is flipped together with the strike shift; twist is unchanged.
-    See :func:`_canonicalise_solution`.
+    See :func:`_geometric_fold` (the default ``disambiguation``
+    strategy); other strategies are documented on
+    :func:`decompose`.
 
     The static-shift convention of ``gain`` matches that of
     :meth:`mtpy.core.mt.MT.remove_static_shift`. Applying

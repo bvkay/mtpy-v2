@@ -7,9 +7,25 @@ yields identical predicted impedances. Multi-start optimisation can
 also converge to physically-distinct local minima ("modes"). This
 module provides:
 
-- :func:`_canonicalise_solution` : canonical fold of the GB symmetry.
+- Disambiguation strategies that resolve the GB 90-degree symmetry by
+  choosing one of the two equivalent branches:
+
+  * :func:`_geometric_fold` — historical default, folds strike into
+    ``[0, pi/2)`` and flips shear sign when the fold triggers.
+    Matches strike_py and the McNeice-Jones Fortran convention.
+  * :func:`_identity_fold` — no fold; strike wraps to ``[0, pi)`` and
+    shear keeps its optimised sign. Both branches remain accessible.
+  * :func:`_pt_aligned_fold` — choose the branch whose strike is
+    closest (mod pi) to a supplied phase-tensor strike.
+  * :func:`_min_shear_fold` — choose the branch with smaller
+    ``|shear|``, a low-shear-preferring tiebreaker.
+  * :func:`_resolve_disambiguation` — dispatch a string identifier or
+    callable to one of the above.
+
 - :class:`_Mode` and clustering / probability helpers : group converged
-  starts into modes for both single-site and joint decompositions.
+  starts into modes for both single-site and joint decompositions
+  (clustering uses :func:`_geometric_fold` internally so two starts
+  differing only by the GB symmetry collapse to one mode).
 - Disagreement / primary-mode-warning detectors used by the public
   decompose path to surface ambiguous fits to the caller.
 
@@ -48,44 +64,36 @@ _DEFAULT_MODE_TOLERANCE = {
 # clusters; we exclude it.
 
 
-def _canonicalise_solution(
+def _geometric_fold(
     strike: float,
     twist: float,
     shear: float,
-    canonicalise: bool = True,
 ) -> tuple[float, float, float]:
-    """Apply the GB 90-degree / shear-sign symmetry to fold a
-    solution to a canonical branch.
+    """Geometric / "canonical" fold of the GB 90-degree symmetry.
+
+    Historical default. Folds strike into ``[0, pi/2)`` and flips the
+    sign of shear when the fold triggers. Matches the strike_py
+    reference's ``symmetry.compare_band_against_dcmp`` convention and
+    the McNeice-Jones Fortran output.
 
     The Groom-Bailey decomposition has a discrete symmetry: the
     triple ``(strike, twist, shear)`` and ``(strike + 90 mod 180,
-    twist, -shear)`` represent the same physical solution (twist is
-    invariant; the strike shift by 90 degrees is paired with a sign
-    flip on shear). This function chooses the branch with strike in
-    ``[0, 90)``, which matches the strike_py reference's
-    ``symmetry.compare_band_against_dcmp`` convention.
+    twist, -shear)`` generate identical predicted impedances (twist
+    is invariant; the strike shift by 90 degrees is paired with a
+    sign flip on shear). This function chooses the branch with
+    strike in ``[0, pi/2)``.
 
     Parameters
     ----------
     strike, twist, shear : float
         Radians.
-    canonicalise : bool, default True
-        If True (historical behaviour), fold strike into
-        ``[0, pi/2)`` and flip the sign of shear when the fold
-        triggers. If False, only wrap strike to ``[0, pi)`` via
-        ``strike % pi`` and leave shear unchanged. The False mode
-        is provided so callers can study the unfolded GB output
-        directly (e.g. for cross-tool comparison with phase-tensor
-        strike, which uses a 180-degree fold).
 
     Returns
     -------
     strike_c, twist_c, shear_c : float
-        Canonicalised values. ``strike_c`` lies in ``[0, pi/2)``
-        when ``canonicalise`` is True, otherwise in ``[0, pi)``.
+        Strike in ``[0, pi/2)``. Twist unchanged. Shear sign flipped
+        iff the fold triggered.
     """
-    if not canonicalise:
-        return float(strike % np.pi), float(twist), float(shear)
     half_pi = np.pi / 2.0
     # Tolerance for the boundary at strike = pi/2 (90 deg). Without
     # this, a strike that lands exactly at pi/2 can be rounded to one
@@ -103,6 +111,148 @@ def _canonicalise_solution(
         strike_c = strike_mod_pi
         shear_c = shear
     return float(strike_c), float(twist), float(shear_c)
+
+
+def _identity_fold(
+    strike: float,
+    twist: float,
+    shear: float,
+) -> tuple[float, float, float]:
+    """Identity fold: wrap strike to ``[0, pi)`` and leave shear alone.
+
+    The GB 90-degree symmetry is *not* applied; both branches remain
+    accessible in the reported parameters. Useful when the caller
+    wants to compare the unfolded GB output directly against another
+    tool that uses a 180-degree convention (e.g. the phase tensor).
+    """
+    return float(strike % np.pi), float(twist), float(shear)
+
+
+def _pt_aligned_fold(
+    strike: float,
+    twist: float,
+    shear: float,
+    *,
+    pt_strike_rad: float,
+) -> tuple[float, float, float]:
+    """Choose the GB branch whose strike is closest to ``pt_strike_rad``.
+
+    Of the two equivalent branches
+    ``(strike % pi, twist, shear)`` and
+    ``((strike + pi/2) % pi, twist, -shear)``, return whichever has
+    the smaller angular distance (mod pi) to ``pt_strike_rad``. Ties
+    resolve to the un-rotated branch.
+
+    Parameters
+    ----------
+    strike, twist, shear : float
+        Radians.
+    pt_strike_rad : float, keyword-only
+        Phase-tensor strike (radians) for the same band/period.
+        Required: callers without a PT reference should use
+        :func:`_geometric_fold` or :func:`_min_shear_fold`.
+
+    Returns
+    -------
+    strike_c, twist_c, shear_c : float
+        Strike in ``[0, pi)``. Twist unchanged. Shear sign flipped
+        iff the rotated branch was selected.
+    """
+    s0 = float(strike % np.pi)
+    s1 = float((strike + np.pi / 2.0) % np.pi)
+    target = float(pt_strike_rad % np.pi)
+
+    def _dist_mod_pi(a: float, b: float) -> float:
+        d = abs(a - b) % np.pi
+        return min(d, np.pi - d)
+
+    if _dist_mod_pi(s1, target) < _dist_mod_pi(s0, target):
+        return s1, float(twist), float(-shear)
+    return s0, float(twist), float(shear)
+
+
+def _min_shear_fold(
+    strike: float,
+    twist: float,
+    shear: float,
+) -> tuple[float, float, float]:
+    """Choose the GB branch with the smaller ``|shear|``.
+
+    Useful as a low-shear-preferring tiebreaker when no external
+    reference (PT strike, geological prior) is available. Since the
+    rotated branch flips the sign of shear, ``|shear|`` is the same
+    on both branches in pure form — but with finite-precision
+    optimisation output the two are not exactly equal, so this fold
+    is well-defined operationally and stable to a single canonical
+    pick when fed downstream-rounded values.
+
+    Returns
+    -------
+    strike_c, twist_c, shear_c : float
+        Strike in ``[0, pi)``. Twist unchanged. Shear sign flipped
+        iff the rotated branch had smaller ``|shear|``.
+    """
+    s0 = float(strike % np.pi)
+    s1 = float((strike + np.pi / 2.0) % np.pi)
+    if abs(-shear) < abs(shear):
+        return s1, float(twist), float(-shear)
+    return s0, float(twist), float(shear)
+
+
+def _resolve_disambiguation(
+    disambiguation: "str | callable",
+    *,
+    pt_strike_rad: float | None = None,
+):
+    """Map a disambiguation identifier to a fold callable.
+
+    Parameters
+    ----------
+    disambiguation : str or callable
+        One of ``"geometric"``, ``"identity"``, ``"pt_aligned"``,
+        ``"min_shear"``, or a callable with the signature
+        ``(strike, twist, shear) -> (strike_c, twist_c, shear_c)``
+        (radians).
+    pt_strike_rad : float, optional
+        Required when ``disambiguation == "pt_aligned"``. Bound into
+        the returned callable as the keyword argument.
+
+    Returns
+    -------
+    fold : callable
+        ``fold(strike, twist, shear) -> (strike_c, twist_c, shear_c)``.
+
+    Raises
+    ------
+    ValueError
+        If the string identifier is unknown, or ``"pt_aligned"`` is
+        requested without ``pt_strike_rad``.
+    """
+    if callable(disambiguation):
+        return disambiguation
+    if disambiguation == "geometric":
+        return _geometric_fold
+    if disambiguation == "identity":
+        return _identity_fold
+    if disambiguation == "min_shear":
+        return _min_shear_fold
+    if disambiguation == "pt_aligned":
+        if pt_strike_rad is None:
+            raise ValueError(
+                "_resolve_disambiguation: disambiguation='pt_aligned' "
+                "requires pt_strike_rad (radians) to be supplied."
+            )
+        pt = float(pt_strike_rad)
+
+        def _bound(strike, twist, shear):
+            return _pt_aligned_fold(strike, twist, shear, pt_strike_rad=pt)
+
+        return _bound
+    raise ValueError(
+        f"_resolve_disambiguation: unknown disambiguation "
+        f"{disambiguation!r}. Expected one of 'geometric', 'identity', "
+        f"'pt_aligned', 'min_shear', or a callable."
+    )
 
 @dataclass
 class _Mode:
@@ -124,14 +274,15 @@ class _Mode:
 def _canonical_form_summary(br: _BandResult) -> dict:
     """Extract canonical-form scalar parameters for clustering.
 
-    Applies :func:`_canonicalise_solution` so that two converged
-    points differing only by the GB 90-degree symmetry produce
-    identical summaries.
+    Applies :func:`_geometric_fold` so that two converged points
+    differing only by the GB 90-degree symmetry produce identical
+    summaries. Mode clustering always uses the geometric fold
+    regardless of the user's reporting choice.
 
     Returns a dict with keys: ``strike_deg``, ``twist_deg``,
     ``shear_deg``, ``log10_gain``, ``rms_misfit``.
     """
-    strike_rad, twist_rad, shear_rad = _canonicalise_solution(
+    strike_rad, twist_rad, shear_rad = _geometric_fold(
         float(br.x_opt[0]), float(br.x_opt[1]), float(br.x_opt[2])
     )
     return {
@@ -447,7 +598,7 @@ def _canonical_form_summary_joint(br: _BandResult, n_sites: int, n_freqs: int) -
         _,
     ) = _unpack_x_joint(br.x_opt, n_sites, n_freqs)
 
-    strike_can, _, _ = _canonicalise_solution(
+    strike_can, _, _ = _geometric_fold(
         theta_shared, float(twist[0]), float(shear[0])
     )
     rotated = abs(strike_can - (theta_shared % np.pi)) > 1e-9

@@ -40,13 +40,14 @@ from .symmetries import (
     _DEFAULT_MODE_TOLERANCE,
     _Mode,
     _canonical_form_summary_joint,
-    _canonicalise_solution,
     _cluster_modes,
     _cluster_modes_joint,
     _compute_mode_probabilities,
     _compute_mode_probabilities_joint,
     _detect_band_disagreement,
     _detect_primary_mode_warning,
+    _geometric_fold,
+    _resolve_disambiguation,
 )
 
 if TYPE_CHECKING:
@@ -60,6 +61,37 @@ __all__ = [
     "decompose_each_station",
     "decompose_joint",
 ]
+
+
+_DISAMBIGUATION_DESCRIPTIONS = {
+    "geometric": (
+        "(strike + 90 mod 180, -shear, twist) symmetry folded so "
+        "strike in [0, 90); shear sign flipped if pre-fold strike "
+        "was in [90, 180)"
+    ),
+    "identity": (
+        "no symmetry fold; strike wrapped to [0, 180) and shear "
+        "sign preserved"
+    ),
+    "pt_aligned": (
+        "GB branch chosen per band to minimise mod-180 angular "
+        "distance to z.phase_tensor.alpha at the band's median "
+        "period; shear sign flipped iff the rotated branch was "
+        "selected"
+    ),
+    "min_shear": (
+        "GB branch chosen per band to minimise |shear|; shear "
+        "sign flipped iff the rotated branch was selected"
+    ),
+}
+
+
+def _disambiguation_description(disambiguation) -> str:
+    if isinstance(disambiguation, str):
+        return _DISAMBIGUATION_DESCRIPTIONS.get(
+            disambiguation, f"unknown disambiguation: {disambiguation!r}"
+        )
+    return "user-supplied callable disambiguation strategy"
 
 
 def decompose(
@@ -80,6 +112,7 @@ def decompose(
     ci_level: float = 0.95,
     ci_method: str = "percentile",
     canonicalise: bool = True,
+    disambiguation: "str | callable" = "geometric",
 ) -> DecompositionResult:
     """Single-site Groom-Bailey decomposition with multi-start.
 
@@ -178,16 +211,42 @@ def decompose(
         and accelerated) is planned for a future session.
 
     canonicalise : bool, default True
-        If True (default), fold each band's reported strike into
-        ``[0, 90)`` via the GB 90-degree / shear-sign symmetry
-        (matching the historical Fortran-validated convention).
-        If False, skip the fold so reported strike lies in
-        ``[0, 180)`` and shear keeps its optimised sign. The
-        underlying optimisation, predicted Z, residuals, and
-        reconstructed C tensor are independent of this choice;
-        only the per-band and per-period reporting of strike and
-        shear changes. The bootstrap and mode-clustering paths
-        always canonicalise internally regardless of this flag.
+        Backward-compatibility shim for the older two-state flag.
+        ``canonicalise=True`` is equivalent to
+        ``disambiguation='geometric'`` (default), and
+        ``canonicalise=False`` is equivalent to
+        ``disambiguation='identity'``. New code should pass
+        ``disambiguation`` directly. Passing ``canonicalise=False``
+        together with an explicit non-default ``disambiguation``
+        raises :class:`ValueError`.
+
+    disambiguation : str or callable, default 'geometric'
+        Strategy for resolving the GB 90-degree / shear-sign
+        symmetry per band. The forward model, predicted Z,
+        residuals, and reconstructed C tensor are independent of
+        this choice; only the per-band and per-period reporting of
+        strike and shear changes. Mode clustering and the bootstrap
+        always use ``'geometric'`` internally regardless of this
+        choice.
+
+        Accepted values:
+
+        - ``'geometric'`` (default): fold strike into ``[0, 90)``
+          and flip shear sign when the fold triggers; matches the
+          historical Fortran-validated convention.
+        - ``'identity'``: wrap strike to ``[0, 180)`` and leave
+          shear unchanged; both branches remain visible.
+        - ``'pt_aligned'``: pick the branch closest (mod 180) to
+          the phase tensor's principal axis at the band's median
+          period. Computed from ``z`` via
+          :attr:`Z.phase_tensor`; if the phase tensor cannot be
+          built, raises :class:`ValueError`.
+        - ``'min_shear'``: pick the branch with smaller
+          ``|shear|`` per band.
+        - callable: a function with signature
+          ``fold(strike_rad, twist_rad, shear_rad) ->
+          (strike_rad, twist_rad, shear_rad)``. Returned strikes
+          are wrapped to ``[0, 180)`` for reporting.
 
     Returns
     -------
@@ -309,6 +368,21 @@ def decompose(
             f"for a future session."
         )
 
+    # Reconcile the legacy ``canonicalise`` flag with the new
+    # ``disambiguation`` kwarg. ``canonicalise=False`` is the
+    # historical way to ask for the identity fold; honour it only
+    # when the caller has not also passed an explicit non-default
+    # ``disambiguation`` (mixing both is a programmer error).
+    if not canonicalise:
+        if disambiguation == "geometric":
+            disambiguation = "identity"
+        elif disambiguation != "identity":
+            raise ValueError(
+                "decompose: canonicalise=False conflicts with "
+                f"disambiguation={disambiguation!r}; pass "
+                "disambiguation='identity' instead."
+            )
+
     frequencies = np.asarray(z.frequency, dtype=np.float64)
     all_periods = 1.0 / frequencies
     if periods is not None:
@@ -399,10 +473,41 @@ def decompose(
         for global_i in band_idx:
             period_band_indices[int(global_i)].append(i)
 
+    # Per-band PT strikes are needed only for disambiguation='pt_aligned'.
+    pt_strike_per_band_rad: list[float | None] = [None] * len(band_results)
+    if disambiguation == "pt_aligned":
+        try:
+            pt_alpha_full_deg = np.asarray(
+                z.phase_tensor.alpha, dtype=np.float64
+            )[period_mask][sort_idx]
+        except Exception as exc:
+            raise ValueError(
+                "decompose: disambiguation='pt_aligned' needs a phase "
+                "tensor strike from z.phase_tensor.alpha but it could "
+                "not be computed; pass a callable disambiguation that "
+                "supplies the strike explicitly, or use 'geometric' / "
+                f"'identity' / 'min_shear' instead. Underlying error: {exc}"
+            ) from exc
+        for i, (band_idx, _br) in enumerate(band_results):
+            band_alpha = pt_alpha_full_deg[band_idx]
+            band_alpha = band_alpha[np.isfinite(band_alpha)]
+            if band_alpha.size == 0:
+                raise ValueError(
+                    f"decompose: disambiguation='pt_aligned' band "
+                    f"{i} has no finite phase-tensor strike values."
+                )
+            # Median PT alpha per band; convert deg -> rad.
+            pt_strike_per_band_rad[i] = float(
+                np.radians(np.median(band_alpha))
+            )
+
     canon_per_band = []
-    for band_idx, br in band_results:
-        theta_c, twist_c, shear_c = _canonicalise_solution(
-            br.x_opt[0], br.x_opt[1], br.x_opt[2], canonicalise=canonicalise
+    for i, (band_idx, br) in enumerate(band_results):
+        fold = _resolve_disambiguation(
+            disambiguation, pt_strike_rad=pt_strike_per_band_rad[i]
+        )
+        theta_c, twist_c, shear_c = fold(
+            br.x_opt[0], br.x_opt[1], br.x_opt[2]
         )
         canon_per_band.append((theta_c, twist_c, shear_c))
 
@@ -506,12 +611,13 @@ def decompose(
         # Average chi-squared across bands containing this period
         chi_squared_pp[global_i] = float(np.mean(chi_sq_at_period))
 
-    if not canonicalise:
-        # Circular mean of strikes in [0, pi) lands in (-pi/2, pi/2];
-        # wrap into [0, pi) so reported strike covers the full
-        # un-folded range.
-        finite_mask = np.isfinite(strike_pp)
-        strike_pp[finite_mask] = strike_pp[finite_mask] % np.pi
+    # For non-geometric folds, per-band strikes live in [0, pi) so the
+    # circular weighted mean (via arctan2 of doubled angles divided by
+    # two) can land in (-pi/2, pi/2]; wrap into [0, pi) so reported
+    # strike covers the full un-folded range. For the geometric fold,
+    # per-band strikes live in [0, pi/2) and the wrap is a no-op.
+    finite_mask = np.isfinite(strike_pp)
+    strike_pp[finite_mask] = strike_pp[finite_mask] % np.pi
 
     # Build regional Z in strike frame, then rotate to measurement
     # frame.
@@ -591,9 +697,10 @@ def decompose(
         },
         coords={"period": selected_periods},
     )
+    strike_range_str = "[0, 90)" if disambiguation == "geometric" else "[0, 180)"
     params["strike"].attrs.update(
         units="degrees",
-        range="[0, 90)" if canonicalise else "[0, 180)",
+        range=strike_range_str,
         convention="clockwise from x-axis",
     )
     params["twist"].attrs.update(units="degrees")
@@ -657,14 +764,11 @@ def decompose(
 
     metadata = {
         "convention": "clockwise from x-axis",
-        "strike_range_degrees": "[0, 90)" if canonicalise else "[0, 180)",
-        "canonicalisation": (
-            "(strike + 90 mod 180, -shear, twist) symmetry folded "
-            "so strike in [0, 90); shear sign flipped if pre-fold "
-            "strike was in [90, 180)"
-            if canonicalise
-            else "disabled; strike wrapped to [0, 180) and shear sign preserved"
+        "strike_range_degrees": strike_range_str,
+        "disambiguation": (
+            disambiguation if isinstance(disambiguation, str) else "callable"
         ),
+        "canonicalisation": _disambiguation_description(disambiguation),
         "static_shift_convention": ("gain consistent with MT.remove_static_shift"),
         "regional_z_frame": "measurement",
         "per_band": per_band_metadata,
@@ -783,6 +887,9 @@ def decompose(
         "ci_level": ci_level,
         "ci_method": ci_method,
         "canonicalise": canonicalise,
+        "disambiguation": (
+            disambiguation if isinstance(disambiguation, str) else "callable"
+        ),
     }
 
     return DecompositionResult(
@@ -2670,7 +2777,7 @@ def _bootstrap_decompose(
             br = primary.band_result
             n_band_freqs = len(band_idx)
 
-            strike_can, twist_can, shear_can = _canonicalise_solution(
+            strike_can, twist_can, shear_can = _geometric_fold(
                 float(br.x_opt[0]), float(br.x_opt[1]), float(br.x_opt[2])
             )
             log10_gain = float(br.x_opt[3])

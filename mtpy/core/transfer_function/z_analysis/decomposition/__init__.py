@@ -96,11 +96,15 @@ from .results import (  # noqa: F401  -- private helpers re-exported for backwar
 )
 from .symmetries import (  # noqa: F401  -- private helpers re-exported for backward compatibility
     _DEFAULT_MODE_TOLERANCE,
-    _canonicalise_solution,
     _cluster_modes,
     _compute_mode_probabilities,
     _detect_band_disagreement,
     _detect_primary_mode_warning,
+    _geometric_fold,
+    _identity_fold,
+    _min_shear_fold,
+    _pt_aligned_fold,
+    _resolve_disambiguation,
 )
 
 __all__ = [

@@ -29,7 +29,6 @@ from mtpy.core.transfer_function.z_analysis.decomposition import (
     _build_bounds_joint,
     _calc_error,
     _canonical_initial_guess,
-    _canonicalise_solution,
     _cluster_modes,
     _compute_ci_percentile,
     _compute_mode_probabilities,
@@ -42,6 +41,8 @@ from mtpy.core.transfer_function.z_analysis.decomposition import (
     _extract_bands,
     _extreme,
     _generate_starting_points,
+    _geometric_fold,
+    _identity_fold,
     _jkvar,
     _mat_multiply,
     _objfun,
@@ -818,10 +819,12 @@ class TestObjfunJacobian:
 
 class TestCanonicaliseSolution:
     """The 90-degree / shear-sign symmetry fold reduces solutions to
-    a canonical branch with strike in [0, pi/2)."""
+    a canonical branch with strike in [0, pi/2). The geometric fold
+    is the historical default and matches the strike_py / Fortran
+    convention."""
 
     def test_in_canonical_range_already(self):
-        s, t, sh = _canonicalise_solution(
+        s, t, sh = _geometric_fold(
             np.radians(30.0), np.radians(10.0), np.radians(5.0)
         )
         assert np.isclose(np.degrees(s), 30.0)
@@ -831,7 +834,7 @@ class TestCanonicaliseSolution:
     def test_folds_upper_half(self):
         # strike=120 deg, shear=+5 deg should fold to strike=30 deg,
         # shear=-5 deg.
-        s, t, sh = _canonicalise_solution(
+        s, t, sh = _geometric_fold(
             np.radians(120.0), np.radians(10.0), np.radians(5.0)
         )
         assert np.isclose(np.degrees(s), 30.0, atol=1e-9)
@@ -842,54 +845,53 @@ class TestCanonicaliseSolution:
         # The boundary case: floating-point % np.pi can drop strike
         # one ULP below pi/2; the tolerance in the fold should still
         # send it to ~0.
-        s, _, _ = _canonicalise_solution(np.pi / 2.0, 0.0, 0.0)
+        s, _, _ = _geometric_fold(np.pi / 2.0, 0.0, 0.0)
         assert s < 1e-8
 
     def test_negative_strike(self):
         # strike=-30 deg = +150 deg mod 180; should fold to 60 deg
         # with shear sign flipped.
-        s, _, sh = _canonicalise_solution(np.radians(-30.0), 0.0, np.radians(7.0))
+        s, _, sh = _geometric_fold(np.radians(-30.0), 0.0, np.radians(7.0))
         assert np.isclose(np.degrees(s), 60.0, atol=1e-9)
         assert np.isclose(np.degrees(sh), -7.0, atol=1e-9)
 
     def test_strike_above_pi(self):
         # strike=200 deg = 20 deg mod 180. Below pi/2; no fold.
-        s, _, sh = _canonicalise_solution(np.radians(200.0), 0.0, np.radians(3.0))
+        s, _, sh = _geometric_fold(np.radians(200.0), 0.0, np.radians(3.0))
         assert np.isclose(np.degrees(s), 20.0, atol=1e-9)
         assert np.isclose(np.degrees(sh), 3.0, atol=1e-9)
 
     def test_twist_unchanged(self):
         # Twist is the symmetry-invariant; should never change.
         for strike_deg in [10, 50, 90, 130, 170]:
-            _, t_out, _ = _canonicalise_solution(
+            _, t_out, _ = _geometric_fold(
                 np.radians(strike_deg),
                 np.radians(7.5),
                 np.radians(2.0),
             )
             assert np.isclose(np.degrees(t_out), 7.5, atol=1e-9)
 
-    def test_canonicalise_off_skips_fold(self):
-        # canonicalise=False: strike in [90, 180) is *not* folded;
-        # shear sign is preserved.
-        s, t, sh = _canonicalise_solution(
+    def test_identity_skips_fold(self):
+        # Identity fold: strike in [90, 180) is *not* folded; shear
+        # sign is preserved.
+        s, t, sh = _identity_fold(
             np.radians(120.0),
             np.radians(10.0),
             np.radians(5.0),
-            canonicalise=False,
         )
         assert np.isclose(np.degrees(s), 120.0, atol=1e-9)
         assert np.isclose(np.degrees(t), 10.0, atol=1e-9)
         assert np.isclose(np.degrees(sh), 5.0, atol=1e-9)
 
-    def test_canonicalise_off_wraps_to_zero_pi(self):
-        # Negative or > pi inputs still get wrapped to [0, pi).
-        s, _, sh = _canonicalise_solution(
-            np.radians(-30.0), 0.0, np.radians(7.0), canonicalise=False
+    def test_identity_wraps_to_zero_pi(self):
+        # Identity fold still wraps negative or > pi inputs into [0, pi).
+        s, _, sh = _identity_fold(
+            np.radians(-30.0), 0.0, np.radians(7.0)
         )
         assert np.isclose(np.degrees(s), 150.0, atol=1e-9)
         assert np.isclose(np.degrees(sh), 7.0, atol=1e-9)
-        s2, _, sh2 = _canonicalise_solution(
-            np.radians(200.0), 0.0, np.radians(3.0), canonicalise=False
+        s2, _, sh2 = _identity_fold(
+            np.radians(200.0), 0.0, np.radians(3.0)
         )
         assert np.isclose(np.degrees(s2), 20.0, atol=1e-9)
         assert np.isclose(np.degrees(sh2), 3.0, atol=1e-9)
