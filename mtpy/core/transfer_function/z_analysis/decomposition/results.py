@@ -400,6 +400,70 @@ class DecompositionResult:
 
 
 @dataclass
+class JointDecompositionResult:
+    """Result of a McNeice-Jones (2001) multi-site joint decomposition.
+
+    A purpose-built result type for the new
+    :func:`decompose_mcneice_jones` API. Distinct from
+    :class:`DecompositionResult` because the joint analysis has
+    natively per-band and per-site structure that is most easily
+    expressed as plain dicts rather than as an :class:`xr.Dataset`
+    with mixed dimensionality. (The older
+    :func:`decompose_joint` returns the dataset-shaped result; the
+    two are siblings, not duplicates.)
+
+    Attributes
+    ----------
+    per_site_distortion : dict[str, dict[str, float | np.ndarray]]
+        ``{site_id: {parameter_name: value}}``. Per-site distortion
+        parameters in the GB factorisation, with keys
+        ``twist_deg``, ``shear_deg``, ``gain``, ``c_tensor`` (the
+        ``2x2`` reconstructed real distortion matrix in the
+        measurement frame), and per-band copies as
+        ``twist_deg_per_band``, ``shear_deg_per_band``,
+        ``gain_per_band`` (each shape ``(n_bands,)``). Twist /
+        shear are in degrees, gain is dimensionless, ``c_tensor``
+        is a band-averaged (median) ``2x2`` ndarray.
+    per_band_strike : dict[int, float]
+        ``{band_id: shared_strike_deg}``. The shared regional
+        strike per band, in degrees, in the range determined by
+        the chosen disambiguation strategy.
+    per_band_per_site_z_regional : dict[tuple[int, str], np.ndarray]
+        ``{(band_id, site_id): z_regional}`` where ``z_regional``
+        is the regional 2-D impedance for that site at the periods
+        of the band, shape ``(n_band_periods, 2, 2)``, in the
+        measurement frame.
+    chi_squared : float
+        Total chi-squared across all bands and sites (sum of
+        squared residuals of the joint fit).
+    rms_misfit_per_site : dict[str, float]
+        Per-site RMS misfit (over all bands and components),
+        weighted by the input ``z_error``.
+    metadata : dict
+        Provenance: ``method='mcneice_jones_joint'``, ``n_starts``,
+        ``seed``, ``disambiguation``, ``share_strike_within_band``,
+        ``per_site_distortion``, ``max_iter`` request, ``period_bands``
+        actually fitted, and ``per_band`` (one entry per band with
+        mode info, n_iter, converged, RMS, etc.).
+
+    References
+    ----------
+    McNeice, G. W., & Jones, A. G. (2001). Multisite, multifrequency
+    tensor decomposition of magnetotelluric data. Geophysics,
+    66(1), 158-173.
+    """
+
+    per_site_distortion: dict[str, dict[str, Any]] = field(default_factory=dict)
+    per_band_strike: dict[int, float] = field(default_factory=dict)
+    per_band_per_site_z_regional: dict[tuple[int, str], np.ndarray] = field(
+        default_factory=dict
+    )
+    chi_squared: float = 0.0
+    rms_misfit_per_site: dict[str, float] = field(default_factory=dict)
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
 class BibbyResult:
     """Result of a Bibby-Caldwell-Brown decomposition.
 

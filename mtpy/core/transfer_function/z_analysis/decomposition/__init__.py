@@ -30,8 +30,12 @@ Currently implemented
 - **GB single-site** (:func:`decompose`): per-band TRF least-squares
   with multi-start optimisation, parametric bootstrap, and a
   user-selectable strategy for resolving the GB 90-degree symmetry.
-- **MJ joint** (:func:`decompose_joint`): the multi-site extension
-  with a shared regional strike across stations.
+- **MJ joint** (:func:`decompose_joint` and the newer
+  :func:`decompose_mcneice_jones`): the multi-site extension with
+  a shared regional strike across stations.
+  ``decompose_mcneice_jones`` is the cleaner Phase-1 API that
+  returns a :class:`JointDecompositionResult`; both functions
+  share the same underlying optimisation machinery.
 - **BCB single-site** (:func:`decompose_bibby`): Bibby-Caldwell-
   Brown decomposition. Fits a single real 2x2 distortion matrix
   ``C`` per period and band-averages it; the methodologically
@@ -162,9 +166,11 @@ from .groom_bailey import (  # noqa: F401  -- private helpers re-exported for ba
     decompose_joint,
 )
 from .bibby import decompose_bibby
+from .mcneice_jones import decompose_mcneice_jones
 from .results import (  # noqa: F401  -- private helpers re-exported for backward compatibility
     BibbyResult,
     DecompositionResult,
+    JointDecompositionResult,
     _desanitize_station_id,
     _sanitize_station_id,
 )
@@ -184,8 +190,10 @@ from .symmetries import (  # noqa: F401  -- private helpers re-exported for back
 __all__ = [
     "BibbyResult",
     "DecompositionResult",
+    "JointDecompositionResult",
     "decompose",
     "decompose_bibby",
     "decompose_each_station",
     "decompose_joint",
+    "decompose_mcneice_jones",
 ]

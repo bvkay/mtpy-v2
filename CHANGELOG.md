@@ -60,6 +60,16 @@ the same API.
   Methodologically the simplest distortion-analysis method in
   the package and a comparison baseline for the parameterised
   Groom-Bailey result.
+- **McNeice-Jones (Phase 1)**
+  (`decompose_mcneice_jones`, `JointDecompositionResult`). New
+  API for multi-site joint GB decomposition. Takes parallel
+  `z_objs` / `site_ids` lists, supports the disambiguation
+  framework, and returns a purpose-built result with per-site
+  distortion dicts and per-band shared strikes. Thin façade
+  over the existing joint optimisation machinery in
+  `groom_bailey.py` (no algorithm reimplementation). Phase 2
+  will add validation against published results (BC87) and
+  edge-case coverage.
 - **CHANGELOG.md** (this file).
 
 ### Tests
