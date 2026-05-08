@@ -287,7 +287,22 @@ def _estim_imp(
     shear_tan : float
         Tangent of the shear angle.
     theta : float
-        Regional azimuth in radians, clockwise from x-axis.
+        Regional azimuth in radians. Concretely the function
+        implements the Lilley 1998 eq. 28 transformation
+
+            Z_meas = R(-theta) · {gain · T(twist) · S(shear)
+                                  · Z_strike} · R(theta)
+
+        with the rotation matrix
+
+            R(theta) = [[ cos(theta),  sin(theta)],
+                        [-sin(theta),  cos(theta)]].
+
+        Under this transformation form ``theta`` is the standard
+        MT geographic azimuth — measured **clockwise from
+        geographic North** — of the regional 2-D strike. (See
+        Lilley 1998 eq. 28; Lilley 2016 tutorial gives the same
+        relation with diagrams.)
 
     Returns
     -------
@@ -304,6 +319,25 @@ def _estim_imp(
     no net effect; the cleaner form skips that. Cross-validation
     against the Fortran reference confirms agreement at machine
     precision (see ``test_kernels_against_fortran.py``).
+
+    Convention
+    ~~~~~~~~~~
+    The transformation form ``Z_meas = R(-theta) · M · R(theta)``
+    with ``R(theta)`` as defined above and ``M = gain · T · S ·
+    Z_strike`` (the distorted strike-frame tensor) is the
+    Lilley 1998 eq. 28 form. Numerical verification against the
+    Fortran reference (and against synthetic ground-truth via
+    :mod:`tests....distortion.synthetics`) confirms the algebra
+    matches this form to machine precision. With this convention
+    ``theta`` is the standard MT geographic azimuth of the
+    regional strike — clockwise from geographic North — and is
+    the value reported back to users in the
+    :class:`DecompositionResult` ``strike`` field. Any
+    alternative reading of ``theta`` (e.g. as a counter-clockwise
+    rotation, or as a math-convention azimuth measured CCW from
+    East) would require negating the algebra and is not what
+    this code implements. See Lilley 1998 eq. 28; see also
+    Lilley 2016 tutorial for diagrams.
 
     The four alpha values (Pauli-spin combinations) are::
 
