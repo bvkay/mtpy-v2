@@ -17,7 +17,7 @@ decomposition of magnetotelluric data. Geophysics, 66(1), 158-173.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, TYPE_CHECKING
 
@@ -285,6 +285,100 @@ class DecompositionResult:
                 )
             return self.regional_z[station_id]
         return self.regional_z
+
+    def alternate_branch(self) -> "DecompositionResult":
+        """Return the GB-symmetry-equivalent solution on the other branch.
+
+        The Groom-Bailey decomposition has an exact discrete symmetry:
+        the parameter triples ``(strike, twist, shear)`` and
+        ``(strike + 90 mod 180, twist, -shear)`` produce identical
+        predicted impedances, identical galvanic-distortion C tensors,
+        and identical fit quality (Groom & Bailey, 1989). At a single
+        site the two branches are observationally indistinguishable;
+        which one a single optimiser run reports depends on starting
+        point and the chosen disambiguation strategy. This method
+        returns a fresh :class:`DecompositionResult` representing the
+        alternate solution so callers can examine both branches side
+        by side.
+
+        The transformation applied to ``parameters``:
+
+        - ``strike`` -> ``(strike + 90) mod 180`` (degrees)
+        - ``shear``  -> ``-shear`` (degrees)
+        - ``twist``, ``gain``, ``anisotropy``: unchanged
+        - all error and uncertainty fields
+          (``strike_error`` etc., bootstrap CI bounds): unchanged.
+          The 1-sigma uncertainties are invariant under the
+          symmetry; CI bounds describe sensitivity in a frame that
+          shifts with the strike but covers the same physical
+          neighbourhood.
+
+        For ``regional_z`` (single-site :class:`Z` or joint
+        ``dict[str, Z]``), the off-diagonal components ``Z_xy`` and
+        ``Z_yx`` are swapped — the TE/TM exchange that accompanies
+        the 90-degree rotation of the strike axis. Diagonal terms
+        and per-component errors are swapped with their off-diagonal
+        partners.
+
+        ``chi_squared``, ``rms_misfit``, ``method``, ``options``,
+        ``metadata``, and ``frame`` are preserved unchanged; the two
+        branches fit the data identically.
+
+        Idempotent: ``r.alternate_branch().alternate_branch()`` is
+        equal to ``r`` within floating-point tolerance.
+
+        Returns
+        -------
+        DecompositionResult
+            A new result with the alternate-branch parameters and a
+            Z (or dict of Zs) with swapped off-diagonal components.
+            ``self`` is not mutated.
+
+        References
+        ----------
+        Groom, R. W., & Bailey, R. C. (1989). Decomposition of
+        magnetotelluric impedance tensors in the presence of local
+        three-dimensional galvanic distortion. Journal of
+        Geophysical Research: Solid Earth, 94(B2), 1913-1925.
+        """
+        new_params = self.parameters.copy(deep=True)
+        new_params["strike"] = (new_params["strike"] + 90.0) % 180.0
+        new_params["shear"] = -new_params["shear"]
+        # After the symmetry shift strike covers the full [0, 180)
+        # range regardless of the original disambiguation choice.
+        new_params["strike"].attrs.update(self.parameters["strike"].attrs)
+        new_params["strike"].attrs["range"] = "[0, 180)"
+        new_params["shear"].attrs.update(self.parameters["shear"].attrs)
+
+        if isinstance(self.regional_z, dict):
+            new_regional_z: Any = {
+                sid: _swap_off_diagonals(z) for sid, z in self.regional_z.items()
+            }
+        else:
+            new_regional_z = _swap_off_diagonals(self.regional_z)
+
+        return replace(self, parameters=new_params, regional_z=new_regional_z)
+
+
+def _swap_off_diagonals(z_obj: "Z") -> "Z":
+    """Return a fresh :class:`Z` with ``Z_xy`` and ``Z_yx`` swapped.
+
+    Used by :meth:`DecompositionResult.alternate_branch` to flip the
+    regional impedance into its TE/TM-swapped representation that
+    accompanies the GB 90-degree strike rotation.
+    """
+    from mtpy.core.transfer_function.z import Z as _Z
+
+    z_arr = np.asarray(z_obj.z).copy()
+    z_arr[:, [0, 1], [1, 0]] = z_arr[:, [1, 0], [0, 1]]
+
+    z_err = z_obj.z_error
+    if z_err is not None:
+        z_err = np.asarray(z_err).copy()
+        z_err[:, [0, 1], [1, 0]] = z_err[:, [1, 0], [0, 1]]
+
+    return _Z(z=z_arr, z_error=z_err, frequency=z_obj.frequency)
+
 
 def _z_to_serialisable(regional_z):
     """Convert a Z or dict[str, Z] into pickle/JSON-friendly arrays.
