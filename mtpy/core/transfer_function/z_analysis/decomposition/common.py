@@ -62,9 +62,10 @@ decomposition of magnetotelluric data. Geophysics, 66(1), 158-173.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable
 
 import numpy as np
+from scipy.optimize import least_squares
 
 if TYPE_CHECKING:
     from mtpy.core.transfer_function.z import Z
@@ -943,3 +944,298 @@ def _compute_ci_percentile(
         np.nanpercentile(replicates, lower_pct, axis=axis),
         np.nanpercentile(replicates, upper_pct, axis=axis),
     )
+
+
+# ---------------------------------------------------------------------------
+# Joint multi-site orchestration
+# ---------------------------------------------------------------------------
+#
+# These four helpers run nonlinear-least-squares jointly across multiple
+# sites within a single frequency band. The orchestration is method-
+# agnostic — multi-site joint inversion is a generic technique
+# (McNeice & Jones 2001 framed it that way; the same machinery would be
+# applicable to any future joint-inversion method that wanted to share a
+# parameter across sites). The method-specific pieces — cost function,
+# parameter bounds, canonical / rotated initial guess — are passed in as
+# callable factories so the orchestrators can be reused without taking a
+# dependency on any particular method's module.
+#
+# All four currently live here as private helpers; the GB single-site
+# joint flow (:func:`...groom_bailey.decompose_joint`) and the
+# McNeice-Jones Phase 1 API (:func:`...mcneice_jones.decompose_mcneice_jones`)
+# both consume them with GB's joint cost function as the factories.
+
+
+def _generate_starting_points_joint(
+    z_obs_per_site: np.ndarray,
+    sigma_per_site: np.ndarray,
+    periods: np.ndarray,
+    lower: np.ndarray,
+    upper: np.ndarray,
+    n_starts: int,
+    rng: np.random.Generator,
+    *,
+    canonical_initial_guess_joint: Callable,
+    rotated_initial_guess_joint: Callable,
+    perturbation_scale: float = 0.1,
+) -> list[np.ndarray]:
+    """Joint hybrid starting points: canonical, rotated, perturbations.
+
+    Parameters
+    ----------
+    canonical_initial_guess_joint : callable
+        ``(z_obs_per_site, sigma_per_site, periods) -> ndarray`` —
+        method-specific zero-distortion guess.
+    rotated_initial_guess_joint : callable
+        ``(z_obs_per_site, sigma_per_site, periods) -> ndarray`` —
+        method-specific 90-degree-rotated guess.
+    """
+    if n_starts < 1:
+        raise ValueError(
+            f"_generate_starting_points_joint: n_starts must be >= 1, "
+            f"got {n_starts}"
+        )
+
+    canonical = np.clip(
+        canonical_initial_guess_joint(z_obs_per_site, sigma_per_site, periods),
+        lower,
+        upper,
+    )
+    starts = [canonical]
+    if n_starts >= 2:
+        rotated = np.clip(
+            rotated_initial_guess_joint(z_obs_per_site, sigma_per_site, periods),
+            lower,
+            upper,
+        )
+        starts.append(rotated)
+    for _ in range(n_starts - 2):
+        starts.append(
+            _perturbed_initial_guess(canonical, lower, upper, rng, perturbation_scale)
+        )
+    return starts
+
+
+def _solve_band_joint(
+    z_obs_per_site: np.ndarray,
+    sigma_per_site: np.ndarray,
+    periods: np.ndarray,
+    *,
+    objfun_joint: Callable,
+    build_bounds_joint: Callable,
+    canonical_initial_guess_joint: Callable,
+    x0: np.ndarray | None = None,
+    bounds: tuple[np.ndarray, np.ndarray] | None = None,
+    bounds_override: dict | None = None,
+    max_nfev: int = 1000,
+    ftol: float = 1e-10,
+    xtol: float = 1e-10,
+) -> _BandResult:
+    """Joint single-band optimisation across multiple sites.
+
+    Parameters
+    ----------
+    objfun_joint : callable
+        ``(x, z_obs_per_site, sigma_per_site, periods,
+        compute_jacobian) -> (residuals, jacobian)`` — the
+        method-specific residual and Jacobian builder.
+    build_bounds_joint : callable
+        ``(n_sites, n_freqs, bounds_override) -> (lower, upper)`` —
+        the method-specific parameter-bounds builder.
+    canonical_initial_guess_joint : callable
+        Method-specific zero-distortion guess. Used only when ``x0``
+        is ``None``.
+
+    Other parameters mirror :func:`_solve_band` (single-site) and
+    are described there.
+    """
+    n_sites = z_obs_per_site.shape[0]
+    n_freqs = z_obs_per_site.shape[1]
+
+    if bounds is None:
+        bounds = build_bounds_joint(n_sites, n_freqs, bounds_override)
+    lower, upper = bounds
+
+    if x0 is None:
+        x0 = canonical_initial_guess_joint(z_obs_per_site, sigma_per_site, periods)
+    x0 = np.clip(x0, lower, upper)
+
+    def fun(x):
+        r, _ = objfun_joint(
+            x, z_obs_per_site, sigma_per_site, periods, compute_jacobian=False
+        )
+        return r
+
+    def jac(x):
+        _, j = objfun_joint(
+            x, z_obs_per_site, sigma_per_site, periods, compute_jacobian=True
+        )
+        return j
+
+    result = least_squares(
+        fun=fun,
+        x0=x0,
+        jac=jac,
+        bounds=(lower, upper),
+        method="trf",
+        ftol=ftol,
+        xtol=xtol,
+        max_nfev=max_nfev,
+    )
+
+    x_opt = result.x
+    residuals = result.fun
+    chi_squared = float(np.sum(residuals**2))
+    n_resid = len(residuals)
+    rms_misfit = float(np.sqrt(chi_squared / n_resid))
+
+    J = result.jac
+    col_norms = np.linalg.norm(J, axis=0)
+    zero_cols = col_norms < 1e-15
+    try:
+        cov = np.linalg.pinv(J.T @ J, rcond=1e-12)
+        x_err = np.sqrt(np.maximum(np.diag(cov), 0.0))
+        x_err[zero_cols] = np.inf
+    except np.linalg.LinAlgError:
+        x_err = np.full_like(x_opt, np.nan)
+
+    return _BandResult(
+        x_opt=x_opt,
+        x_err=x_err,
+        residuals=residuals,
+        chi_squared=chi_squared,
+        rms_misfit=rms_misfit,
+        n_iter=int(result.nfev),
+        converged=int(result.status) > 0,
+        cost_at_opt=float(result.cost),
+        jacobian=J,
+    )
+
+
+def _solve_band_joint_multistart(
+    z_obs_per_site: np.ndarray,
+    sigma_per_site: np.ndarray,
+    periods: np.ndarray,
+    *,
+    objfun_joint: Callable,
+    build_bounds_joint: Callable,
+    canonical_initial_guess_joint: Callable,
+    rotated_initial_guess_joint: Callable,
+    n_starts: int = 5,
+    bounds: tuple[np.ndarray, np.ndarray] | None = None,
+    bounds_override: dict | None = None,
+    rng: np.random.Generator | None = None,
+    mode_tolerance: dict | None = None,
+    perturbation_scale: float = 0.1,
+    max_nfev: int = 1000,
+    ftol: float = 1e-10,
+    xtol: float = 1e-10,
+) -> list:
+    """Multi-start joint single-band optimisation.
+
+    See :func:`_solve_band_joint` for the meaning of the four
+    factory callables. The clustering helpers
+    (:func:`_cluster_modes_joint`,
+    :func:`_compute_mode_probabilities_joint`) are method-agnostic
+    and imported from :mod:`.symmetries` at call time to avoid a
+    circular import (``common`` is the lower-level module;
+    ``symmetries`` already imports from it).
+    """
+    # Lazy import to avoid the common <-> symmetries circular.
+    from .symmetries import _cluster_modes_joint, _compute_mode_probabilities_joint
+
+    if rng is None:
+        rng = np.random.default_rng(42)
+
+    n_sites = z_obs_per_site.shape[0]
+    n_freqs = z_obs_per_site.shape[1]
+    if bounds is None:
+        bounds = build_bounds_joint(n_sites, n_freqs, bounds_override)
+    lower, upper = bounds
+
+    starting_points = _generate_starting_points_joint(
+        z_obs_per_site,
+        sigma_per_site,
+        periods,
+        lower,
+        upper,
+        n_starts,
+        rng,
+        canonical_initial_guess_joint=canonical_initial_guess_joint,
+        rotated_initial_guess_joint=rotated_initial_guess_joint,
+        perturbation_scale=perturbation_scale,
+    )
+
+    band_results: list[_BandResult] = []
+    for x0 in starting_points:
+        try:
+            br = _solve_band_joint(
+                z_obs_per_site=z_obs_per_site,
+                sigma_per_site=sigma_per_site,
+                periods=periods,
+                objfun_joint=objfun_joint,
+                build_bounds_joint=build_bounds_joint,
+                canonical_initial_guess_joint=canonical_initial_guess_joint,
+                x0=x0,
+                bounds=bounds,
+                max_nfev=max_nfev,
+                ftol=ftol,
+                xtol=xtol,
+            )
+            band_results.append(br)
+        except Exception:
+            continue
+
+    if not band_results:
+        raise RuntimeError("_solve_band_joint_multistart: all starting points failed")
+
+    modes = _cluster_modes_joint(band_results, n_sites, n_freqs, mode_tolerance)
+    probabilities = _compute_mode_probabilities_joint(modes, n_sites)
+    for mode, prob in zip(modes, probabilities):
+        mode.probability = prob
+    return modes
+
+
+def _decompose_bands_with_modes_joint(
+    z_obs_per_site_full: np.ndarray,
+    sigma_per_site_full: np.ndarray,
+    selected_periods: np.ndarray,
+    bands: list[np.ndarray],
+    n_starts: int,
+    bounds_override: dict | None,
+    rng: np.random.Generator,
+    mode_tolerance: dict | None,
+    perturbation_scale: float,
+    *,
+    objfun_joint: Callable,
+    build_bounds_joint: Callable,
+    canonical_initial_guess_joint: Callable,
+    rotated_initial_guess_joint: Callable,
+) -> list[tuple[np.ndarray, list]]:
+    """Run joint multi-start optimisation per band; return per-band
+    mode lists. Joint analogue of :func:`_decompose_bands_with_modes`.
+
+    The four method-specific factory callables are threaded through
+    to :func:`_solve_band_joint_multistart`.
+    """
+    band_modes_list: list[tuple[np.ndarray, list]] = []
+    for band_idx in bands:
+        z_b = z_obs_per_site_full[:, band_idx, :, :]
+        sigma_b = sigma_per_site_full[:, band_idx, :, :]
+        periods_b = selected_periods[band_idx]
+        modes = _solve_band_joint_multistart(
+            z_obs_per_site=z_b,
+            sigma_per_site=sigma_b,
+            periods=periods_b,
+            objfun_joint=objfun_joint,
+            build_bounds_joint=build_bounds_joint,
+            canonical_initial_guess_joint=canonical_initial_guess_joint,
+            rotated_initial_guess_joint=rotated_initial_guess_joint,
+            n_starts=n_starts,
+            bounds_override=bounds_override,
+            rng=rng,
+            mode_tolerance=mode_tolerance,
+            perturbation_scale=perturbation_scale,
+        )
+        band_modes_list.append((band_idx, modes))
+    return band_modes_list

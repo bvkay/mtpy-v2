@@ -66,6 +66,7 @@ from .common import (
     _BandResult,
     _band_arrays_to_z,
     _compute_ci_percentile,
+    _decompose_bands_with_modes_joint,
     _estim_imp,
     _extract_bands,
     _normalise_collection_input,
@@ -81,9 +82,7 @@ from .symmetries import (
     _Mode,
     _canonical_form_summary_joint,
     _cluster_modes,
-    _cluster_modes_joint,
     _compute_mode_probabilities,
-    _compute_mode_probabilities_joint,
     _detect_band_disagreement,
     _detect_primary_mode_warning,
     _geometric_fold,
@@ -1138,6 +1137,10 @@ def decompose_joint(
         rng=rng,
         mode_tolerance=mode_tolerance,
         perturbation_scale=perturbation_scale,
+        objfun_joint=_objfun_joint,
+        build_bounds_joint=_build_bounds_joint,
+        canonical_initial_guess_joint=_canonical_initial_guess_joint,
+        rotated_initial_guess_joint=_rotated_initial_guess_joint,
     )
 
     # Aggregation: pick each band's primary mode, expand band-level
@@ -3165,212 +3168,6 @@ def _rotated_initial_guess_joint(
 
     return rotated
 
-def _generate_starting_points_joint(
-    z_obs_per_site: np.ndarray,
-    sigma_per_site: np.ndarray,
-    periods: np.ndarray,
-    lower: np.ndarray,
-    upper: np.ndarray,
-    n_starts: int,
-    rng: np.random.Generator,
-    perturbation_scale: float = 0.1,
-) -> list[np.ndarray]:
-    """Joint hybrid starting points: canonical, rotated, perturbations."""
-    if n_starts < 1:
-        raise ValueError(
-            f"_generate_starting_points_joint: n_starts must be >= 1, "
-            f"got {n_starts}"
-        )
-
-    canonical = np.clip(
-        _canonical_initial_guess_joint(z_obs_per_site, sigma_per_site, periods),
-        lower,
-        upper,
-    )
-    starts = [canonical]
-    if n_starts >= 2:
-        rotated = np.clip(
-            _rotated_initial_guess_joint(z_obs_per_site, sigma_per_site, periods),
-            lower,
-            upper,
-        )
-        starts.append(rotated)
-    for _ in range(n_starts - 2):
-        starts.append(
-            _perturbed_initial_guess(canonical, lower, upper, rng, perturbation_scale)
-        )
-    return starts
-
-def _solve_band_joint(
-    z_obs_per_site: np.ndarray,
-    sigma_per_site: np.ndarray,
-    periods: np.ndarray,
-    x0: np.ndarray | None = None,
-    bounds: tuple[np.ndarray, np.ndarray] | None = None,
-    bounds_override: dict | None = None,
-    max_nfev: int = 1000,
-    ftol: float = 1e-10,
-    xtol: float = 1e-10,
-) -> _BandResult:
-    """Joint single-band optimisation across multiple sites.
-
-    Direct extension of :func:`_solve_band` to the joint state vector.
-    """
-    n_sites = z_obs_per_site.shape[0]
-    n_freqs = z_obs_per_site.shape[1]
-
-    if bounds is None:
-        bounds = _build_bounds_joint(n_sites, n_freqs, bounds_override)
-    lower, upper = bounds
-
-    if x0 is None:
-        x0 = _canonical_initial_guess_joint(z_obs_per_site, sigma_per_site, periods)
-    x0 = np.clip(x0, lower, upper)
-
-    def fun(x):
-        r, _ = _objfun_joint(
-            x, z_obs_per_site, sigma_per_site, periods, compute_jacobian=False
-        )
-        return r
-
-    def jac(x):
-        _, j = _objfun_joint(
-            x, z_obs_per_site, sigma_per_site, periods, compute_jacobian=True
-        )
-        return j
-
-    result = least_squares(
-        fun=fun,
-        x0=x0,
-        jac=jac,
-        bounds=(lower, upper),
-        method="trf",
-        ftol=ftol,
-        xtol=xtol,
-        max_nfev=max_nfev,
-    )
-
-    x_opt = result.x
-    residuals = result.fun
-    chi_squared = float(np.sum(residuals**2))
-    n_resid = len(residuals)
-    rms_misfit = float(np.sqrt(chi_squared / n_resid))
-
-    J = result.jac
-    col_norms = np.linalg.norm(J, axis=0)
-    zero_cols = col_norms < 1e-15
-    try:
-        cov = np.linalg.pinv(J.T @ J, rcond=1e-12)
-        x_err = np.sqrt(np.maximum(np.diag(cov), 0.0))
-        x_err[zero_cols] = np.inf
-    except np.linalg.LinAlgError:
-        x_err = np.full_like(x_opt, np.nan)
-
-    return _BandResult(
-        x_opt=x_opt,
-        x_err=x_err,
-        residuals=residuals,
-        chi_squared=chi_squared,
-        rms_misfit=rms_misfit,
-        n_iter=int(result.nfev),
-        converged=int(result.status) > 0,
-        cost_at_opt=float(result.cost),
-        jacobian=J,
-    )
-
-def _solve_band_joint_multistart(
-    z_obs_per_site: np.ndarray,
-    sigma_per_site: np.ndarray,
-    periods: np.ndarray,
-    n_starts: int = 5,
-    bounds: tuple[np.ndarray, np.ndarray] | None = None,
-    bounds_override: dict | None = None,
-    rng: np.random.Generator | None = None,
-    mode_tolerance: dict | None = None,
-    perturbation_scale: float = 0.1,
-    max_nfev: int = 1000,
-    ftol: float = 1e-10,
-    xtol: float = 1e-10,
-) -> list[_Mode]:
-    """Multi-start joint single-band optimisation."""
-    if rng is None:
-        rng = np.random.default_rng(42)
-
-    n_sites = z_obs_per_site.shape[0]
-    n_freqs = z_obs_per_site.shape[1]
-    if bounds is None:
-        bounds = _build_bounds_joint(n_sites, n_freqs, bounds_override)
-    lower, upper = bounds
-
-    starting_points = _generate_starting_points_joint(
-        z_obs_per_site,
-        sigma_per_site,
-        periods,
-        lower,
-        upper,
-        n_starts,
-        rng,
-        perturbation_scale=perturbation_scale,
-    )
-
-    band_results: list[_BandResult] = []
-    for x0 in starting_points:
-        try:
-            br = _solve_band_joint(
-                z_obs_per_site=z_obs_per_site,
-                sigma_per_site=sigma_per_site,
-                periods=periods,
-                x0=x0,
-                bounds=bounds,
-                max_nfev=max_nfev,
-                ftol=ftol,
-                xtol=xtol,
-            )
-            band_results.append(br)
-        except Exception:
-            continue
-
-    if not band_results:
-        raise RuntimeError("_solve_band_joint_multistart: all starting points failed")
-
-    modes = _cluster_modes_joint(band_results, n_sites, n_freqs, mode_tolerance)
-    probabilities = _compute_mode_probabilities_joint(modes, n_sites)
-    for mode, prob in zip(modes, probabilities):
-        mode.probability = prob
-    return modes
-
-def _decompose_bands_with_modes_joint(
-    z_obs_per_site_full: np.ndarray,
-    sigma_per_site_full: np.ndarray,
-    selected_periods: np.ndarray,
-    bands: list[np.ndarray],
-    n_starts: int,
-    bounds_override: dict | None,
-    rng: np.random.Generator,
-    mode_tolerance: dict | None,
-    perturbation_scale: float,
-) -> list[tuple[np.ndarray, list[_Mode]]]:
-    """Run joint multi-start optimisation per band; return per-band
-    mode lists. Joint analogue of :func:`_decompose_bands_with_modes`.
-    """
-    band_modes_list: list[tuple[np.ndarray, list[_Mode]]] = []
-    for band_idx in bands:
-        z_b = z_obs_per_site_full[:, band_idx, :, :]
-        sigma_b = sigma_per_site_full[:, band_idx, :, :]
-        periods_b = selected_periods[band_idx]
-        modes = _solve_band_joint_multistart(
-            z_obs_per_site=z_b,
-            sigma_per_site=sigma_b,
-            periods=periods_b,
-            n_starts=n_starts,
-            bounds_override=bounds_override,
-            rng=rng,
-            mode_tolerance=mode_tolerance,
-            perturbation_scale=perturbation_scale,
-        )
-        band_modes_list.append((band_idx, modes))
-    return band_modes_list
-
 def _bootstrap_decompose_joint(
     z_obs_per_site_full: np.ndarray,
     sigma_per_site_full: np.ndarray,
@@ -3502,6 +3299,10 @@ def _bootstrap_decompose_joint(
                 rng=rng,
                 mode_tolerance=mode_tolerance,
                 perturbation_scale=perturbation_scale,
+                objfun_joint=_objfun_joint,
+                build_bounds_joint=_build_bounds_joint,
+                canonical_initial_guess_joint=_canonical_initial_guess_joint,
+                rotated_initial_guess_joint=_rotated_initial_guess_joint,
             )
         except Exception:
             continue

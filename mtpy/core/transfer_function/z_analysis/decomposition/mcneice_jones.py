@@ -19,10 +19,13 @@ multi-start clustering. The core call sequence is:
 
 1. ``_validate_joint_input`` (from :mod:`.common`) checks that all
    sites share a frequency grid and have valid ``z_error``.
-2. ``_solve_band_joint_multistart`` (from :mod:`.groom_bailey`) runs
-   the joint TRF nonlinear least-squares fit per band over
-   ``n_starts`` starting points, with mode clustering by canonical
-   form so multi-modal fits are detected.
+2. ``_solve_band_joint_multistart`` (from :mod:`.common`) runs the
+   joint TRF nonlinear least-squares fit per band over ``n_starts``
+   starting points, with mode clustering by canonical form so
+   multi-modal fits are detected. The orchestration is method-
+   agnostic; the GB-specific cost function, bounds, and initial
+   guesses are passed in as factory callables imported from
+   :mod:`.groom_bailey`.
 3. The chosen disambiguation strategy
    (:mod:`.symmetries._resolve_disambiguation`) is applied
    *post-hoc* to each band's primary mode: the shared strike is
@@ -56,8 +59,17 @@ from typing import TYPE_CHECKING, Callable
 
 import numpy as np
 
-from .common import _unpack_x_joint, _validate_joint_input
-from .groom_bailey import _solve_band_joint_multistart
+from .common import (
+    _solve_band_joint_multistart,
+    _unpack_x_joint,
+    _validate_joint_input,
+)
+from .groom_bailey import (
+    _build_bounds_joint,
+    _canonical_initial_guess_joint,
+    _objfun_joint,
+    _rotated_initial_guess_joint,
+)
 from .results import JointDecompositionResult
 from .symmetries import _geometric_fold, _resolve_disambiguation
 
@@ -230,6 +242,10 @@ def decompose_mcneice_jones(
             z_obs_per_site=z_b,
             sigma_per_site=sigma_b,
             periods=periods_b,
+            objfun_joint=_objfun_joint,
+            build_bounds_joint=_build_bounds_joint,
+            canonical_initial_guess_joint=_canonical_initial_guess_joint,
+            rotated_initial_guess_joint=_rotated_initial_guess_joint,
             n_starts=n_starts,
             rng=rng,
             max_nfev=int(max_iter),
