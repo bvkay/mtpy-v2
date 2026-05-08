@@ -1,14 +1,77 @@
 """GB symmetry handling and mode disambiguation.
 
-The Groom-Bailey forward model has a 90-degree strike / shear-sign
-symmetry that produces an exact gauge equivalence:
-``(strike, twist, shear) <-> (strike + 90 mod 180, twist, -shear)``
-yields identical predicted impedances and identical galvanic-
-distortion tensors. The two branches are observationally
-indistinguishable; which one a single optimiser run reports depends
-on starting point alone. Multi-start optimisation can additionally
-converge to physically-distinct local minima ("modes") that are not
+The Groom-Bailey forward model has a 90-degree gauge symmetry. The
+*complete* statement of the symmetry is
+
+    (strike, twist, shear, a, b)
+        <->
+    (strike + 90 mod 180, twist, -shear, b, a)
+
+where ``a`` and ``b`` are the strike-frame off-diagonal regional
+impedances (Lilley's "TE" and "TM"). Both five-tuples produce
+identical predicted observed impedances ``Z_obs = R(strike) C
+Z_strike R(strike).T`` and the same galvanic-distortion tensor
+``C``. The two branches are observationally indistinguishable;
+which one a single optimiser run reports depends on starting
+point alone. Multi-start optimisation can additionally converge
+to physically-distinct local minima ("modes") that are not
 GB-symmetry-equivalent.
+
+What the symmetry preserves
+---------------------------
+The (strike, twist, shear) → (strike + 90, twist, −shear) part
+of the symmetry is *itself* a smaller symmetry of the bare
+distortion tensor ``C``: any analysis that consumes only ``C``
+(e.g. the spin-2 shear ``gamma`` from
+:func:`...distortion_geometry.gamma_field`, or anything that
+treats the regional impedance as nuisance) is invariant under
+this fold without needing the (a, b) swap.
+
+The full predicted-Z invariance, however, *additionally* requires
+the (a, b) swap: rotating strike by 90° also swaps which
+strike-frame off-diagonal corresponds to "TE" vs "TM" in the
+measurement-frame Z, so the regional impedance values
+themselves swap. Any analysis that consumes the regional
+impedance must apply the (a, b) swap together with the strike
++ 90, shear-sign-flip operation; otherwise two truly
+GB-equivalent fits (one converging to ``strike = 30°,
++shear, a=A, b=B``, the other to ``strike = 120°, -shear,
+a=B, b=A``) would report regional impedances that look
+inconsistent across neighbouring sites despite being the same
+physics.
+
+A worked verification (numerical, run during code review):
+
+    Z(strike,    twist, +shear, a, b) ≠ Z(strike+90°, twist, -shear, a, b)
+    Z(strike,    twist, +shear, a, b) = Z(strike+90°, twist, -shear, b, a)
+
+i.e. omitting the (a, b) swap breaks the equivalence. The
+existing fold strategies in this module act on
+(strike, twist, shear) only — they preserve ``C`` but *not*
+``Z_obs`` unless the caller separately swaps (a, b) on the
+rotated branch. See the per-function docstrings for which
+operation each fold performs.
+
+Caveat about the regional-impedance gauge
+-----------------------------------------
+Mode clustering and the canonical-form summary
+(:func:`_canonical_form_summary`) use only (strike, twist,
+shear). Two starts that differ only by the GB symmetry will
+collapse to the same mode (correct), but the (a, b) values
+reported on the eventual :class:`DecompositionResult`'s
+``regional_z`` are whichever start happened to have the lowest
+numerical RMS — so the (a, b) gauge can flip arbitrarily
+between sites that are physically equivalent.
+
+For continental-scale array analyses this can produce spurious
+spatial structure in maps of regional response: neighbouring
+sites with the same physics but optimisers landing on opposite
+GB branches will show TE / TM swapped. The fix is to canonicalise
+the (a, b) gauge after the fold (e.g. always report the branch
+with ``|a| ≥ |b|``, or pick the branch whose strike is closest
+to a phase-tensor prior), and is tracked as a separate work item
+(F4) — this module currently documents the issue but does not
+correct for it.
 
 Why a strategy pattern, not a single default
 --------------------------------------------
@@ -106,12 +169,28 @@ def _geometric_fold(
     reference's ``symmetry.compare_band_against_dcmp`` convention and
     the McNeice-Jones Fortran output.
 
-    The Groom-Bailey decomposition has a discrete symmetry: the
-    triple ``(strike, twist, shear)`` and ``(strike + 90 mod 180,
-    twist, -shear)`` generate identical predicted impedances (twist
-    is invariant; the strike shift by 90 degrees is paired with a
-    sign flip on shear). This function chooses the branch with
-    strike in ``[0, pi/2)``.
+    Scope of this fold
+    ------------------
+    This function operates on **(strike, twist, shear) only**. The
+    bare distortion tensor ``C`` is invariant under
+    ``(strike, shear) -> (strike + 90, -shear)``, so any
+    ``C``-only consumer (e.g. spin-2 shear analysis) gets a
+    correct answer from this fold alone.
+
+    However, the full predicted-Z symmetry also requires swapping
+    the strike-frame regional impedances ``(a, b) -> (b, a)``
+    (TE ↔ TM swap; see the module docstring for the complete
+    statement). **This function does NOT touch (a, b)**; the caller
+    is responsible for swapping the regional impedances when it
+    wants ``Z_obs``-equivalent output rather than just
+    ``C``-equivalent output. In the GB / MJ public path the swap
+    is handled at result-assembly time
+    (:meth:`DecompositionResult.alternate_branch`); inside the
+    multi-start optimiser the branch chosen by clustering is the
+    one that *was* fitted, so no swap is applied — and the (a, b)
+    gauge can therefore flip arbitrarily between sites that are
+    physically equivalent (see the module docstring for the
+    spurious-spatial-structure caveat and the F4 follow-up).
 
     Parameters
     ----------
@@ -311,6 +390,26 @@ def _canonical_form_summary(br: _BandResult) -> dict:
 
     Returns a dict with keys: ``strike_deg``, ``twist_deg``,
     ``shear_deg``, ``log10_gain``, ``rms_misfit``.
+
+    Note on the regional-impedance gauge
+    ------------------------------------
+    The summary uses **(strike, twist, shear) only** — it does not
+    look at the strike-frame regional impedances ``(a, b)``. This
+    is the right choice for clustering: the GB symmetry leaves
+    ``C`` invariant under ``(strike, shear) -> (strike + 90,
+    -shear)``, so two starts that differ only by the symmetry
+    correctly collapse to a single mode.
+
+    But the full predicted-Z symmetry *also* requires
+    ``(a, b) -> (b, a)`` (see :mod:`...symmetries` module
+    docstring). Because clustering ignores ``(a, b)``, the (a, b)
+    values that end up on the reported result are whichever
+    optimiser start happened to have the lowest numerical RMS —
+    not a canonicalised choice. Two physically equivalent fits at
+    neighbouring sites can land on opposite branches and report
+    swapped TE / TM, which would manifest as spurious spatial
+    structure in maps of regional response. See the module
+    docstring caveat for the F4 follow-up.
     """
     strike_rad, twist_rad, shear_rad = _geometric_fold(
         float(br.x_opt[0]), float(br.x_opt[1]), float(br.x_opt[2])
