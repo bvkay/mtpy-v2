@@ -24,8 +24,11 @@ multi-start clustering. The core call sequence is:
    starting points, with mode clustering by canonical form so
    multi-modal fits are detected. The orchestration is method-
    agnostic; the GB-specific cost function, bounds, and initial
-   guesses are passed in as factory callables imported from
-   :mod:`.groom_bailey`.
+   guesses (``_objfun_joint``, ``_build_bounds_joint``,
+   ``_canonical_initial_guess_joint``,
+   ``_rotated_initial_guess_joint``) are also imported from
+   :mod:`.common` and passed in as factory callables.
+   ``mcneice_jones`` no longer reaches into ``groom_bailey``.
 3. The chosen disambiguation strategy
    (:mod:`.symmetries._resolve_disambiguation`) is applied
    *post-hoc* to each band's primary mode: the shared strike is
@@ -60,15 +63,13 @@ from typing import TYPE_CHECKING, Callable
 import numpy as np
 
 from .common import (
-    _solve_band_joint_multistart,
-    _unpack_x_joint,
-    _validate_joint_input,
-)
-from .groom_bailey import (
     _build_bounds_joint,
     _canonical_initial_guess_joint,
     _objfun_joint,
     _rotated_initial_guess_joint,
+    _solve_band_joint_multistart,
+    _unpack_x_joint,
+    _validate_joint_input,
 )
 from .results import JointDecompositionResult
 from .symmetries import _geometric_fold, _resolve_disambiguation

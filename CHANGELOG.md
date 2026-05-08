@@ -156,12 +156,17 @@ opt-in skipped.
   ``__init__.py`` files added at intermediate levels so the test
   modules are importable.
 
-Open architectural item: ``mcneice_jones.py`` still imports the
-four GB joint factory callables from ``groom_bailey.py``. The
-peer-into-private-orchestration smell is fully resolved (those
-were the architectural concern), but a follow-up could re-locate
-or re-export the GB joint helpers if the import is still
-considered undesirable.
+- **GB joint cost function and initial guesses moved to
+  ``common.py``** (this commit): ``_canonical_initial_guess``,
+  ``_rotated_initial_guess``, ``_canonical_initial_guess_joint``,
+  ``_rotated_initial_guess_joint``, ``_build_bounds_joint``, and
+  ``_objfun_joint`` (the GB joint cost function with analytic
+  Jacobian) all relocated. Function bodies and docstrings
+  unchanged. ``mcneice_jones.py`` no longer imports anything from
+  ``groom_bailey.py``; both modules consume the GB joint primitives
+  uniformly from ``common.py``. ``groom_bailey.py`` final size is
+  2775 lines (down from 3681 at the start of the refactor — −906
+  / −25 %).
 
 ### Tests
 - All decomposition test suites pass: GB single-site, MJ joint,
