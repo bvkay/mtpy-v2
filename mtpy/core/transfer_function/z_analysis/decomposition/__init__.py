@@ -219,6 +219,12 @@ from .groom_bailey import (  # noqa: F401  -- private helpers re-exported for ba
     decompose_joint,
 )
 from .bibby import decompose_bibby
+from .cross_method import (
+    ALL_METHODS,
+    agreement_summary,
+    compute_cross_method,
+    compute_cross_method_collection,
+)
 from .distortion_geometry import (
     complex_to_gamma,
     gamma_field,
@@ -246,6 +252,7 @@ from .marti import decompose_marti, wal_invariants, waldim_dimensionality
 from .mcneice_jones import decompose_mcneice_jones
 from .results import (  # noqa: F401  -- private helpers re-exported for backward compatibility
     BibbyResult,
+    CrossMethodResult,
     DecompositionResult,
     GarciaJonesResult,
     GomezTrevinoResult,
@@ -270,7 +277,9 @@ from .symmetries import (  # noqa: F401  -- private helpers re-exported for back
 )
 
 __all__ = [
+    "ALL_METHODS",
     "BibbyResult",
+    "CrossMethodResult",
     "DecompositionResult",
     "GarciaJonesResult",
     "GomezTrevinoResult",
@@ -278,7 +287,10 @@ __all__ = [
     "LilleyResult",
     "MagneticDistortionFlag",
     "MartiResult",
+    "agreement_summary",
     "complex_to_gamma",
+    "compute_cross_method",
+    "compute_cross_method_collection",
     "compute_magnetic_distortion_flag",
     "decompose",
     "decompose_bibby",

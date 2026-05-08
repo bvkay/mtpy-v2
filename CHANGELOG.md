@@ -168,6 +168,43 @@ opt-in skipped.
   2775 lines (down from 3681 at the start of the refactor — −906
   / −25 %).
 
+### Cross-method consolidation
+- **Cross-method comparison entry point**
+  (:mod:`...cross_method`,
+  :func:`compute_cross_method`,
+  :func:`compute_cross_method_collection`,
+  :func:`agreement_summary`,
+  :class:`CrossMethodResult`). Runs every implemented
+  decomposition method on the same site and projects each
+  method's native output onto a common comparison space
+  (per-period strike, twist / shear, regional ``Z``,
+  dimensionality). Methods that fail or that don't produce a
+  particular output field record the failure in
+  ``method_status`` / ``method_messages`` rather than raising;
+  per-field dicts simply omit absent methods.
+
+  Adapter design is local: each method has a private
+  ``_adapter_<name>`` function that takes ``(z_object,
+  periods, **kwargs)`` and returns a comparison-space dict.
+  Adding a new method means adding an adapter and registering
+  the name in ``ALL_METHODS``. Single-site GJ correctly
+  reports ``no_solution`` (it requires >= 2 sites); other six
+  methods complete unaffected. The companion
+  :func:`agreement_summary` returns per-method RMS deltas vs a
+  reference (default ``"groom_bailey"``) for strike (circular
+  mod 90°), twist / shear (linear), and regional ``Z`` (log10
+  fractional in amplitude, radians in phase). 16 unit tests in
+  ``tests/.../distortion/test_cross_method.py`` cover the four
+  required scenarios plus subset / unknown-method handling.
+
+  This is the canonical entry point for the "three traditions
+  converge" empirical claim of Paper 1: GB / MJ / BCB / GJ all
+  agreeing within a tolerance is direct cross-tradition
+  evidence the recovery is correct, and disagreement is a
+  diagnostic flag (cross-referenced with the F4
+  ``canonical_gauge`` and the ``magnetic_distortion_diagnostic``
+  module).
+
 ### New diagnostics
 - **Magnetic-galvanic-distortion heuristic flag**
   (:mod:`...magnetic_distortion_diagnostic`,

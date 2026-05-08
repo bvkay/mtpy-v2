@@ -901,6 +901,68 @@ class GomezTrevinoResult:
 
 
 @dataclass
+class CrossMethodResult:
+    """Side-by-side comparison of multiple decomposition methods on a
+    single site.
+
+    Each implemented method projects its native output onto a common
+    comparison space (per-period strike / twist / shear / regional
+    Z / dimensionality) so the user can answer "do the methods
+    agree?" with a single dataclass. The companion function
+    :func:`...cross_method.agreement_summary` quantifies the
+    cross-method differences for a specific reference method.
+
+    Methods that fail or that don't produce a particular output
+    field record the failure in :attr:`method_status` and
+    :attr:`method_messages` rather than raising; the per-field
+    dicts simply omit the absent method.
+
+    Fields
+    ------
+    site : str
+        Identifier for the source site.
+    periods : ndarray, shape ``(n_periods,)``
+        Periods (seconds), sorted ascending.
+    strike_estimates : dict[str, ndarray]
+        ``{method_name: per-period strike (degrees, mod 90)}``. For
+        methods that don't produce a strike (Marti, Gomez-Treviño)
+        the method key is absent.
+    twist_shear_estimates : dict[str, tuple of ndarray]
+        ``{method_name: (twist_deg_array, shear_deg_array)}``.
+        Methods absent: Lilley, Marti, Gomez-Treviño.
+    regional_z_estimates : dict[str, tuple of ndarray]
+        ``{method_name: (Z_TE_array, Z_TM_array)}`` complex per
+        period in measurement frame. Methods absent: Lilley
+        (uses central-impedance scalars), Marti.
+    dimensionality_estimates : dict[str, ndarray or list[str]]
+        ``{method_name: per-period classification}``. Marti uses
+        the WALDIM integer codes (0-7); Lilley uses string labels;
+        BCB uses a phase-tensor-derived label; Gomez-Treviño
+        compares ``rho_+`` vs ``rho_-`` to produce ``"1D"`` /
+        ``"2D"`` / ``"3D-likely"``. Methods absent: GB, MJ, GJ
+        (none of these classify dimensionality natively).
+    method_status : dict[str, str]
+        ``{method_name: "success" | "no_solution" | "error"}``.
+    method_messages : dict[str, str]
+        ``{method_name: explanatory string}``. Empty for
+        ``"success"``.
+    """
+
+    site: str
+    periods: np.ndarray
+    strike_estimates: dict[str, np.ndarray] = field(default_factory=dict)
+    twist_shear_estimates: dict[str, tuple[np.ndarray, np.ndarray]] = field(
+        default_factory=dict
+    )
+    regional_z_estimates: dict[str, tuple[np.ndarray, np.ndarray]] = field(
+        default_factory=dict
+    )
+    dimensionality_estimates: dict[str, Any] = field(default_factory=dict)
+    method_status: dict[str, str] = field(default_factory=dict)
+    method_messages: dict[str, str] = field(default_factory=dict)
+
+
+@dataclass
 class MagneticDistortionFlag:
     """Heuristic per-site flag for *suspected* magnetic galvanic
     distortion.
