@@ -3,12 +3,41 @@
 The Groom-Bailey forward model has a 90-degree strike / shear-sign
 symmetry that produces an exact gauge equivalence:
 ``(strike, twist, shear) <-> (strike + 90 mod 180, twist, -shear)``
-yields identical predicted impedances. Multi-start optimisation can
-also converge to physically-distinct local minima ("modes"). This
-module provides:
+yields identical predicted impedances and identical galvanic-
+distortion tensors. The two branches are observationally
+indistinguishable; which one a single optimiser run reports depends
+on starting point alone. Multi-start optimisation can additionally
+converge to physically-distinct local minima ("modes") that are not
+GB-symmetry-equivalent.
 
-- Disambiguation strategies that resolve the GB 90-degree symmetry by
-  choosing one of the two equivalent branches:
+Why a strategy pattern, not a single default
+--------------------------------------------
+Different downstream applications need different conventions, and
+those needs are mutually incompatible:
+
+- Reproducing historical strike_py / McNeice-Jones Fortran output
+  requires the geometric fold to ``[0, 90)``.
+- Cross-tool comparison with the phase tensor (``alpha``, mod 180)
+  requires the identity fold so both axes share the same strike
+  range.
+- Combining GB strikes with an external prior (a phase-tensor strike,
+  a regional geological strike) requires picking the branch closest
+  to that prior — a separate fold per band.
+- Low-shear-preferring tiebreakers are useful when the data is
+  consistent with no shear and the optimiser landed on a noisy
+  non-zero value.
+
+The empirical-reproducibility goal of the surrounding research
+project additionally requires that this choice be *explicit*: a
+silent default would mean two analysts with the same data and the
+same package version can publish different strikes, with no
+recoverable provenance for the discrepancy. This module therefore
+exposes the choice as a named strategy with no hidden default.
+
+Module contents
+---------------
+- Disambiguation strategies that resolve the GB 90-degree symmetry
+  by choosing one of the two equivalent branches per band:
 
   * :func:`_geometric_fold` — historical default, folds strike into
     ``[0, pi/2)`` and flips shear sign when the fold triggers.
@@ -20,12 +49,13 @@ module provides:
   * :func:`_min_shear_fold` — choose the branch with smaller
     ``|shear|``, a low-shear-preferring tiebreaker.
   * :func:`_resolve_disambiguation` — dispatch a string identifier or
-    callable to one of the above.
+    a user-supplied callable to one of the above.
 
-- :class:`_Mode` and clustering / probability helpers : group converged
-  starts into modes for both single-site and joint decompositions
-  (clustering uses :func:`_geometric_fold` internally so two starts
-  differing only by the GB symmetry collapse to one mode).
+- :class:`_Mode` and clustering / probability helpers — group
+  converged multi-start runs into modes for both single-site and
+  joint decompositions. Clustering always uses :func:`_geometric_fold`
+  internally so two starts differing only by the GB symmetry collapse
+  to a single mode regardless of the user's reporting choice.
 - Disagreement / primary-mode-warning detectors used by the public
   decompose path to surface ambiguous fits to the caller.
 

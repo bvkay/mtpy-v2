@@ -1,8 +1,47 @@
-"""Result objects and serialisation for the GB decomposition package.
+"""Result objects and serialisation for the decomposition package.
 
-Holds :class:`DecompositionResult` plus the pickle and NetCDF
-serialisation helpers used by its ``save`` / ``load`` / ``to_netcdf`` /
-``from_netcdf`` methods.
+Result hierarchy
+----------------
+The package exposes a single user-facing result type,
+:class:`DecompositionResult`, used by every method in the package
+(both currently-implemented and planned). It is a frozen-shape
+dataclass with the same field set regardless of which tradition
+produced it; downstream tooling can therefore consume any
+decomposition result with the same code path.
+
+The shape adapts to the method via two conventions:
+
+- **Single-site** (e.g. :func:`decompose`, future Bahr / Lilley /
+  WAL): ``regional_z`` is a single :class:`Z`. ``parameters`` has a
+  ``period`` coordinate only.
+- **Joint multi-site** (e.g. :func:`decompose_joint`, future joint
+  Bahr / Marti): ``regional_z`` is ``dict[str, Z]`` keyed by
+  ``station_id``. ``parameters`` adds a ``station`` coordinate to
+  the per-site fields (``twist``, ``shear``, ``gain``, etc.) while
+  shared fields (``strike``) keep the ``period``-only coordinate.
+
+The :meth:`DecompositionResult.regional_z_as_z` helper hides the
+single/joint distinction so call sites that only need one
+station's regional Z can be agnostic.
+
+The class also exposes :meth:`alternate_branch` for the GB symmetry
+(see :mod:`.symmetries`) so callers can examine the equivalent
+solution on the other branch without re-running the optimiser.
+
+Serialisation
+-------------
+Two serialisation paths are provided:
+
+- :meth:`save` / :meth:`load` write a pickle file. Fastest path for
+  in-session round trips; not robust across mtpy-v2 versions.
+- :meth:`to_netcdf` / :meth:`from_netcdf` write the parameters
+  Dataset and embedded regional Z to a NetCDF file with a sidecar
+  JSON for ``metadata``. The archival format; safe across versions
+  because both formats are stable.
+
+The module-private helpers (``_z_to_serialisable``,
+``_save_to_netcdf``, ``_json_serialise_numpy``, etc.) implement the
+two paths and are not part of the public API.
 
 References
 ----------

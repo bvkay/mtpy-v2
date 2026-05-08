@@ -1,7 +1,52 @@
-"""Shared utilities for the Groom-Bailey decomposition package.
+"""Shared utilities for decomposition methods.
 
-Math helpers, residual normalisations, band-extraction helpers, and
-input-validation routines used by both single-site and joint decomposition.
+This module collects the helpers that are not specific to any single
+decomposition tradition (Groom-Bailey, Bahr, WAL, Lilley, ...) and
+are intended for reuse as additional methods are added to the
+package. Each helper is method-agnostic: it deals with the impedance
+tensor, its uncertainty model, period banding, or the input
+collection structure, and never with a particular GB / Bahr / etc.
+parameterisation.
+
+What lives here
+---------------
+- **Tensor algebra primitives** : :func:`_mat_multiply`,
+  :func:`_extreme`. Tiny helpers that wrap idioms repeated across the
+  optimisers.
+- **Conversions** : :func:`_convz2r` (impedance -> apparent
+  resistivity), :func:`_convz2p` (impedance -> phase),
+  :func:`_estim_imp` (Groom-Bailey forward model — provided here
+  because the regional impedance reconstruction it wraps is a
+  natural building block for any future GB-derived method).
+- **Residual / error helpers** : :func:`_calc_error`,
+  :func:`_jkvar`. Common normalisations used in nonlinear least-
+  squares cost functions.
+- **Optimiser plumbing** : :func:`_unpack_x`, :func:`_unpack_x_joint`,
+  the per-band parameter-vector packing used by both the GB and MJ
+  cost functions.
+- **Period-band partitioning** : :func:`_extract_bands`,
+  :func:`_z_to_band_arrays`, :func:`_band_arrays_to_z`. Splitting an
+  impedance tensor into log-period bands is a method-agnostic
+  operation — every tradition that fits in bands needs the same
+  helpers.
+- **Per-band result container** : :class:`_BandResult`. The internal
+  per-band optimisation record consumed by all method-specific
+  aggregation code.
+- **Joint-input validation** : :func:`_normalise_collection_input`,
+  :func:`_validate_joint_input`. Multi-site methods accept either an
+  :class:`MTCollection` or a list of ``MT`` objects; these helpers
+  canonicalise the input and check the cross-site invariants
+  (matching frequency grids, distinct station ids, etc.) any joint
+  method needs.
+
+What does **not** live here
+---------------------------
+Method-specific machinery — the GB cost function, mode clustering,
+canonicalisation, and bootstrap — lives in the method's own module
+(:mod:`.groom_bailey`, :mod:`.symmetries`). When a future Bahr or
+Lilley implementation lands, its forward model, parameter-specific
+bounds, and result aggregation will live in a peer module rather
+than here.
 
 References
 ----------

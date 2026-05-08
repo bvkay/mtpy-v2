@@ -1,9 +1,46 @@
 """Groom-Bailey single-site and McNeice-Jones joint decomposition.
 
-Implements the public :func:`decompose`, :func:`decompose_joint`, and
-:func:`decompose_each_station` entry points and the per-band
-optimisation, multi-start orchestration, and parametric-bootstrap
-machinery they rely on.
+Algorithm
+---------
+The Groom-Bailey model (Groom & Bailey, 1989) factorises the 2x2
+galvanic-distortion tensor as
+
+    C = g * R(strike) * T(twist) * S(shear) * A(anisotropy)
+
+with named geometric operators, and writes the observed measurement-
+frame impedance as
+
+    Z_obs = R(strike) * C * Z_2D(strike) * R(strike).T
+
+where ``Z_2D`` is the regional 2-D impedance (anti-diagonal in the
+strike frame, with TE response ``a`` and TM response ``b``). The
+unknowns per period are ``(strike, twist, shear, anisotropy, gain, a,
+b)``; ``a`` and ``b`` are complex, the rest are real. ``anisotropy`` is
+structurally non-identifiable from MT alone.
+
+This module fits all unknowns jointly within a frequency *band* using
+weighted nonlinear least-squares (scipy ``trust-constr``). The
+optimiser sees a single residual vector packing real and imaginary
+parts of the predicted-minus-observed Z entries, normalised by
+``z_error``. Each band is fitted from multiple starting points and the
+converged points are clustered by canonical (strike, twist, shear) into
+"modes"; the lowest-RMS mode is reported as primary, with the
+remaining modes preserved on the result for inspection. A parametric
+bootstrap is available (synthetic Gaussian noise on the primary-mode
+predicted Z) for empirical confidence intervals on the direct GB
+parameters.
+
+The McNeice-Jones extension (McNeice & Jones, 2001) ties the regional
+strike across multiple sites within a band while leaving twist, shear,
+and gain per-site, on the geological argument that a regional 2-D
+strike is a property of the survey and not of any single station.
+
+This module implements the public entry points
+:func:`decompose` (single-site), :func:`decompose_joint`
+(multi-site shared-strike), and :func:`decompose_each_station`
+(convenience wrapper that runs single-site GB on every station of a
+collection), plus the per-band optimisation, multi-start
+orchestration, and parametric-bootstrap helpers they rely on.
 
 References
 ----------
