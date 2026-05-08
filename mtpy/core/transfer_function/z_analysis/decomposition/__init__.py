@@ -54,6 +54,11 @@ Currently implemented
   3-D regional extension of MJ, Phase 1. Per-site real distortion
   (twist, shear) plus a free 3-D regional Z per period, fitted
   jointly across two-or-more sites.
+- **Irreducible decomposition utilities**
+  (:mod:`.distortion_geometry`): split a 2x2 real distortion
+  ``C - I`` into its irreducible ``SO(2)`` parts (trace, spin-2
+  deviatoric shear, antisymmetric pseudo-scalar). The spin-2
+  ``gamma`` field is the input to array-level E / B-mode analysis.
 
 Planned
 -------
@@ -80,6 +85,8 @@ Package layout
 - :mod:`.marti` : the Marti WALDIM dimensionality classifier.
 - :mod:`.garcia_jones` : the Garcia-Jones (2002) 3-D-regional
   extended decomposition.
+- :mod:`.distortion_geometry` : irreducible-decomposition utilities
+  for the spin-0 / spin-2 split of a real distortion tensor.
 
 See also
 --------
@@ -176,6 +183,14 @@ from .groom_bailey import (  # noqa: F401  -- private helpers re-exported for ba
     decompose_joint,
 )
 from .bibby import decompose_bibby
+from .distortion_geometry import (
+    complex_to_gamma,
+    gamma_field,
+    gamma_magnitude,
+    gamma_to_complex,
+    irreducible_decomposition,
+    principal_axis,
+)
 from .garcia_jones import decompose_garcia_jones
 from .lilley import decompose_lilley
 from .marti import decompose_marti, wal_invariants, waldim_dimensionality
@@ -210,6 +225,7 @@ __all__ = [
     "JointDecompositionResult",
     "LilleyResult",
     "MartiResult",
+    "complex_to_gamma",
     "decompose",
     "decompose_bibby",
     "decompose_each_station",
@@ -218,6 +234,11 @@ __all__ = [
     "decompose_lilley",
     "decompose_marti",
     "decompose_mcneice_jones",
+    "gamma_field",
+    "gamma_magnitude",
+    "gamma_to_complex",
+    "irreducible_decomposition",
+    "principal_axis",
     "wal_invariants",
     "waldim_dimensionality",
 ]
