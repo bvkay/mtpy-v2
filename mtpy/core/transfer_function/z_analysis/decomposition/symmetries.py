@@ -363,6 +363,350 @@ def _resolve_disambiguation(
         f"'pt_aligned', 'min_shear', or a callable."
     )
 
+
+# ---------------------------------------------------------------------------
+# Canonical-gauge selection (post-processing of primary mode)
+# ---------------------------------------------------------------------------
+#
+# The fold strategies above pick a (strike, twist, shear) branch but do
+# not touch the regional impedance (a, b). The canonical-gauge layer
+# below operates on the assembled primary-mode result and decides, per
+# band, whether the optimiser landed on the "right" GB branch. If not,
+# it applies the full GB symmetry — flipping (strike, shear) so that
+# downstream (a, b) derivations from the (unchanged, measurement-frame)
+# regional Z automatically yield the swapped strike-frame values
+# (proof: in measurement frame the regional Z is invariant under the
+# GB symmetry, so flipping strike alone re-interprets which off-
+# diagonal corresponds to TE vs TM in the strike frame).
+#
+# This is the F4 fix for the spurious-spatial-flip risk documented in
+# the module docstring's "Caveat about the regional-impedance gauge".
+#
+# Three gauges are supported:
+#
+#   "pt_aligned" — choose the branch whose strike is closest to the
+#                  phase-tensor alpha for the band (mod pi). Default
+#                  for the public decompose APIs.
+#   "magnitude"  — choose the branch with median |a| >= |b| (where
+#                  (a, b) are derived per-period from the regional Z
+#                  and the per-period strike).
+#   "rms_best"   — no-op; report whichever start the optimiser-and-
+#                  clustering chain returned. Backwards-compatibility
+#                  with the pre-F4 default and useful for debugging.
+
+
+def _angular_dist_mod_pi(a: float, b: float) -> float:
+    """Smallest angular distance between two angles modulo pi."""
+    d = abs(a - b) % np.pi
+    return float(min(d, np.pi - d))
+
+
+def _circular_median_mod_pi(values: np.ndarray) -> float:
+    """Circular median of mod-pi angles (radians).
+
+    Doubles the input angles to map mod-pi onto a full circle, takes
+    the medians of sin and cos, and halves back. Robust to wrapping.
+    Returns ``nan`` if no finite inputs.
+    """
+    finite = values[np.isfinite(values)]
+    if finite.size == 0:
+        return float("nan")
+    return float(
+        0.5
+        * np.arctan2(
+            np.median(np.sin(2.0 * finite)),
+            np.median(np.cos(2.0 * finite)),
+        )
+    )
+
+
+def _decide_gauge_flip_per_band(
+    *,
+    canonical_gauge: str,
+    band_idx: np.ndarray,
+    band_strike_rad: float,
+    pt_alpha_rad: np.ndarray | None,
+    regional_z: np.ndarray,
+    per_period_strike_rad: np.ndarray,
+) -> bool:
+    """Per-band: should we flip to the alternate GB branch?
+
+    Parameters
+    ----------
+    canonical_gauge : {"pt_aligned", "magnitude"}
+        ``"rms_best"`` should be filtered out by the caller; this
+        function never returns ``True`` for it.
+    band_idx : (n_band_periods,) int ndarray
+    band_strike_rad : float
+        Representative strike for the band (e.g. median across band
+        periods).
+    pt_alpha_rad : (n_periods,) float ndarray, optional
+        Per-period phase-tensor alpha (radians). Required for
+        ``"pt_aligned"``.
+    regional_z : (n_periods, 2, 2) complex ndarray
+        Measurement-frame regional impedance.
+    per_period_strike_rad : (n_periods,) float ndarray
+        Current per-period strike (radians) — used to derive
+        strike-frame (a, b) magnitudes for the ``"magnitude"`` rule.
+    """
+    if canonical_gauge == "pt_aligned":
+        if pt_alpha_rad is None:
+            raise ValueError(
+                "canonical_gauge='pt_aligned' requires pt_alpha_rad"
+            )
+        # PT alpha is the across-strike (perpendicular-to-strike)
+        # azimuth by convention; the GB strike is the along-strike
+        # azimuth. The two differ by 90° for an idealised 2-D Earth
+        # (see the F3 docstring fix in lilley.py and the
+        # mt_decomp commit c12e44e "GB-PT 90° offset is a fixed
+        # convention, not physical"). The natural target for the GB
+        # strike is therefore PT alpha + 90° (mod pi).
+        target = _circular_median_mod_pi(pt_alpha_rad[band_idx])
+        if not np.isfinite(target):
+            return False
+        target = (target + np.pi / 2.0) % np.pi
+        d_orig = _angular_dist_mod_pi(band_strike_rad, target)
+        d_alt = _angular_dist_mod_pi(band_strike_rad + np.pi / 2.0, target)
+        return d_alt < d_orig
+
+    if canonical_gauge == "magnitude":
+        mag_a = np.empty(len(band_idx))
+        mag_b = np.empty(len(band_idx))
+        for j, k in enumerate(band_idx):
+            ki = int(k)
+            theta = float(per_period_strike_rad[ki])
+            cs, sn = np.cos(theta), np.sin(theta)
+            R = np.array([[cs, -sn], [sn, cs]])
+            z_strike = R.T @ regional_z[ki] @ R
+            mag_a[j] = abs(z_strike[0, 1])
+            mag_b[j] = abs(z_strike[1, 0])
+        return float(np.median(mag_a)) < float(np.median(mag_b))
+
+    raise ValueError(
+        f"_decide_gauge_flip_per_band: unsupported canonical_gauge "
+        f"{canonical_gauge!r}; expected 'pt_aligned' or 'magnitude'."
+    )
+
+
+def _apply_canonical_gauge_per_band(
+    *,
+    canonical_gauge: str,
+    bands: list[np.ndarray],
+    parameters,  # xr.Dataset (not imported at module level to avoid xr dep here)
+    regional_z: np.ndarray,
+    pt_alpha_rad: np.ndarray | None = None,
+) -> tuple:
+    """Apply F4 canonical gauge per-band to a single-site result.
+
+    For each band, decide via :func:`_decide_gauge_flip_per_band`
+    whether to flip to the alternate GB branch. If yes, rewrite that
+    band's per-period (strike, shear). The measurement-frame regional
+    Z is invariant under the GB symmetry and is left unchanged;
+    downstream (a, b) derivations using the rewritten strike
+    automatically produce the swapped strike-frame values.
+
+    Overlapping bands: the first band wins for any period, so a
+    period is never double-flipped.
+
+    Parameters
+    ----------
+    canonical_gauge : {"pt_aligned", "magnitude", "rms_best"}
+        ``"rms_best"`` makes this function a no-op.
+    bands : list of (n_band_periods,) int ndarrays
+    parameters : xr.Dataset
+        With variables ``strike``, ``shear`` keyed on a ``period``
+        coord.
+    regional_z : (n_periods, 2, 2) complex ndarray
+    pt_alpha_rad : (n_periods,) float ndarray, optional
+        Required iff ``canonical_gauge == "pt_aligned"``.
+
+    Returns
+    -------
+    (new_parameters, flipped_period_indices)
+        ``new_parameters`` is a deep copy with the gauge applied;
+        ``flipped_period_indices`` is a list of integer period
+        indices that were flipped (for diagnostics / metadata).
+    """
+    if canonical_gauge not in {"pt_aligned", "magnitude", "rms_best"}:
+        raise ValueError(
+            f"canonical_gauge must be one of 'pt_aligned', 'magnitude', "
+            f"'rms_best'; got {canonical_gauge!r}"
+        )
+    if canonical_gauge == "rms_best":
+        return parameters, []
+
+    new_params = parameters.copy(deep=True)
+    flipped_periods: set[int] = set()
+    n_periods = new_params["strike"].size
+
+    per_period_strike_rad = np.radians(
+        np.asarray(new_params["strike"].values, dtype=np.float64)
+    )
+
+    for band_idx in bands:
+        band_idx = np.asarray(band_idx, dtype=int)
+        active = np.array(
+            [int(k) for k in band_idx if int(k) not in flipped_periods],
+            dtype=int,
+        )
+        if active.size == 0:
+            continue
+
+        band_strike_deg = float(np.median(new_params["strike"].values[active]))
+        band_strike_rad = float(np.radians(band_strike_deg))
+
+        try:
+            should_flip = _decide_gauge_flip_per_band(
+                canonical_gauge=canonical_gauge,
+                band_idx=active,
+                band_strike_rad=band_strike_rad,
+                pt_alpha_rad=pt_alpha_rad,
+                regional_z=regional_z,
+                per_period_strike_rad=per_period_strike_rad,
+            )
+        except Exception:
+            # Robustness: a single bad band must not bring the whole
+            # decomposition down. Leave that band unchanged.
+            continue
+
+        if should_flip:
+            for k in band_idx:
+                ki = int(k)
+                if ki in flipped_periods or ki >= n_periods:
+                    continue
+                flipped_periods.add(ki)
+                new_strike = (
+                    float(new_params["strike"].values[ki]) + 90.0
+                ) % 180.0
+                new_params["strike"].values[ki] = new_strike
+                new_params["shear"].values[ki] = -float(
+                    new_params["shear"].values[ki]
+                )
+                # Update the cache too so subsequent magnitude-rule
+                # bands compute strike-frame (a, b) correctly.
+                per_period_strike_rad[ki] = np.radians(new_strike)
+
+    if flipped_periods:
+        # Range may now exceed the disambiguation choice (e.g. a
+        # geometric-fold result of [0, 90) can land at >= 90 if the
+        # canonical gauge selects the alternate branch).
+        new_params["strike"].attrs["range"] = "[0, 180)"
+
+    return new_params, sorted(flipped_periods)
+
+
+def _apply_canonical_gauge_per_band_joint(
+    *,
+    canonical_gauge: str,
+    bands: list[np.ndarray],
+    parameters,
+    regional_z_per_site: np.ndarray,
+    pt_alpha_rad: np.ndarray | None = None,
+) -> tuple:
+    """Apply F4 canonical gauge per-band to a joint (multi-site) result.
+
+    The joint GB symmetry is shared across sites: a single decision
+    per band flips ``strike`` (period-shared) and every site's
+    ``shear`` simultaneously. Per-site regional Z (measurement frame)
+    is invariant.
+
+    Parameters
+    ----------
+    canonical_gauge : {"pt_aligned", "magnitude", "rms_best"}
+    bands : list of int ndarrays
+    parameters : xr.Dataset
+        With variables ``strike`` (``period``-only) and ``shear``
+        (``period``, ``station``).
+    regional_z_per_site : (n_sites, n_periods, 2, 2) complex ndarray
+        Per-site, per-period measurement-frame regional Z. The
+        magnitude rule uses the median across sites.
+    pt_alpha_rad : (n_periods,) float ndarray, optional
+        Per-period PT alpha (radians), pre-aggregated across sites
+        (e.g. circular median over sites). Required for
+        ``"pt_aligned"``.
+    """
+    if canonical_gauge not in {"pt_aligned", "magnitude", "rms_best"}:
+        raise ValueError(
+            f"canonical_gauge must be one of 'pt_aligned', 'magnitude', "
+            f"'rms_best'; got {canonical_gauge!r}"
+        )
+    if canonical_gauge == "rms_best":
+        return parameters, []
+
+    new_params = parameters.copy(deep=True)
+    flipped_periods: set[int] = set()
+    n_sites = regional_z_per_site.shape[0]
+    n_periods = regional_z_per_site.shape[1]
+
+    per_period_strike_rad = np.radians(
+        np.asarray(new_params["strike"].values, dtype=np.float64)
+    )
+
+    for band_idx in bands:
+        band_idx = np.asarray(band_idx, dtype=int)
+        active = np.array(
+            [int(k) for k in band_idx if int(k) not in flipped_periods],
+            dtype=int,
+        )
+        if active.size == 0:
+            continue
+
+        band_strike_deg = float(np.median(new_params["strike"].values[active]))
+        band_strike_rad = float(np.radians(band_strike_deg))
+
+        if canonical_gauge == "pt_aligned":
+            if pt_alpha_rad is None:
+                # Cannot apply pt_aligned without PT data; skip.
+                continue
+            target = _circular_median_mod_pi(pt_alpha_rad[band_idx])
+            if not np.isfinite(target):
+                continue
+            # See _decide_gauge_flip_per_band for the +90° rationale
+            # (PT alpha is across-strike; GB strike is along-strike).
+            target = (target + np.pi / 2.0) % np.pi
+            d_orig = _angular_dist_mod_pi(band_strike_rad, target)
+            d_alt = _angular_dist_mod_pi(
+                band_strike_rad + np.pi / 2.0, target
+            )
+            should_flip = d_alt < d_orig
+        else:  # magnitude
+            mag_a_band = []
+            mag_b_band = []
+            for k in active:
+                ki = int(k)
+                theta = float(per_period_strike_rad[ki])
+                cs, sn = np.cos(theta), np.sin(theta)
+                R = np.array([[cs, -sn], [sn, cs]])
+                for i in range(n_sites):
+                    z_strike = R.T @ regional_z_per_site[i, ki] @ R
+                    mag_a_band.append(abs(z_strike[0, 1]))
+                    mag_b_band.append(abs(z_strike[1, 0]))
+            should_flip = float(np.median(mag_a_band)) < float(
+                np.median(mag_b_band)
+            )
+
+        if should_flip:
+            for k in band_idx:
+                ki = int(k)
+                if ki in flipped_periods or ki >= n_periods:
+                    continue
+                flipped_periods.add(ki)
+                new_strike = (
+                    float(new_params["strike"].values[ki]) + 90.0
+                ) % 180.0
+                new_params["strike"].values[ki] = new_strike
+                # shear is (period, station)
+                new_params["shear"].values[ki, :] = -np.asarray(
+                    new_params["shear"].values[ki, :]
+                )
+                per_period_strike_rad[ki] = np.radians(new_strike)
+
+    if flipped_periods:
+        new_params["strike"].attrs["range"] = "[0, 180)"
+
+    return new_params, sorted(flipped_periods)
+
+
 @dataclass
 class _Mode:
     """Internal type: one discovered mode of a multi-start fit.

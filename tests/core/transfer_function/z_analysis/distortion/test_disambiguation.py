@@ -179,10 +179,20 @@ def test_disambiguation_geometric_unchanged():
     geometric fold; the new default `disambiguation='geometric'` must
     be a drop-in equivalent.
     """
+    # canonical_gauge="rms_best" so this test exercises only the
+    # disambiguation flag — the F4 default ("pt_aligned") would
+    # additionally rewrite (strike, shear) per-band based on PT
+    # alpha, which is a separate feature with its own tests
+    # (TestCanonicalGauge / TestGbSymmetryRoundtrip in
+    # test_symmetries.py).
     z = _synthetic_z(theta_deg=120.0)
-    res_default = decompose(z, seed=42)
-    res_legacy = decompose(z, seed=42, canonicalise=True)
-    res_explicit = decompose(z, seed=42, disambiguation="geometric")
+    res_default = decompose(z, seed=42, canonical_gauge="rms_best")
+    res_legacy = decompose(
+        z, seed=42, canonicalise=True, canonical_gauge="rms_best"
+    )
+    res_explicit = decompose(
+        z, seed=42, disambiguation="geometric", canonical_gauge="rms_best"
+    )
 
     np.testing.assert_array_equal(
         res_default.parameters["strike"].values,
@@ -247,10 +257,14 @@ def test_disambiguation_pt_aligned_consistency():
     # ~120° (= true strike + 90° under mtpy's convention).
     assert pt_median_mod180 == pytest.approx(120.0, abs=5.0)
 
+    # canonical_gauge="rms_best": this test exercises the
+    # disambiguation='pt_aligned' fold; the F4 canonical_gauge
+    # would re-flip after the fold, which is tested separately.
     res = decompose(
         z,
         seed=11,
         disambiguation="pt_aligned",
+        canonical_gauge="rms_best",
         bounds_override={"strike": (0.0, np.pi / 2.0)},
     )
     strikes = res.parameters["strike"].values

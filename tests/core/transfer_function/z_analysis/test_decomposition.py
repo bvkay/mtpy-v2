@@ -1143,7 +1143,10 @@ class TestDecomposeEndToEnd:
 
     def test_strike_attrs(self):
         z, _ = _build_synthetic_z()
-        result = decompose(z)
+        # canonical_gauge="rms_best": this test asserts the
+        # disambiguation="geometric" range attribute, which the F4
+        # canonical_gauge would override to [0, 180).
+        result = decompose(z, canonical_gauge="rms_best")
         assert result.parameters["strike"].attrs.get("units") == "degrees"
         assert result.parameters["strike"].attrs.get("range") == "[0, 90)"
 
@@ -1268,8 +1271,11 @@ class TestDecomposeCanonicaliseFlag:
     def test_default_strike_in_canonical_range(self):
         # Backward compatibility: with canonicalise=True (default),
         # all reported strikes lie in [0, 90).
+        # canonical_gauge="rms_best" so this test covers only the
+        # canonicalise/disambiguation flag interaction; the F4
+        # canonical_gauge has its own tests.
         z, _ = _build_synthetic_z(theta_deg=120.0)
-        result = decompose(z)
+        result = decompose(z, canonical_gauge="rms_best")
         strikes = result.parameters["strike"].values
         finite = strikes[np.isfinite(strikes)]
         assert finite.size > 0
@@ -1288,6 +1294,7 @@ class TestDecomposeCanonicaliseFlag:
         result = decompose(
             z,
             canonicalise=False,
+            canonical_gauge="rms_best",
             bounds_override={"strike": (np.pi / 2.0, np.pi)},
         )
         strikes = result.parameters["strike"].values
@@ -1315,11 +1322,18 @@ class TestDecomposeCanonicaliseFlag:
         z, _ = _build_synthetic_z(theta_deg=120.0, twist_deg=8.0, shear_deg=4.0)
         upper_branch_bounds = {"strike": (np.pi / 2.0, np.pi)}
 
+        # canonical_gauge="rms_best": this test asserts the
+        # canonicalise flag's narrow effect on (strike, shear)
+        # reporting; the F4 canonical_gauge would re-rotate after
+        # the canonicalise fold, breaking the bounded-branch
+        # premise.
         result_true = decompose(
-            z, seed=123, bounds_override=upper_branch_bounds
+            z, seed=123, bounds_override=upper_branch_bounds,
+            canonical_gauge="rms_best",
         )
         result_false = decompose(
-            z, seed=123, canonicalise=False, bounds_override=upper_branch_bounds
+            z, seed=123, canonicalise=False, bounds_override=upper_branch_bounds,
+            canonical_gauge="rms_best",
         )
 
         # The optimisation is independent of the reporting flag, so
@@ -1797,8 +1811,12 @@ class TestDecomposeMultistart:
         # land at theta=0 with single-start. With multi-start n=5,
         # primary mode of every band should now recover theta=75
         # (or its canonical fold, 75 in [0, 90)).
+        # canonical_gauge="rms_best": this test exercises the
+        # multi-start convergence; the F4 canonical_gauge could
+        # flip the recovered branch to PT-aligned, which is a
+        # separate concern.
         z, _ = _build_synthetic_z(theta_deg=75.0, twist_deg=15.0, shear_deg=-8.0)
-        result = decompose(z, n_starts=5)
+        result = decompose(z, n_starts=5, canonical_gauge="rms_best")
         strikes = result.parameters["strike"].values
         finite = strikes[np.isfinite(strikes)]
         # Median strike should be near 75 deg
@@ -1809,7 +1827,14 @@ class TestDecomposeMultistart:
 
     def test_return_all_modes_dataset_shape(self):
         z, _ = _build_synthetic_z()
-        result = decompose(z, return_all_modes=True)
+        # canonical_gauge="rms_best": this test asserts dataset
+        # shape with return_all_modes=True; the F4 gauge does not
+        # touch the per-mode dataset (it operates only on the
+        # primary-mode projection), but to keep the assertion of
+        # non-flipped values we use rms_best.
+        result = decompose(
+            z, return_all_modes=True, canonical_gauge="rms_best"
+        )
         assert "mode" in result.parameters.dims
         # Primary mode = 0, must equal the regular per-period values
         # for the same-shape (period,) projection

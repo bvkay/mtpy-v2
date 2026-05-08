@@ -92,6 +92,7 @@ def decompose_mcneice_jones(
     seed: int = 42,
     disambiguation: "str | Callable" = "geometric",
     max_iter: int = 200,
+    canonical_gauge: str = "pt_aligned",
 ) -> JointDecompositionResult:
     """McNeice-Jones (2001) multi-site joint GB decomposition.
 
@@ -329,6 +330,103 @@ def decompose_mcneice_jones(
             }
         )
 
+    # F4: canonical-gauge selection. Decide per band whether to flip
+    # to the alternate GB branch so that the regional-impedance
+    # gauge is deterministic across runs and across neighbouring
+    # sites. The shared strike per band means a single decision per
+    # band flips strike AND every site's shear simultaneously; the
+    # measurement-frame regional Z is invariant. See the
+    # symmetries.py module docstring for the architectural
+    # rationale.
+    flipped_band_ids: list[int] = []
+    if canonical_gauge != "rms_best":
+        if canonical_gauge not in {"pt_aligned", "magnitude"}:
+            raise ValueError(
+                f"canonical_gauge must be one of 'pt_aligned', "
+                f"'magnitude', 'rms_best'; got {canonical_gauge!r}"
+            )
+
+        # Pre-compute per-period PT alpha (median across sites,
+        # radians) for the pt_aligned rule.
+        pt_alpha_full_rad: np.ndarray | None = None
+        if canonical_gauge == "pt_aligned":
+            pt_alphas: list[np.ndarray] = []
+            for _, z in stations:
+                try:
+                    a = np.asarray(z.phase_tensor.alpha, dtype=np.float64)
+                    pt_alphas.append(np.radians(a[sort_idx]))
+                except Exception:
+                    pass
+            if pt_alphas:
+                stack = np.stack(pt_alphas, axis=0)
+                with np.errstate(invalid="ignore"):
+                    sin2 = np.median(np.sin(2.0 * stack), axis=0)
+                    cos2 = np.median(np.cos(2.0 * stack), axis=0)
+                pt_alpha_full_rad = 0.5 * np.arctan2(sin2, cos2)
+
+        for band_id, band_idx in enumerate(bands):
+            band_strike_deg = per_band_strike[band_id]
+            band_strike_rad = np.radians(band_strike_deg)
+
+            should_flip = False
+            if canonical_gauge == "pt_aligned":
+                if pt_alpha_full_rad is None:
+                    continue  # no PT data
+                vals = pt_alpha_full_rad[band_idx]
+                vals = vals[np.isfinite(vals)]
+                if vals.size == 0:
+                    continue
+                # Circular median; PT alpha is across-strike, GB
+                # strike is along-strike — offset by pi/2.
+                target = float(
+                    0.5
+                    * np.arctan2(
+                        np.median(np.sin(2.0 * vals)),
+                        np.median(np.cos(2.0 * vals)),
+                    )
+                )
+                target = (target + np.pi / 2.0) % np.pi
+
+                def _dist(a: float, b: float) -> float:
+                    d = abs(a - b) % np.pi
+                    return min(d, np.pi - d)
+
+                d_orig = _dist(band_strike_rad, target)
+                d_alt = _dist(band_strike_rad + np.pi / 2.0, target)
+                should_flip = d_alt < d_orig
+            else:  # magnitude
+                mag_a: list[float] = []
+                mag_b: list[float] = []
+                for sid in site_ids:
+                    z_r = per_band_per_site_z_regional[(band_id, sid)]
+                    cs = np.cos(band_strike_rad)
+                    sn = np.sin(band_strike_rad)
+                    R = np.array([[cs, -sn], [sn, cs]])
+                    for k in range(z_r.shape[0]):
+                        z_strike = R.T @ z_r[k] @ R
+                        mag_a.append(abs(z_strike[0, 1]))
+                        mag_b.append(abs(z_strike[1, 0]))
+                if mag_a and mag_b:
+                    should_flip = float(np.median(mag_a)) < float(
+                        np.median(mag_b)
+                    )
+
+            if should_flip:
+                flipped_band_ids.append(band_id)
+                per_band_strike[band_id] = (band_strike_deg + 90.0) % 180.0
+                # Each site's shear flips sign at this band, and the
+                # per-band strike record updates to match.
+                for sid in site_ids:
+                    rec = per_site_dist[sid]
+                    rec["shear_deg_per_band"][band_id] = -rec[
+                        "shear_deg_per_band"
+                    ][band_id]
+                    rec["strike_deg_per_band"][band_id] = per_band_strike[
+                        band_id
+                    ]
+                # per_band_per_site_z_regional is invariant under
+                # the GB symmetry in measurement frame; not touched.
+
     # Finalise per-site records: band-averaged scalars (median) and
     # the reconstructed measurement-frame C tensor.
     rms_per_site: dict[str, float] = {}
@@ -370,6 +468,8 @@ def decompose_mcneice_jones(
         "period_bands": bands_actually_fitted,
         "site_ids": list(site_ids),
         "per_band": per_band_meta,
+        "canonical_gauge": canonical_gauge,
+        "canonical_gauge_flipped_band_ids": flipped_band_ids,
     }
 
     return JointDecompositionResult(

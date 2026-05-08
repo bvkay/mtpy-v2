@@ -86,6 +86,8 @@ from .results import DecompositionResult
 from .symmetries import (
     _DEFAULT_MODE_TOLERANCE,
     _Mode,
+    _apply_canonical_gauge_per_band,
+    _apply_canonical_gauge_per_band_joint,
     _canonical_form_summary_joint,
     _cluster_modes,
     _compute_mode_probabilities,
@@ -158,6 +160,7 @@ def decompose(
     ci_method: str = "percentile",
     canonicalise: bool = True,
     disambiguation: "str | callable" = "geometric",
+    canonical_gauge: str = "pt_aligned",
 ) -> DecompositionResult:
     """Single-site Groom-Bailey decomposition with multi-start.
 
@@ -292,6 +295,34 @@ def decompose(
           ``fold(strike_rad, twist_rad, shear_rad) ->
           (strike_rad, twist_rad, shear_rad)``. Returned strikes
           are wrapped to ``[0, 180)`` for reporting.
+
+    canonical_gauge : str, default ``'pt_aligned'``
+        Post-clustering canonical-gauge selection. Decides per
+        band whether to flip to the alternate GB branch (full
+        symmetry: ``strike + 90``, ``-shear``, with the ``(a, b)``
+        swap propagating implicitly via the unchanged measurement-
+        frame regional Z). Operates *after* ``disambiguation``
+        and may put strike outside the disambiguation's chosen
+        range. The rationale is the spurious-spatial-flip risk
+        documented in the :mod:`...symmetries` module docstring's
+        "Caveat about the regional-impedance gauge" section.
+
+        Accepted values:
+
+        - ``'pt_aligned'`` (default): pick the branch whose strike
+          is closest (mod 180°) to the phase-tensor alpha plus 90°
+          (the GB-PT 90° convention offset). Yields a
+          geographically-anchored strike that is stable across
+          neighbouring sites and across runs with different RNG.
+          Requires ``z.phase_tensor.alpha`` to be computable; if
+          not, falls back silently to ``'rms_best'`` and records
+          a metadata note.
+        - ``'magnitude'``: pick the branch with median ``|a| >=
+          |b|`` in strike frame. Method-internal canonical choice.
+        - ``'rms_best'``: no-op; report whichever branch the
+          optimiser-and-clustering chain returned.
+          Backwards-compatibility with the pre-F4 default and
+          useful for debugging.
 
     Returns
     -------
@@ -935,7 +966,59 @@ def decompose(
         "disambiguation": (
             disambiguation if isinstance(disambiguation, str) else "callable"
         ),
+        "canonical_gauge": canonical_gauge,
     }
+
+    # F4: canonical-gauge selection. Decide per band whether to flip
+    # to the alternate GB branch so that the regional-impedance
+    # gauge is deterministic across runs and across neighbouring
+    # sites. The measurement-frame regional Z is invariant; only
+    # (strike, shear) are rewritten, and downstream (a, b)
+    # derivations using the new strike automatically yield the
+    # swapped strike-frame values. See the symmetries.py module
+    # docstring "Caveat about the regional-impedance gauge".
+    if canonical_gauge != "rms_best":
+        pt_alpha_rad_per_period: np.ndarray | None = None
+        if canonical_gauge == "pt_aligned":
+            try:
+                pt_alpha_full_deg = np.asarray(
+                    z.phase_tensor.alpha, dtype=np.float64
+                )[period_mask][sort_idx]
+                pt_alpha_rad_per_period = np.radians(pt_alpha_full_deg)
+            except Exception:
+                # Fall back silently to "rms_best" if PT cannot be
+                # computed; record this in metadata.
+                pt_alpha_rad_per_period = None
+        if (
+            canonical_gauge == "pt_aligned"
+            and pt_alpha_rad_per_period is None
+        ):
+            metadata["canonical_gauge_fallback"] = (
+                "pt_aligned requested but z.phase_tensor.alpha could "
+                "not be computed; gauge left as rms_best for this run"
+            )
+        else:
+            params, flipped_periods = _apply_canonical_gauge_per_band(
+                canonical_gauge=canonical_gauge,
+                bands=bands,
+                parameters=params,
+                regional_z=z_regional_meas,
+                pt_alpha_rad=pt_alpha_rad_per_period,
+            )
+            metadata["canonical_gauge"] = canonical_gauge
+            metadata["canonical_gauge_flipped_period_indices"] = list(
+                flipped_periods
+            )
+            if flipped_periods and realisations > 0:
+                metadata["canonical_gauge_caveat"] = (
+                    "Bootstrap CI bounds were computed in the "
+                    "as-fitted branch and have NOT been re-rotated "
+                    "into the gauge-corrected branch. CI consumers "
+                    "should treat ``strike_ci_*`` / ``shear_ci_*`` "
+                    "as advisory in this configuration. Set "
+                    "canonical_gauge='rms_best' to avoid the "
+                    "asymmetry."
+                )
 
     return DecompositionResult(
         parameters=params,
@@ -968,6 +1051,7 @@ def decompose_joint(
     strike_sharing: str = "per_band_shared",
     mode_clustering: str = "all_sites_agree",
     regional_z_format: str = "dict",
+    canonical_gauge: str = "pt_aligned",
 ) -> DecompositionResult:
     """Multi-site joint Groom-Bailey decomposition (McNeice & Jones, 2001).
 
@@ -1490,7 +1574,53 @@ def decompose_joint(
         "strike_sharing": strike_sharing,
         "mode_clustering": mode_clustering,
         "regional_z_format": regional_z_format,
+        "canonical_gauge": canonical_gauge,
     }
+
+    # F4: canonical-gauge selection (joint variant). The shared
+    # strike per band means a single decision per band flips strike
+    # AND every site's shear simultaneously. Per-site regional Z
+    # (measurement frame) is invariant; downstream (a, b) for each
+    # site are derived using the new strike. See the symmetries.py
+    # module docstring for the architectural rationale.
+    if canonical_gauge != "rms_best":
+        pt_alpha_rad_per_period: np.ndarray | None = None
+        if canonical_gauge == "pt_aligned":
+            pt_alphas = []
+            for _, z in stations:
+                try:
+                    a = np.asarray(z.phase_tensor.alpha, dtype=np.float64)
+                    a_sorted = a[period_mask][sort_idx]
+                    pt_alphas.append(np.radians(a_sorted))
+                except Exception:
+                    pass
+            if pt_alphas:
+                stack = np.stack(pt_alphas, axis=0)
+                with np.errstate(invalid="ignore"):
+                    sin2 = np.median(np.sin(2.0 * stack), axis=0)
+                    cos2 = np.median(np.cos(2.0 * stack), axis=0)
+                pt_alpha_rad_per_period = 0.5 * np.arctan2(sin2, cos2)
+        if (
+            canonical_gauge == "pt_aligned"
+            and pt_alpha_rad_per_period is None
+        ):
+            metadata["canonical_gauge_fallback"] = (
+                "pt_aligned requested but no station's "
+                "z.phase_tensor.alpha could be computed; gauge left "
+                "as rms_best for this run"
+            )
+        else:
+            params, flipped_periods = _apply_canonical_gauge_per_band_joint(
+                canonical_gauge=canonical_gauge,
+                bands=bands,
+                parameters=params,
+                regional_z_per_site=z_regional_per_site,
+                pt_alpha_rad=pt_alpha_rad_per_period,
+            )
+            metadata["canonical_gauge"] = canonical_gauge
+            metadata["canonical_gauge_flipped_period_indices"] = list(
+                flipped_periods
+            )
 
     return DecompositionResult(
         parameters=params,
