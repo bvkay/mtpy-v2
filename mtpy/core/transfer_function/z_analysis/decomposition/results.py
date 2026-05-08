@@ -464,6 +464,110 @@ class JointDecompositionResult:
 
 
 @dataclass
+class MartiResult:
+    """Result of a WAL-invariants / WALDIM dimensionality analysis.
+
+    The Marti tradition (Marti et al. 2004, 2005, 2009, 2010, 2013;
+    Weaver-Agarwal-Lilley 2000) classifies each period of an MT
+    impedance tensor into a dimensionality regime based on the
+    seven WAL rotational invariants ``I_1`` ... ``I_7`` and the
+    auxiliary ``Q``. The classification per Marti et al. (2009)
+    Table 1 distinguishes 1-D, 2-D, 3-D / 2-D-distorted (with
+    several sub-cases), and 3-D regimes via direct sign tests on
+    the invariants against a single user-tunable threshold.
+
+    Attributes
+    ----------
+    periods : ndarray, shape ``(n_periods,)``
+        Periods (seconds), sorted ascending.
+    I1, I2, I3, I4, I5, I6, I7 : ndarray of float
+        The seven WAL invariants per period. ``I_1`` and ``I_2``
+        carry units of ``Z`` (impedance); the rest are
+        dimensionless. See the :mod:`.marti` module docstring for
+        the algebraic definitions and physical interpretation.
+    Q : ndarray of float
+        WAL auxiliary invariant — the denominator in the formula
+        for ``I_7``. Small ``Q`` indicates an ill-defined ``I_7``
+        and is itself a 2-D-versus-3-D-distorted discriminator.
+    dimensionality : ndarray of int
+        Per-period classification:
+
+        * ``0`` — undetermined
+        * ``1`` — 1-D
+        * ``2`` — 2-D
+        * ``3`` — 3-D / 2-D twist-only (Marti 2009 case 3a)
+        * ``4`` — 3-D / 2-D general (Marti 2009 case 4)
+        * ``5`` — 3-D
+        * ``6`` — 3-D / 2-D with diagonal regional tensor
+          (Marti 2009 case 3c)
+        * ``7`` — 3-D / 2-D or 3-D / 1-D-2-D
+          indistinguishable (Marti 2009 case 3b)
+
+    strike_2d_real_rad, strike_2d_imag_rad : ndarray of float
+        Per-period 2-D strike candidates from the in-phase and
+        quadrature Mohr folds (Marti's ``St_3`` and ``St_4``,
+        radians). For pure 2-D periods these agree (within the
+        quadrant ambiguity); divergence is itself a 3-D indicator.
+    strike_3d_2d_rad : ndarray of float
+        Per-period 3-D / 2-D Bahr strike (Marti's ``St_5``,
+        radians) — the rotation that simultaneously satisfies
+        Bahr's equal-phase condition for the in-phase and
+        quadrature parts. Computed by numerical root-finding;
+        ``nan`` where no real solution exists.
+    f1_rad, f2_rad : ndarray of float
+        Smith (1995) distortion-angle linear combinations
+        ``f1 = (twist + shear) / 2`` and
+        ``f2 = (twist - shear) / 2`` (Marti's ``St_6``, ``St_7``,
+        radians). Computed for 2-D and 3-D / 2-D classifications
+        only; ``nan`` otherwise.
+    twist_rad, shear_rad : ndarray of float
+        Smith (1995) distortion angles (Marti's ``St_8``,
+        ``St_9``, radians). Computed for 3-D / 2-D classifications;
+        ``nan`` otherwise.
+    metadata : dict
+        Provenance: ``method``, the threshold used, etc.
+
+    References
+    ----------
+    Marti, A., Queralt, P., Jones, A. G., & Ledo, J. (2005).
+    Improving Bahr's invariant parameters using the WAL approach.
+    Geophysical Journal International, 163, 38-41.
+
+    Marti, A., Queralt, P., & Ledo, J. (2009). WALDIM: A code for
+    the dimensionality analysis of magnetotelluric data using the
+    rotational invariants of the magnetotelluric tensor. Computers
+    & Geosciences, 35, 2295-2303.
+
+    Booker, J. R. (2014). The magnetotelluric phase tensor: a
+    critical review. Surveys in Geophysics, 35, 7-40.
+
+    Weaver, J. T., Agarwal, A. K., & Lilley, F. E. M. (2000).
+    Characterization of the magnetotelluric tensor in terms of
+    its invariants. Geophysical Journal International, 141,
+    321-336.
+    """
+
+    periods: np.ndarray
+    I1: np.ndarray
+    I2: np.ndarray
+    I3: np.ndarray
+    I4: np.ndarray
+    I5: np.ndarray
+    I6: np.ndarray
+    I7: np.ndarray
+    Q: np.ndarray
+    dimensionality: np.ndarray
+    strike_2d_real_rad: np.ndarray
+    strike_2d_imag_rad: np.ndarray
+    strike_3d_2d_rad: np.ndarray
+    f1_rad: np.ndarray
+    f2_rad: np.ndarray
+    twist_rad: np.ndarray
+    shear_rad: np.ndarray
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
 class LilleyResult:
     """Result of a Lilley Mohr-circle distortion analysis.
 

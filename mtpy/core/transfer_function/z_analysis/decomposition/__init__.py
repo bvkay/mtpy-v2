@@ -167,12 +167,14 @@ from .groom_bailey import (  # noqa: F401  -- private helpers re-exported for ba
 )
 from .bibby import decompose_bibby
 from .lilley import decompose_lilley
+from .marti import decompose_marti, wal_invariants, waldim_dimensionality
 from .mcneice_jones import decompose_mcneice_jones
 from .results import (  # noqa: F401  -- private helpers re-exported for backward compatibility
     BibbyResult,
     DecompositionResult,
     JointDecompositionResult,
     LilleyResult,
+    MartiResult,
     _desanitize_station_id,
     _sanitize_station_id,
 )
@@ -194,10 +196,14 @@ __all__ = [
     "DecompositionResult",
     "JointDecompositionResult",
     "LilleyResult",
+    "MartiResult",
     "decompose",
     "decompose_bibby",
     "decompose_each_station",
     "decompose_joint",
     "decompose_lilley",
+    "decompose_marti",
     "decompose_mcneice_jones",
+    "wal_invariants",
+    "waldim_dimensionality",
 ]
