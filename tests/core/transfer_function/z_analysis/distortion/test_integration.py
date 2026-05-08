@@ -55,7 +55,7 @@ from mtpy.core.transfer_function.z_analysis.decomposition import (
     gamma_field,
     irreducible_decomposition,
 )
-from tests.synthetics import (
+from tests.core.transfer_function.z_analysis.distortion.synthetics import (
     _build_regional_z,
     _construct_C_gb89,
     compute_method_accuracy,

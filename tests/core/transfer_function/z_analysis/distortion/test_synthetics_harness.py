@@ -14,7 +14,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from tests.synthetics import (
+from tests.core.transfer_function.z_analysis.distortion.synthetics import (
     compute_method_accuracy,
     generate_synthetic_z,
     run_all_methods_on_synthetic,
