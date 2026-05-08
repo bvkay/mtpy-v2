@@ -166,11 +166,13 @@ from .groom_bailey import (  # noqa: F401  -- private helpers re-exported for ba
     decompose_joint,
 )
 from .bibby import decompose_bibby
+from .lilley import decompose_lilley
 from .mcneice_jones import decompose_mcneice_jones
 from .results import (  # noqa: F401  -- private helpers re-exported for backward compatibility
     BibbyResult,
     DecompositionResult,
     JointDecompositionResult,
+    LilleyResult,
     _desanitize_station_id,
     _sanitize_station_id,
 )
@@ -191,9 +193,11 @@ __all__ = [
     "BibbyResult",
     "DecompositionResult",
     "JointDecompositionResult",
+    "LilleyResult",
     "decompose",
     "decompose_bibby",
     "decompose_each_station",
     "decompose_joint",
+    "decompose_lilley",
     "decompose_mcneice_jones",
 ]

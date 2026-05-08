@@ -464,6 +464,116 @@ class JointDecompositionResult:
 
 
 @dataclass
+class LilleyResult:
+    """Result of a Lilley Mohr-circle distortion analysis.
+
+    The Lilley tradition (Lilley 1976, 1993, 2012, 2016, 2018, 2020)
+    represents an MT impedance tensor parametrically-free as a pair
+    of Mohr circles, one for the in-phase part of ``Z`` and one for
+    the quadrature part. Each circle's centre, radius, and
+    rotational invariants are tensor-axes-rotation-invariant
+    summaries of the underlying physics.
+
+    Convention
+    ----------
+    Throughout this result type the suffix ``_real`` denotes
+    quantities derived from the in-phase part of ``Z`` (Lilley's
+    subscript ``p``), and ``_imag`` denotes the quadrature part
+    (Lilley's subscript ``q``). The 2-D Mohr circle centre is
+    packed into a complex scalar
+    ``c_x + 1j * c_y`` where ``c_x`` is the horizontal axis of the
+    Mohr diagram (``Z'_xy``) and ``c_y`` is the vertical axis
+    (``Z'_xx``). Radii are real positive scalars. See the
+    :mod:`.lilley` module docstring for the algebraic definitions.
+
+    Attributes
+    ----------
+    periods : ndarray, shape ``(n_periods,)``
+        Periods (seconds), sorted ascending.
+    center_real, center_imag : ndarray of complex, shape ``(n_periods,)``
+        Mohr-circle centre per period for the in-phase / quadrature
+        circle, packed as ``c_x + 1j * c_y``.
+    radius_real, radius_imag : ndarray of float, shape ``(n_periods,)``
+        Mohr-circle radius (Lilley's ``C_p`` and ``C_q``) per period.
+    rotation_real_rad, rotation_imag_rad : ndarray of float
+        Per-period rotation angles (radians) that bring the
+        in-phase / quadrature radial arm onto the horizontal axis,
+        which Lilley reads as a 2-D-strike candidate from each
+        circle. Equal to ``-beta / 2`` in Lilley 2018 notation.
+    central_impedance_real, central_impedance_imag : ndarray of float
+        Lilley's ``Z^L_p`` and ``Z^L_q``: the distance from the
+        origin to the circle centre. 1-D scale of the tensor.
+    anisotropy_real_rad, anisotropy_imag_rad : ndarray of float
+        Lilley's ``lambda_p`` and ``lambda_q`` angles (radians):
+        ``arcsin(C / Z^L)``. 2-D-anisotropy measures.
+    threed_real_rad, threed_imag_rad : ndarray of float
+        Lilley's ``mu_p`` and ``mu_q`` angles (radians): the angle
+        at the origin between the circle-centre line and the
+        horizontal axis. Per-part 3-D measures.
+    delta_beta_rad : ndarray of float
+        Lilley's ``delta beta = beta_q - beta_p`` (radians), the
+        angle between the in-phase and quadrature radial arms. The
+        seventh "linking" invariant; near-zero values indicate the
+        Bahr distortion-of-2-D regime.
+    strike_mean_rad, strike_std_rad : ndarray of float
+        Mean and standard deviation of the per-period strike across
+        the noise-stability ensemble (radians). Sites with high
+        ``strike_std_rad`` are unstable in Lilley's
+        noise-stability sense.
+    strike_histograms : list of ndarray
+        One ``(n_realisations,)`` array per period holding the
+        full strike distribution for downstream plotting.
+    dimensionality : list of str
+        One classification per period: ``"1D"``, ``"2D"``,
+        ``"3D-distorted"`` (Bahr 2-D + 3-D galvanic distortion
+        regime), or ``"3D"``.
+    metadata : dict
+        Provenance: ``method``, the dimensionality / noise-stability
+        thresholds used, RNG seed, etc.
+
+    References
+    ----------
+    Lilley, F. E. M. (1976). Diagrams for magnetotelluric data.
+    Geophysics, 41(4), 766-770.
+
+    Lilley, F. E. M. (1993). Magnetotelluric analysis using Mohr
+    circles. Geophysics, 58(10), 1498-1506.
+
+    Lilley, F. E. M. (2012). Magnetotelluric tensor decomposition:
+    insights from linear algebra and Mohr diagrams. In *New
+    Achievements in Geoscience*.
+
+    Lilley, F. E. M. (2016). The distortion tensor of
+    magnetotellurics: a tutorial on some properties. Exploration
+    Geophysics, 47(2), 85-99.
+
+    Lilley, F. E. M. (2018). The magnetotelluric tensor: improved
+    invariants for its decomposition, especially the 7th.
+    Exploration Geophysics, 49(5), 622-636.
+    """
+
+    periods: np.ndarray
+    center_real: np.ndarray
+    center_imag: np.ndarray
+    radius_real: np.ndarray
+    radius_imag: np.ndarray
+    rotation_real_rad: np.ndarray
+    rotation_imag_rad: np.ndarray
+    central_impedance_real: np.ndarray
+    central_impedance_imag: np.ndarray
+    anisotropy_real_rad: np.ndarray
+    anisotropy_imag_rad: np.ndarray
+    threed_real_rad: np.ndarray
+    threed_imag_rad: np.ndarray
+    delta_beta_rad: np.ndarray
+    strike_mean_rad: np.ndarray
+    strike_std_rad: np.ndarray
+    strike_histograms: list[np.ndarray] = field(default_factory=list)
+    dimensionality: list[str] = field(default_factory=list)
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
 class BibbyResult:
     """Result of a Bibby-Caldwell-Brown decomposition.
 
