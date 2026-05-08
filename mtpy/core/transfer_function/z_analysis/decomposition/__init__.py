@@ -236,6 +236,12 @@ from .gomez_trevino import (
     series_parallel_resistivities,
 )
 from .lilley import decompose_lilley
+from .magnetic_distortion_diagnostic import (
+    compute_magnetic_distortion_flag,
+    frequency_dependence_diagnostic,
+    method_inconsistency_diagnostic,
+    tipper_diagnostic,
+)
 from .marti import decompose_marti, wal_invariants, waldim_dimensionality
 from .mcneice_jones import decompose_mcneice_jones
 from .results import (  # noqa: F401  -- private helpers re-exported for backward compatibility
@@ -245,6 +251,7 @@ from .results import (  # noqa: F401  -- private helpers re-exported for backwar
     GomezTrevinoResult,
     JointDecompositionResult,
     LilleyResult,
+    MagneticDistortionFlag,
     MartiResult,
     _desanitize_station_id,
     _sanitize_station_id,
@@ -269,8 +276,10 @@ __all__ = [
     "GomezTrevinoResult",
     "JointDecompositionResult",
     "LilleyResult",
+    "MagneticDistortionFlag",
     "MartiResult",
     "complex_to_gamma",
+    "compute_magnetic_distortion_flag",
     "decompose",
     "decompose_bibby",
     "decompose_each_station",
@@ -281,14 +290,17 @@ __all__ = [
     "decompose_marti",
     "decompose_mcneice_jones",
     "determinant_resistivity",
+    "frequency_dependence_diagnostic",
     "gamma_field",
     "gamma_magnitude",
     "gamma_to_complex",
     "invariant_resistivities",
     "irreducible_decomposition",
     "iterative_chain",
+    "method_inconsistency_diagnostic",
     "principal_axis",
     "series_parallel_resistivities",
+    "tipper_diagnostic",
     "wal_invariants",
     "waldim_dimensionality",
 ]

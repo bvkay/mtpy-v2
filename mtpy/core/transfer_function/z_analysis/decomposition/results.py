@@ -900,6 +900,92 @@ class GomezTrevinoResult:
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
+@dataclass
+class MagneticDistortionFlag:
+    """Heuristic per-site flag for *suspected* magnetic galvanic
+    distortion.
+
+    .. warning::
+
+        **This is a heuristic flag, not a quantitative
+        correction.** A flag does *not* prove magnetic distortion
+        is present at the site; it indicates the standard MT
+        decomposition assumption (magnetic galvanic distortion is
+        negligible) may be violated. Two intended uses:
+
+        1. Exclude flagged sites from continental aggregation, OR
+        2. Annotate flagged sites in summary plots.
+
+        Do **not** use the flag to "correct" individual-site
+        analyses. Magnetic distortion handling is Paper 6 territory
+        (Bayesian inversion with explicit ``Q_h``, ``Q_z`` priors
+        per Garcia, Boerner & Pedersen 2003 and Chave & Smith 1994);
+        a follow-up PR will integrate that.
+
+    Three diagnostics combine into a single overall flag:
+
+    * **Tipper-based** (:func:`...magnetic_distortion_diagnostic.tipper_diagnostic`)
+      — anomalously large or strongly frequency-dependent vertical
+      magnetic transfer function magnitude. The Garcia 2003 paper
+      shows this manifests at intermediate periods.
+    * **Frequency dependence of C** (:func:`...frequency_dependence_diagnostic`)
+      — recovered ``C`` tensor varies across bands more than a
+      static-galvanic model can explain.
+    * **Cross-method inconsistency**
+      (:func:`...method_inconsistency_diagnostic`)
+      — GB / MJ (E-field-only distortion) disagrees with
+      Garcia-Jones (3-D regional) on regional ``Z`` recovery.
+
+    Flag combination rule:
+
+    * ``"high_risk"``: 2 or more diagnostics flag, *or* peak
+      tipper magnitude exceeds the strong-tipper override
+      threshold (default 0.5).
+    * ``"moderate_risk"``: exactly one diagnostic flags.
+    * ``"low_risk"``: zero diagnostics flag.
+    * ``"indeterminate"``: insufficient data (e.g. no Tipper
+      available, fewer than 3 bands for the frequency-dependence
+      diagnostic, no cross-method input).
+
+    Fields
+    ------
+    site : str
+        Identifier for the source site.
+    overall_flag : str
+        One of ``"low_risk"``, ``"moderate_risk"``, ``"high_risk"``,
+        ``"indeterminate"``.
+    tipper_diagnostic : dict
+        Per-diagnostic detail (see :func:`...tipper_diagnostic`).
+        ``None`` when Tipper data is unavailable.
+    frequency_dependence_diagnostic : dict
+        Per-diagnostic detail. ``None`` when fewer than 3 bands
+        of recovered ``C`` are supplied.
+    method_inconsistency_diagnostic : dict
+        Per-diagnostic detail. ``None`` when no cross-method
+        comparison is supplied.
+    contributing_factors : list of str
+        Human-readable list of which diagnostics contributed to a
+        non-low-risk flag (or the reasons for ``indeterminate``).
+
+    References
+    ----------
+    Chave, A. D., & Smith, J. T. (1994). On electric and magnetic
+    galvanic distortion tensor decompositions. *Journal of
+    Geophysical Research* 99(B3), 4669-4682.
+
+    Garcia, X., Boerner, D., & Pedersen, L. B. (2003). Electric and
+    magnetic galvanic distortion decomposition of tensor CSAMT
+    data. *Geophysical Journal International* 154, 957-969.
+    """
+
+    site: str
+    overall_flag: str
+    tipper_diagnostic: dict[str, Any] | None = None
+    frequency_dependence_diagnostic: dict[str, Any] | None = None
+    method_inconsistency_diagnostic: dict[str, Any] | None = None
+    contributing_factors: list[str] = field(default_factory=list)
+
+
 def _swap_off_diagonals(z_obj: "Z") -> "Z":
     """Return a fresh :class:`Z` with ``Z_xy`` and ``Z_yx`` swapped.
 

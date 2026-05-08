@@ -168,6 +168,43 @@ opt-in skipped.
   2775 lines (down from 3681 at the start of the refactor — −906
   / −25 %).
 
+### New diagnostics
+- **Magnetic-galvanic-distortion heuristic flag**
+  (:mod:`...magnetic_distortion_diagnostic`,
+  :func:`compute_magnetic_distortion_flag`,
+  :class:`MagneticDistortionFlag`). Flags sites where the standard
+  MT decomposition's magnetic-distortion-negligible assumption may
+  break down (Garcia, Boerner & Pedersen 2003; Chave & Smith 1994).
+  Three sub-diagnostics combine into a single per-site flag
+  (``low_risk`` / ``moderate_risk`` / ``high_risk`` /
+  ``indeterminate``):
+
+  1. ``tipper_diagnostic`` — anomalous Tipper magnitude / strong
+     band-to-band frequency dependence.
+  2. ``frequency_dependence_diagnostic`` — coefficient of
+     variation of the recovered ``C`` tensor across bands above
+     threshold.
+  3. ``method_inconsistency_diagnostic`` — strike or |Z_TE|
+     disagreement between methods (e.g. GB vs GJ).
+
+  Combination rule: 2 or more diagnostics flag, *or* peak Tipper
+  amplitude exceeds the strong-override threshold (default 0.5),
+  yields ``high_risk``; exactly one diagnostic flagging yields
+  ``moderate_risk``; zero yields ``low_risk``; insufficient input
+  data yields ``indeterminate``. Thresholds are configurable via
+  keyword arguments and exposed as module-level constants for
+  researcher tuning.
+
+  **Heuristic, not corrective.** A flag does not prove magnetic
+  distortion is present; it indicates the assumption may be
+  violated. Intended use: exclude or annotate flagged sites in
+  continental aggregation. Quantitative magnetic-distortion
+  handling (Bayesian inversion with explicit ``Q_h``, ``Q_z``
+  priors) is Paper 6 territory and a future PR. The
+  heuristic-not-corrective scope is documented in three places:
+  the module docstring, the ``MagneticDistortionFlag`` dataclass
+  docstring, and this entry.
+
 ### New (exploratory) modules
 Modules added for *exploration* — algebra and rotational-invariance
 properties verified by unit tests, but not benchmarked against
