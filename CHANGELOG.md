@@ -118,6 +118,51 @@ the same API.
   recovery accuracy. Used for cross-method validation.
 - **CHANGELOG.md** (this file).
 
+### Refactoring
+Architectural cleanup of the decomposition package after the
+multi-method landings, focused on shrinking ``groom_bailey.py``
+back to GB-specific concerns and extracting the genuinely
+method-agnostic plumbing into ``common.py``. ``groom_bailey.py``
+shrunk from 3681 lines to 3337 lines (−344, ~9%) across these
+moves; no behavioural changes — full decomposition test suite
+remains 280 passing / 6 pre-existing netCDF failures / 2 slow-
+opt-in skipped.
+
+- **Method-agnostic plumbing moved to ``common.py``** (commit
+  `fce7576`): ``_perturbed_initial_guess`` (bound-clipped Gaussian
+  perturbation of an initial guess), ``_resample_residuals``
+  (parametric bootstrap noise generator), and
+  ``_compute_ci_percentile`` (NaN- and complex-aware percentile
+  CI). New ``tests/.../distortion/test_common.py`` with 14 unit
+  tests covering each function's contract.
+- **Joint multi-site orchestration moved to ``common.py`` with
+  factory injection** (commit `592ccaf`): ``_solve_band_joint``,
+  ``_solve_band_joint_multistart``,
+  ``_generate_starting_points_joint``, and
+  ``_decompose_bands_with_modes_joint``. The orchestrators accept
+  GB-specific helpers (``_objfun_joint``, ``_build_bounds_joint``,
+  ``_canonical_initial_guess_joint``, ``_rotated_initial_guess_joint``)
+  as required keyword-only factory callables; both
+  ``groom_bailey.py`` and ``mcneice_jones.py`` consume the same
+  generic orchestrator and pass GB's joint helpers as the
+  factories. The smell that prompted the cleanup —
+  ``mcneice_jones.py`` reaching into ``groom_bailey.py``'s
+  ``_solve_band_joint_multistart`` (peer module's private
+  orchestration) — is gone.
+- **Test layout** (commit `0681f3a`): every per-method test file
+  (and ``tests/synthetics.py``) relocated under
+  ``tests/core/transfer_function/z_analysis/distortion/``,
+  matching the source layout of the decomposition package.
+  ``__init__.py`` files added at intermediate levels so the test
+  modules are importable.
+
+Open architectural item: ``mcneice_jones.py`` still imports the
+four GB joint factory callables from ``groom_bailey.py``. The
+peer-into-private-orchestration smell is fully resolved (those
+were the architectural concern), but a follow-up could re-locate
+or re-export the GB joint helpers if the import is still
+considered undesirable.
+
 ### Tests
 - All decomposition test suites pass: GB single-site, MJ joint,
   BCB, Lilley, Marti, Garcia-Jones, disambiguation, alternate-
