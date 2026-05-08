@@ -73,12 +73,22 @@ the same API.
 - **CHANGELOG.md** (this file).
 
 ### Tests
-- 262 pass across the GB / MJ / disambiguation / alternate-branch
-  suites. The 6 `TestDecompositionResultNetcdf` failures pre-date
+- 242 pass by default across the GB / MJ / BCB / disambiguation /
+  alternate-branch suites; 2 opt-in slow validations skip
+  cleanly. The 6 `TestDecompositionResultNetcdf` failures pre-date
   this branch (a netCDF4 library limitation around boolean
   attributes) and are unrelated to the refactor.
 - New test files: `tests/test_disambiguation.py`,
-  `tests/test_alternate_branch.py`.
+  `tests/test_alternate_branch.py`, `tests/test_bibby.py`,
+  `tests/test_mcneice_jones.py`,
+  `tests/test_mj_bc87_validation.py`.
+
+### Documentation
+- `docs/decomposition_validation.md` records the validation
+  strategy for each method and what is and is not validated
+  against published results. The BC87 strike-magnitude
+  comparison against McNeice & Jones (2001) Figure 12 is
+  explicitly Phase-2 work.
 
 ### Planned
 - Implement Bahr (1991) decomposition and dimensionality classifier.
@@ -91,3 +101,8 @@ the same API.
 - Resolve the pre-existing `TestDecompositionResultNetcdf` failures
   by switching boolean metadata attributes to `int8` at the NetCDF
   boundary.
+- Investigate the BC87 LIT-line strike discrepancy
+  (`test_mj_bc87_strike_recovery` finds ~5° in the geometric-fold
+  convention vs Fig 12's ~25–40°). Likely follow-ups: per-period
+  narrow-band fits, higher `n_starts`, side-by-side run against
+  the original McNeice-Jones Fortran on the same EDIs.
