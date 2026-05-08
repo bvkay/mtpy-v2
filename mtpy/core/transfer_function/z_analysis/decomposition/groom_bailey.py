@@ -65,9 +65,12 @@ from scipy.optimize import least_squares
 from .common import (
     _BandResult,
     _band_arrays_to_z,
+    _compute_ci_percentile,
     _estim_imp,
     _extract_bands,
     _normalise_collection_input,
+    _perturbed_initial_guess,
+    _resample_residuals,
     _unpack_x,
     _unpack_x_joint,
     _validate_joint_input,
@@ -2192,40 +2195,6 @@ def _rotated_initial_guess(
 
     return rotated
 
-def _perturbed_initial_guess(
-    canonical_x0: np.ndarray,
-    lower: np.ndarray,
-    upper: np.ndarray,
-    rng: np.random.Generator,
-    perturbation_scale: float = 0.1,
-) -> np.ndarray:
-    """Random Gaussian perturbation of a canonical initial guess.
-
-    Each parameter is perturbed by a Gaussian with standard
-    deviation ``perturbation_scale * (upper - lower)`` for that
-    parameter, then clipped to the bounds so scipy's TRF accepts
-    the start.
-
-    Parameters
-    ----------
-    canonical_x0 : (n_params,) float64
-    lower, upper : (n_params,) float64
-    rng : np.random.Generator
-    perturbation_scale : float, default 0.1
-        Standard deviation of the Gaussian perturbation as a
-        fraction of the bound width per parameter.
-
-    Returns
-    -------
-    x0 : (n_params,) float64
-        Perturbed and clipped.
-    """
-    bound_widths = upper - lower
-    sigma_per_param = perturbation_scale * bound_widths
-    perturbation = rng.normal(scale=sigma_per_param)
-    x0 = canonical_x0 + perturbation
-    return np.clip(x0, lower, upper)
-
 def _generate_starting_points(
     z_obs: np.ndarray,
     sigma: np.ndarray,
@@ -2525,61 +2494,6 @@ def _build_per_mode_parameters_dataset(
     )
     return ds
 
-def _resample_residuals(
-    z_obs: np.ndarray,
-    sigma: np.ndarray,
-    z_predicted: np.ndarray,
-    rng: np.random.Generator,
-) -> np.ndarray:
-    """Generate one parametric bootstrap replica.
-
-    For each tensor component (i,j) at each frequency k, draw real
-    and imaginary noise independently from N(0, sigma[k,i,j]^2) and
-    add to ``z_predicted[k,i,j]``. The result is a synthetic observed
-    tensor that, under the GB89 model with the noise assumption,
-    would have been a plausible observation.
-
-    Parameters
-    ----------
-    z_obs : (n_freqs, 2, 2) complex128
-        Original observed tensor. Used only for shape validation.
-    sigma : (n_freqs, 2, 2) float64
-        Per-component standard errors.
-    z_predicted : (n_freqs, 2, 2) complex128
-        Model-predicted tensor at the primary-mode parameters. The
-        bootstrap is around this, not around z_obs.
-    rng : np.random.Generator
-
-    Returns
-    -------
-    z_replica : (n_freqs, 2, 2) complex128
-
-    Notes
-    -----
-    The noise model assumes real and imaginary parts of each tensor
-    component are independent, both N(0, sigma^2). This matches the
-    convention used by :func:`_objfun` and :func:`_calc_error`
-    (which weight real and imaginary residuals each by sigma).
-
-    The bootstrap is around ``z_predicted``, not ``z_obs``: we are
-    asking "if the GB89 model is correct, what would observations
-    look like under repeated sampling at this noise level?". This
-    is parametric bootstrap; nonparametric bootstrap (e.g. resample
-    frequencies) is a different operation not implemented here.
-    """
-    if z_obs.shape != sigma.shape or z_obs.shape != z_predicted.shape:
-        raise ValueError(
-            f"_resample_residuals: shape mismatch — z_obs "
-            f"{z_obs.shape}, sigma {sigma.shape}, z_predicted "
-            f"{z_predicted.shape}"
-        )
-    if np.any(sigma <= 0):
-        raise ValueError("_resample_residuals: sigma contains non-positive entries")
-
-    real_noise = rng.normal(scale=sigma)
-    imag_noise = rng.normal(scale=sigma)
-    return z_predicted + real_noise + 1j * imag_noise
-
 def _predict_z_from_primary_modes(
     band_modes_list: list[tuple[np.ndarray, list[_Mode]]],
     selected_periods: np.ndarray,
@@ -2653,65 +2567,6 @@ def _predict_z_from_primary_modes(
             "by any band's primary mode prediction"
         )
     return z_predicted
-
-def _compute_ci_percentile(
-    replicates: np.ndarray,
-    level: float = 0.95,
-    axis: int = 0,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Percentile-based confidence interval from bootstrap replicates.
-
-    Computes the empirical CI as the (alpha/2, 1-alpha/2) percentiles
-    of the replicate distribution along ``axis``, where
-    ``alpha = 1 - level``. NaN-aware via :func:`numpy.nanpercentile`.
-
-    Complex-valued replicates produce complex CI bounds whose real
-    and imaginary parts are computed independently from the real and
-    imaginary parts of the replicate.
-
-    Parameters
-    ----------
-    replicates : ndarray
-    level : float, default 0.95
-    axis : int, default 0
-
-    Returns
-    -------
-    lower, upper : ndarray
-        Same shape as ``replicates`` with ``axis`` removed.
-
-    Notes
-    -----
-    Percentile bootstrap is appropriate when the replicate
-    distribution is roughly symmetric. For skewed distributions, BCa
-    is preferred but is not implemented in this session.
-
-    Coverage is approximately ``level`` in large samples for unbiased
-    estimators with symmetric error distributions. For small samples
-    or skewed distributions, actual coverage may differ from nominal.
-    """
-    if not 0 < level < 1:
-        raise ValueError(
-            f"_compute_ci_percentile: level must be in (0, 1), " f"got {level}"
-        )
-
-    alpha = 1 - level
-    lower_pct = 100 * (alpha / 2)
-    upper_pct = 100 * (1 - alpha / 2)
-
-    if np.iscomplexobj(replicates):
-        real_lower = np.nanpercentile(replicates.real, lower_pct, axis=axis)
-        real_upper = np.nanpercentile(replicates.real, upper_pct, axis=axis)
-        imag_lower = np.nanpercentile(replicates.imag, lower_pct, axis=axis)
-        imag_upper = np.nanpercentile(replicates.imag, upper_pct, axis=axis)
-        return (
-            real_lower + 1j * imag_lower,
-            real_upper + 1j * imag_upper,
-        )
-    return (
-        np.nanpercentile(replicates, lower_pct, axis=axis),
-        np.nanpercentile(replicates, upper_pct, axis=axis),
-    )
 
 def _bootstrap_decompose(
     z_obs_full: np.ndarray,
