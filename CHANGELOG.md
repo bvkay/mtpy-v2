@@ -168,6 +168,36 @@ opt-in skipped.
   2775 lines (down from 3681 at the start of the refactor — −906
   / −25 %).
 
+### New (exploratory) modules
+Modules added for *exploration* — algebra and rotational-invariance
+properties verified by unit tests, but not benchmarked against
+forward-modelled 3-D synthetic data or real-data ground truth.
+Treat outputs as diagnostic, not as production-quality apparent-
+resistivity / decomposition estimates, until a follow-up
+benchmarking PR.
+
+- **Gomez-Treviño 2018 rotational-invariant TE / TM resistivities**
+  (:mod:`...gomez_trevino`,
+  :func:`decompose_gomez_trevino`,
+  :class:`GomezTrevinoResult`). Constructs the series and parallel
+  resistivities ``rho_s = trace(Z^T Z) / (2 omega mu_0)``,
+  ``rho_p = 2 / (omega mu_0 trace(Y^T Y))`` and pulls the invariant
+  TE / TM analogues ``rho_+`` / ``rho_-`` out of the symmetric
+  quadratic ``lambda² − 2 rho_s lambda + rho_s rho_p = 0``. Also
+  exposes the iterative ``(arithmetic, harmonic) mean`` chain whose
+  geometric-mean limit is the determinant resistivity (Gomez-
+  Treviño 2018, fig. 1). 19 unit tests in
+  ``tests/.../distortion/test_gomez_trevino.py`` lock in the 1-D
+  reduction (``rho_s = rho_p``, ``rho_+ = rho_- = rho_d``), the
+  explicit 2-D reduction to TE / TM, rotational invariance under
+  measurement-axis rotation (with and without galvanic distortion),
+  the chain's convergence to ``rho_d``, and the geometric-mean
+  invariant ``rho_+ · rho_-`` preserved at every chain step. The
+  framework's general 3-D interpretation — and the assignment of
+  ``+`` / ``−`` to TE vs TM — is *not* validated and is left to a
+  benchmarking follow-up. Marked exploratory in three places:
+  module docstring, dataclass docstring, this entry.
+
 ### Tests
 - All decomposition test suites pass: GB single-site, MJ joint,
   BCB, Lilley, Marti, Garcia-Jones, disambiguation, alternate-

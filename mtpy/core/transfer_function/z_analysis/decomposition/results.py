@@ -825,6 +825,81 @@ class BibbyResult:
     gauge: str = "diagonal_unity"
 
 
+@dataclass
+class GomezTrevinoResult:
+    """Rotational-invariant TE / TM resistivities (Gomez-Treviño 2018).
+
+    .. note::
+
+        **Exploratory module.** The Gomez-Treviño 2018 framework
+        constructs two rotational-invariant complex resistivities
+        ``rho_s`` (series) and ``rho_p`` (parallel) from the
+        impedance tensor and pulls invariant TE / TM analogues
+        ``rho_+`` and ``rho_-`` out of a quadratic. In 2-D
+        (anti-diagonal strike-frame ``Z``) the framework
+        demonstrably reduces to the standard TE / TM apparent
+        resistivities (verified by tests). The framework's
+        usefulness for general 3-D data has not been independently
+        validated in the literature; treat the per-period
+        ``rho_+`` / ``rho_-`` outputs as exploratory / diagnostic
+        rather than production-quality apparent-resistivity
+        estimates.
+
+    Fields
+    ------
+    site : str
+        Identifier for the source ``Z``. Optional; defaults to
+        ``""`` when the entry point isn't passed a station id.
+    periods : ndarray, shape ``(n_periods,)``
+        Periods (seconds), sorted ascending.
+    rho_s, rho_p : ndarray of complex
+        Series and parallel resistivities (Gomez-Treviño eq.
+        ``rho_s = trace(Z^T Z)/(2 omega mu_0)``,
+        ``rho_p = 2/(omega mu_0 trace(Y^T Y))`` with ``Y = Z^{-1}``).
+        Per period.
+    rho_plus, rho_minus : ndarray of float
+        Magnitudes ``|rho_pm|`` of the quadratic-equation
+        solutions ``rho_s ± sqrt(rho_s² − rho_s · rho_p)``. The
+        ``+`` / ``−`` labels are purely mathematical; the mode
+        assignment to TE vs TM is *ambiguous* in 3-D and even in
+        2-D depends on the strike convention.
+    phi_plus, phi_minus : ndarray of float
+        Phases ``arg(rho_pm)`` (radians) of the quadratic solutions.
+    rho_d : ndarray of float
+        Magnitude of the determinant resistivity
+        ``sqrt(rho_s · rho_p) = sqrt(rho_+ · rho_-)`` — the
+        Berdichevsky-Dmitriev (1976) invariant up to a 90° phase
+        convention. Included for direct comparison.
+    phi_d : ndarray of float
+        Phase ``arg(sqrt(rho_s · rho_p))`` (radians).
+    convergence_iterations : ndarray of int, optional
+        For the iterative ``arithmetic / harmonic mean`` chain
+        described in :func:`...gomez_trevino.iterative_chain`,
+        the iteration count to convergence per period. ``None``
+        when ``decompose`` is called without the chain option.
+
+    References
+    ----------
+    Gómez-Treviño, E., Esparza, F. J., & Romo, J. M. (2018). On
+    the use of two new invariants of the magnetotelluric impedance
+    tensor as natural rotational invariant TE and TM modes. Earth,
+    Planets and Space, 70:35. doi:10.1186/s40623-018-0900-y
+    """
+
+    site: str
+    periods: np.ndarray
+    rho_s: np.ndarray
+    rho_p: np.ndarray
+    rho_plus: np.ndarray
+    rho_minus: np.ndarray
+    phi_plus: np.ndarray
+    phi_minus: np.ndarray
+    rho_d: np.ndarray
+    phi_d: np.ndarray
+    convergence_iterations: np.ndarray | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
 def _swap_off_diagonals(z_obj: "Z") -> "Z":
     """Return a fresh :class:`Z` with ``Z_xy`` and ``Z_yx`` swapped.
 

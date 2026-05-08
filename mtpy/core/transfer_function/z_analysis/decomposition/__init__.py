@@ -228,6 +228,13 @@ from .distortion_geometry import (
     principal_axis,
 )
 from .garcia_jones import decompose_garcia_jones
+from .gomez_trevino import (
+    decompose_gomez_trevino,
+    determinant_resistivity,
+    invariant_resistivities,
+    iterative_chain,
+    series_parallel_resistivities,
+)
 from .lilley import decompose_lilley
 from .marti import decompose_marti, wal_invariants, waldim_dimensionality
 from .mcneice_jones import decompose_mcneice_jones
@@ -235,6 +242,7 @@ from .results import (  # noqa: F401  -- private helpers re-exported for backwar
     BibbyResult,
     DecompositionResult,
     GarciaJonesResult,
+    GomezTrevinoResult,
     JointDecompositionResult,
     LilleyResult,
     MartiResult,
@@ -258,6 +266,7 @@ __all__ = [
     "BibbyResult",
     "DecompositionResult",
     "GarciaJonesResult",
+    "GomezTrevinoResult",
     "JointDecompositionResult",
     "LilleyResult",
     "MartiResult",
@@ -266,15 +275,20 @@ __all__ = [
     "decompose_bibby",
     "decompose_each_station",
     "decompose_garcia_jones",
+    "decompose_gomez_trevino",
     "decompose_joint",
     "decompose_lilley",
     "decompose_marti",
     "decompose_mcneice_jones",
+    "determinant_resistivity",
     "gamma_field",
     "gamma_magnitude",
     "gamma_to_complex",
+    "invariant_resistivities",
     "irreducible_decomposition",
+    "iterative_chain",
     "principal_axis",
+    "series_parallel_resistivities",
     "wal_invariants",
     "waldim_dimensionality",
 ]
