@@ -1498,12 +1498,21 @@ class ObservableTable:
         ds.attrs["__schema_version"] = "1"
 
         # Metadata: scalars direct, lists/dicts JSON-encoded.
+        # netCDF4 attribute types are restricted to numeric +
+        # string; Python ``bool`` is rejected even though it
+        # subclasses ``int``. Coerce ``bool`` to ``int`` (0 / 1)
+        # explicitly so the round-trip survives. The original
+        # bool-ness is recovered on read by the metadata-key
+        # convention (``parallel`` etc. are documented as bool).
         for key, val in (self.metadata or {}).items():
             if val is None:
                 continue
-            if isinstance(val, (str, int, float, bool, np.integer, np.floating)):
-                # Native scalar.
-                ds.attrs[key] = val if not isinstance(val, np.generic) else val.item()
+            if isinstance(val, bool):
+                ds.attrs[key] = int(val)
+            elif isinstance(val, (str, int, float, np.integer, np.floating)):
+                ds.attrs[key] = (
+                    val if not isinstance(val, np.generic) else val.item()
+                )
             else:
                 ds.attrs[f"{key}__json"] = json.dumps(
                     val, default=_json_serialise_numpy

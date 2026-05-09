@@ -14,6 +14,65 @@ traditions in MT, and lays the groundwork for adding
 non-Groom-Bailey methods (Bahr, WAL, Lilley, García & Jones) under
 the same API.
 
+### Bootstrap CIs in compute_site_observables
+- **Parametric bootstrap promoted from Phase-2 deferred to
+  Phase-1 enabled**
+  (:func:`compute_site_observables(bootstrap_n_replicates=N)`,
+  :func:`compute_collection_observables(parallel=True)`,
+  :data:`BOOTSTRAP_OBSERVABLES`). Each replicate adds independent
+  Gaussian noise to ``mt_object.Z`` (σ per component =
+  ``z.z_error / √2``) and re-runs the full per-site pipeline (GB
+  + BCB + Lilley + Marti + Gomez-Treviño + PT + cross-method
+  disagreement); per-replicate values are aggregated to per-band
+  5 / 50 / 95 percentiles. Default ``bootstrap_n_replicates=0``
+  preserves backward-compatible behaviour.
+
+  Schema gains 30 CI columns —
+  ``<obs>_p05``, ``<obs>_p50``, ``<obs>_p95`` for each of the 10
+  primary observables in :data:`BOOTSTRAP_OBSERVABLES` (strike,
+  twist, shear, |C-I|_F, gamma_magnitude,
+  gamma_magnitude_periodwise, PT_alpha, PT_beta, PT_abs_beta,
+  PT_ellipticity). Columns are ``NaN`` when the bootstrap was
+  not run (``bootstrap_n_replicates=0``).
+
+  ``discordance_significance`` is now a real signal-to-noise
+  ratio (``mean(disc) / std(disc, ddof=1)`` across replicates),
+  replacing the prior ``NaN`` placeholder.
+
+  ``compute_collection_observables`` gains a ``parallel=False``
+  kwarg that distributes the per-site pipeline across worker
+  processes via :class:`multiprocessing.Pool`. Sites are reduced
+  to raw-array payloads before being sent to workers (``Z``
+  instances hold ``loguru`` references that don't pickle under
+  some test runners). Per-site bootstrap RNG is seeded from a
+  stable hash of the station id + the global seed, so sequential
+  and parallel runs produce *bit-identical* tables.
+
+  ``spatial_coherence.compute_coherence`` now consumes the
+  ``<obs>_p05`` / ``<obs>_p95`` columns directly: the
+  bootstrap-variance reference is the median half-width across
+  rows. The inter-band-variance fallback warning fires only when
+  the CI columns are absent (``bootstrap_n_replicates=0``); the
+  documented Phase-1 transition is to run with bootstrap > 0 by
+  default on production AusLAMP runs.
+
+  Approximate AusLAMP-scale runtimes (1353 sites, 6 default
+  bands, ``n_starts=5``, on a 16-core workstation):
+
+  * ``bootstrap_n_replicates=0`` — ~ 5 minutes sequential.
+  * ``bootstrap_n_replicates=50, parallel=True`` —
+    ~ 1.5 hours.
+  * ``bootstrap_n_replicates=50, parallel=False`` —
+    ~ 19 hours (don't).
+
+  Five new tests in
+  ``tests/.../distortion/test_continental_observables.py``:
+  the regression check at N=0; the CI-population check at N=20
+  on a low-noise synthetic; the noise-widening check (aggregate
+  spread grows with noise); the spatial-coherence
+  warning-suppression check; and the parallel /
+  sequential bit-identical equivalence check.
+
 ### Dependency removed
 - **``pyarrow`` is no longer referenced** by ``ObservableTable``.
   ``to_parquet`` / ``from_parquet`` have been replaced with

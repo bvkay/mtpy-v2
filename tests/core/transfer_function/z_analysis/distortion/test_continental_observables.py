@@ -732,6 +732,341 @@ def test_gamma_magnitude_periodwise_in_table_and_distinguishable():
 
 
 # ---------------------------------------------------------------------------
+# Bootstrap CIs (parametric, full-pipeline)
+# ---------------------------------------------------------------------------
+
+
+def test_bootstrap_n_replicates_zero_matches_no_bootstrap():
+    """``bootstrap_n_replicates=0`` produces the same table as the
+    default kwarg-less call (regression — backward compatibility).
+    """
+    periods = _make_periods()
+    syn = generate_synthetic_z(
+        regional_type="2D",
+        distortion_strength="weak",
+        distortion_shear="low",
+        noise_level="clean",
+        periods=periods,
+        site_id="REG01",
+        seed=42,
+    )
+    mt = _make_mt(syn["z_obj"], station="REG01")
+    bands = _restricted_bands()
+
+    table_default = compute_collection_observables(
+        [mt], period_bands=bands, n_starts=3, seed=42,
+    )
+    table_explicit = compute_collection_observables(
+        [mt], period_bands=bands, n_starts=3, seed=42,
+        bootstrap_n_replicates=0,
+    )
+    pd.testing.assert_frame_equal(
+        table_default.dataframe, table_explicit.dataframe
+    )
+    # Bootstrap CI columns exist but are all-NaN with N=0.
+    for col in table_default.dataframe.columns:
+        if col.endswith(("_p05", "_p50", "_p95")):
+            arr = pd.to_numeric(
+                table_default.dataframe[col], errors="coerce"
+            ).to_numpy()
+            assert np.all(np.isnan(arr)), (
+                f"column {col} should be all-NaN with "
+                f"bootstrap_n_replicates=0; first non-NaN at index "
+                f"{int(np.argwhere(~np.isnan(arr))[0][0])}"
+                if not np.all(np.isnan(arr)) else ""
+            )
+
+
+def test_bootstrap_populates_ci_columns_for_low_noise_synthetic():
+    """``bootstrap_n_replicates > 0`` populates all 30 CI columns.
+    For a clean low-noise synthetic, ``p95 - p05`` is small relative
+    to ``p50`` for magnitudes and small in absolute terms for
+    angles — the bootstrap correctly reflects the well-conditioned
+    inverse problem.
+    """
+    from mtpy.core.transfer_function.z_analysis.decomposition.continental_observables import (
+        BOOTSTRAP_OBSERVABLES,
+    )
+
+    periods = _make_periods()
+    syn = generate_synthetic_z(
+        regional_type="2D",
+        distortion_strength="weak",
+        distortion_shear="low",
+        noise_level="low",  # ~1% noise — small but non-zero
+        periods=periods,
+        site_id="BOOT_LOW",
+        seed=42,
+    )
+    mt = _make_mt(syn["z_obj"], station="BOOT_LOW")
+    band = {
+        "label": "1s_100s", "period_min": 1.0, "period_max": 100.0
+    }
+    obs = compute_site_observables(
+        mt, period_bands=[band], n_starts=2, seed=42,
+        bootstrap_n_replicates=20,
+    )
+    row = obs.band_observables[0]
+
+    # All 30 CI columns are present and finite for this row.
+    angle_obs = {
+        "C_strike_deg", "C_twist_deg", "C_shear_deg", "PT_alpha_deg",
+        "PT_beta_deg", "PT_abs_beta_deg",
+    }
+    magnitude_obs = {
+        "C_minus_I_F", "gamma_magnitude", "gamma_magnitude_periodwise",
+        "PT_ellipticity",
+    }
+    for o in BOOTSTRAP_OBSERVABLES:
+        for pct in ("p05", "p50", "p95"):
+            col = f"{o}_{pct}"
+            assert col in row, f"missing CI column {col}"
+            assert np.isfinite(row[col]), (
+                f"{col} is not finite; got {row[col]}"
+            )
+        spread = row[f"{o}_p95"] - row[f"{o}_p05"]
+        if o in angle_obs:
+            # Angle spread: < 5° on a low-noise synthetic — strict
+            # but achievable (clean GB optimisation noise).
+            assert spread < 5.0, (
+                f"{o}: p95-p05 = {spread:.3f}°; expected < 5° on a "
+                f"low-noise synthetic"
+            )
+        elif o in magnitude_obs:
+            # Magnitude spread: < 30% of p50 (some intrinsic
+            # variability for tight magnitude-CI tests).
+            p50 = row[f"{o}_p50"]
+            ratio = spread / max(abs(p50), 1e-12)
+            assert ratio < 0.3, (
+                f"{o}: (p95-p05)/p50 = {ratio:.3f}; expected < 0.3 "
+                f"on a low-noise synthetic"
+            )
+
+
+def test_bootstrap_ci_widens_with_noise():
+    """For a noisier synthetic the bootstrap CI half-width is
+    meaningfully larger than for a clean synthetic. Demonstrates
+    the bootstrap responds to the underlying noise level.
+
+    The assertion is at the *aggregate* level (sum of widths
+    across several observables) rather than per-observable —
+    individual observables are noisy at small N (bootstrap noise
+    floor), but the joint signal is robust.
+    """
+    periods = _make_periods()
+    band = {
+        "label": "1s_100s", "period_min": 1.0, "period_max": 100.0
+    }
+    obs_clean = compute_site_observables(
+        _make_mt(
+            generate_synthetic_z(
+                regional_type="2D", distortion_strength="moderate",
+                distortion_shear="moderate", noise_level="clean",
+                periods=periods, site_id="CLN", seed=42,
+            )["z_obj"],
+            station="CLN",
+        ),
+        period_bands=[band], n_starts=2, seed=42,
+        bootstrap_n_replicates=20,
+    )
+    obs_noisy = compute_site_observables(
+        _make_mt(
+            generate_synthetic_z(
+                regional_type="2D", distortion_strength="moderate",
+                distortion_shear="moderate", noise_level="high",
+                periods=periods, site_id="NSY", seed=42,
+            )["z_obj"],
+            station="NSY",
+        ),
+        period_bands=[band], n_starts=2, seed=42,
+        bootstrap_n_replicates=20,
+    )
+    clean_row = obs_clean.band_observables[0]
+    noisy_row = obs_noisy.band_observables[0]
+
+    # Compare normalised spread (relative to the magnitude itself
+    # for magnitudes; absolute for angles). Sum across observables
+    # gives a robust aggregate that responds clearly to the
+    # underlying noise level.
+    test_obs = ("C_strike_deg", "C_minus_I_F", "gamma_magnitude",
+                "PT_alpha_deg", "PT_beta_deg")
+    clean_total = 0.0
+    noisy_total = 0.0
+    for o in test_obs:
+        c = clean_row[f"{o}_p95"] - clean_row[f"{o}_p05"]
+        n = noisy_row[f"{o}_p95"] - noisy_row[f"{o}_p05"]
+        # Normalise magnitude observables by their own p50 so they
+        # mix on a comparable scale with angle observables
+        # (degrees).
+        if o in ("C_minus_I_F", "gamma_magnitude"):
+            denom = max(abs(clean_row[f"{o}_p50"]), 1e-9)
+            c = c / denom
+            n = n / denom
+        clean_total += c
+        noisy_total += n
+    assert noisy_total > clean_total, (
+        f"aggregate noisy spread {noisy_total:.4f} should exceed "
+        f"aggregate clean spread {clean_total:.4f}"
+    )
+    # And by a meaningful margin (5% of the clean total) — guards
+    # against pathological draws where they happen to be equal.
+    assert noisy_total > 1.05 * clean_total, (
+        f"aggregate noisy spread {noisy_total:.4f} only marginally "
+        f"exceeds clean {clean_total:.4f} (need > 5% margin)"
+    )
+
+
+def test_discordance_significance_finite_with_bootstrap():
+    """``discordance_significance`` is finite when bootstrap is run
+    and is a sensible signal-to-noise ratio.
+    """
+    periods = _make_periods()
+    syn = generate_synthetic_z(
+        regional_type="2D",
+        distortion_strength="moderate",
+        distortion_shear="moderate",
+        noise_level="low",
+        periods=periods,
+        site_id="DISC_BOOT",
+        seed=42,
+    )
+    mt = _make_mt(syn["z_obj"], station="DISC_BOOT")
+    band = {
+        "label": "1s_100s", "period_min": 1.0, "period_max": 100.0
+    }
+    obs = compute_site_observables(
+        mt, period_bands=[band], n_starts=2, seed=42,
+        bootstrap_n_replicates=15,
+    )
+    row = obs.band_observables[0]
+    sig = row.get("discordance_significance")
+    assert sig is not None
+    assert np.isfinite(sig), (
+        f"discordance_significance must be finite with bootstrap; "
+        f"got {sig!r}"
+    )
+    assert sig >= 0.0, (
+        f"discordance_significance is mean/std of |angle|; "
+        f"non-negative by construction. got {sig:.3f}"
+    )
+
+
+def test_spatial_coherence_uses_bootstrap_cis_and_silences_warning():
+    """When the observable table carries ``<obs>_p05`` / ``_p95``
+    columns, :func:`spatial_coherence.compute_coherence` reads
+    those for the bootstrap-variance reference and the inter-band
+    fallback warning is **not** emitted.
+    """
+    import warnings
+
+    from mtpy.core.transfer_function.z_analysis.decomposition import (
+        compute_coherence,
+    )
+
+    n_sites = 8
+    rng = np.random.default_rng(0)
+    sites = []
+    for i in range(n_sites):
+        syn = generate_synthetic_z(
+            regional_type="2D",
+            distortion_strength="moderate",
+            distortion_shear="moderate",
+            noise_level="low",
+            periods=_make_periods(),
+            site_id=f"SC{i:02d}",
+            seed=42 + i,
+        )
+        sites.append(_make_mt(
+            syn["z_obj"], station=f"SC{i:02d}",
+            lon=140.0 + 0.5 * i + 0.05 * rng.standard_normal(),
+            lat=-30.0 - 0.5 * i + 0.05 * rng.standard_normal(),
+        ))
+    band = {
+        "label": "1s_100s", "period_min": 1.0, "period_max": 100.0
+    }
+
+    # Run with bootstrap; spatial_coherence should *not* emit the
+    # inter-band-fallback warning because CI columns are present.
+    table = compute_collection_observables(
+        sites, period_bands=[band], n_starts=2, seed=42,
+        bootstrap_n_replicates=10,
+    )
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        coh = compute_coherence(
+            table, "gamma_magnitude",
+            n_bins=6, max_distance_km=2000.0, n_shuffles=10, seed=0,
+        )
+    fallback_msgs = [
+        str(w.message) for w in caught
+        if "noise-floor fallback" in str(w.message)
+    ]
+    assert not fallback_msgs, (
+        "spatial_coherence emitted the inter-band-variance fallback "
+        "UserWarning even though bootstrap CI columns are present. "
+        f"Messages: {fallback_msgs}"
+    )
+
+    # bootstrap_variance is finite and matches the median (p95-p05)/2
+    # over rows.
+    df = table.dataframe
+    half = 0.5 * (
+        pd.to_numeric(df["gamma_magnitude_p95"], errors="coerce")
+        - pd.to_numeric(df["gamma_magnitude_p05"], errors="coerce")
+    )
+    expected = float(np.nanmedian(half.to_numpy()))
+    assert coh.bootstrap_variance is not None
+    assert abs(coh.bootstrap_variance - expected) < 1e-9, (
+        f"coh.bootstrap_variance={coh.bootstrap_variance:.6f} "
+        f"!= median half-width {expected:.6f}"
+    )
+
+
+def test_bootstrap_parallel_matches_sequential():
+    """Sequential and parallel bootstrap with the same seed produce
+    bit-identical observable tables. Per-site bootstrap RNG is
+    seeded from a stable hash of the station id + the global seed,
+    so the multiprocessing path doesn't change the numerical
+    outputs.
+    """
+    periods = _make_periods()
+    band = {
+        "label": "1s_100s", "period_min": 1.0, "period_max": 100.0
+    }
+    sites = []
+    for i, sid in enumerate(["P_A", "P_B", "P_C"]):
+        syn = generate_synthetic_z(
+            regional_type="2D",
+            distortion_strength="moderate",
+            distortion_shear="low",
+            noise_level="low",
+            periods=periods,
+            site_id=sid,
+            seed=42 + i,
+        )
+        sites.append(_make_mt(syn["z_obj"], station=sid))
+
+    # Sequential.
+    table_seq = compute_collection_observables(
+        sites, period_bands=[band], n_starts=2, seed=42,
+        bootstrap_n_replicates=8, parallel=False,
+    )
+    # Parallel.
+    table_par = compute_collection_observables(
+        sites, period_bands=[band], n_starts=2, seed=42,
+        bootstrap_n_replicates=8, parallel=True,
+    )
+    pd.testing.assert_frame_equal(
+        table_seq.dataframe.reset_index(drop=True),
+        table_par.dataframe.reset_index(drop=True),
+    )
+    assert table_seq.metadata["bootstrap_n_replicates"] == 8
+    assert table_par.metadata["bootstrap_n_replicates"] == 8
+    assert table_seq.metadata["parallel"] is False
+    assert table_par.metadata["parallel"] is True
+
+
+# ---------------------------------------------------------------------------
 # Joint MJ: per-site rms_misfit, single-site degenerate case, GB comparison
 # ---------------------------------------------------------------------------
 

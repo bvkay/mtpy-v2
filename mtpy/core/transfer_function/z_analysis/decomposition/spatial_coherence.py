@@ -134,6 +134,7 @@ import warnings
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
+import pandas as pd
 
 from .results import CoherenceResult
 
@@ -750,19 +751,43 @@ def _per_site_bootstrap_variance(
 
     Tries (in order):
 
-    1. A column named ``f"{observable_name}_bootstrap_var"`` in the
-       table. (Reserved for a future Phase-2
+    1. The bootstrap CI columns
+       ``f"{observable_name}_p05"`` and ``f"{observable_name}_p95"``
+       written by
        :func:`...continental_observables.compute_site_observables`
-       output.)
-    2. The inter-band variance of the observable at each site,
-       averaged across sites. Less ideal — band-to-band differences
-       reflect both noise and genuine frequency-dependence — but
-       bounds the noise floor from above.
+       when ``bootstrap_n_replicates > 0``. The half-width
+       ``(p95 - p05) / 2`` per row is taken as the per-row
+       1-sigma-equivalent noise; we report the median across
+       rows. **No warning is emitted in this path** — it is the
+       canonical, tight noise estimate.
+    2. A legacy column named
+       ``f"{observable_name}_bootstrap_var"`` in the table
+       (reserved for a future schema option). If present, use
+       its mean.
+    3. The inter-band variance of the observable at each site,
+       averaged across sites. Less ideal — band-to-band
+       differences reflect both noise and genuine
+       frequency-dependence — but bounds the noise floor from
+       above. **A** :class:`UserWarning` **is emitted** in this
+       path, because the canonical bootstrap CIs are missing.
 
-    Returns ``None`` when neither is computable (single band only,
-    no finite values, etc.).
+    Returns ``None`` when none of the above are computable
+    (single band only with no bootstrap, no finite values, etc.).
     """
     df = observable_table.dataframe
+
+    # Path 1: bootstrap CI columns from compute_site_observables.
+    p05_col = f"{observable_name}_p05"
+    p95_col = f"{observable_name}_p95"
+    if p05_col in df.columns and p95_col in df.columns:
+        p05 = pd.to_numeric(df[p05_col], errors="coerce").to_numpy()
+        p95 = pd.to_numeric(df[p95_col], errors="coerce").to_numpy()
+        finite = np.isfinite(p05) & np.isfinite(p95)
+        if finite.any():
+            half_widths = 0.5 * (p95[finite] - p05[finite])
+            return float(np.nanmedian(half_widths))
+
+    # Path 2: legacy bootstrap-var column.
     boot_col = f"{observable_name}_bootstrap_var"
     if boot_col in df.columns:
         v = (
@@ -773,12 +798,15 @@ def _per_site_bootstrap_variance(
         )
         if not v.empty:
             return float(v[boot_col].mean())
-    # Fallback: inter-band variance per site.
+
+    # Path 3: inter-band variance per site (fallback).
     if df["period_band_label"].nunique() < 2:
         warnings.warn(
             "spatial_coherence: cannot estimate bootstrap variance — "
-            "no bootstrap column and only one period band in the "
-            "table. Returning None.",
+            "no bootstrap CI columns and only one period band in the "
+            "table. Returning None. Run "
+            "compute_site_observables(bootstrap_n_replicates > 0) to "
+            "produce <obs>_p05 / _p95 columns.",
             stacklevel=2,
         )
         return None
@@ -790,11 +818,14 @@ def _per_site_bootstrap_variance(
     if var_per_site.empty:
         return None
     warnings.warn(
-        "spatial_coherence: per-site bootstrap CI not present in "
-        "the observable table; using inter-band variance as a "
-        "noise-floor fallback. The fallback over-estimates noise "
-        "by absorbing genuine frequency dependence; treat as an "
-        "upper bound.",
+        "spatial_coherence: per-site bootstrap CI columns not "
+        "present in the observable table; using inter-band variance "
+        "as a noise-floor fallback. The fallback over-estimates "
+        "noise by absorbing genuine frequency dependence; treat as "
+        "an upper bound. This warning fires when "
+        "compute_site_observables was called with "
+        "bootstrap_n_replicates=0; re-run with bootstrap_n_replicates "
+        "> 0 to silence it.",
         stacklevel=2,
     )
     return float(np.nanmedian(var_per_site))

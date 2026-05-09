@@ -403,6 +403,45 @@ def _coerce_period_bands(
 
 # Canonical column names (and human-readable units / docstrings live
 # in the module docstring; this list is the schema contract).
+BOOTSTRAP_OBSERVABLES: list[str] = [
+    "C_strike_deg",
+    "C_twist_deg",
+    "C_shear_deg",
+    "C_minus_I_F",
+    "gamma_magnitude",
+    "gamma_magnitude_periodwise",
+    "PT_alpha_deg",
+    "PT_beta_deg",
+    "PT_abs_beta_deg",
+    "PT_ellipticity",
+]
+"""Primary observables that get bootstrap CI columns
+(``<obs>_p05``, ``<obs>_p50``, ``<obs>_p95``) when
+``compute_site_observables(bootstrap_n_replicates > 0)``.
+
+The list is fixed at the schema level: every column in
+:data:`OBSERVABLE_COLUMNS` is always present in the output table.
+Bootstrap CI columns are ``NaN`` when the bootstrap was not run
+(``bootstrap_n_replicates == 0``); :mod:`...spatial_coherence`
+falls back to inter-band variance with a documented
+:class:`UserWarning` in that case.
+"""
+
+
+def _bootstrap_ci_columns(observables: list[str]) -> list[str]:
+    """Build the per-percentile CI column names for one or more
+    primary observables.
+
+    Returns names in ``observables`` order: for each ``obs`` we
+    emit ``obs_p05``, ``obs_p50``, ``obs_p95`` in that order.
+    """
+    out: list[str] = []
+    for obs in observables:
+        for pct in ("p05", "p50", "p95"):
+            out.append(f"{obs}_{pct}")
+    return out
+
+
 OBSERVABLE_COLUMNS: list[str] = [
     # Site identification
     "site_id",
@@ -450,6 +489,9 @@ OBSERVABLE_COLUMNS: list[str] = [
     # Discordance metrics (Paper 1 hero)
     "discordance_deg",
     "discordance_significance",
+    # Bootstrap CI columns. NaN when the bootstrap was not run
+    # (compute_site_observables(bootstrap_n_replicates=0)).
+    *_bootstrap_ci_columns(BOOTSTRAP_OBSERVABLES),
 ]
 
 # Per-column dtype hints (used to coerce on output). Float64 is the
@@ -1045,6 +1087,305 @@ def _diagnostics_band_observables(
 
 
 # ---------------------------------------------------------------------------
+# Bootstrap CIs (parametric, full-pipeline)
+# ---------------------------------------------------------------------------
+
+
+def _site_sub_seed(base_seed: int, station: str) -> int:
+    """Stable per-site sub-seed combining a global ``base_seed``
+    with the station identifier.
+
+    Used so that the bootstrap RNG is deterministic per site
+    *regardless* of whether the collection is processed
+    sequentially or in parallel — same station + same base_seed →
+    same noise realisations. Stable across processes (does not
+    rely on Python's randomised ``hash``).
+    """
+    import hashlib
+
+    digest = hashlib.md5(station.encode("utf-8")).digest()[:4]
+    offset = int.from_bytes(digest, "big") & 0x7FFFFFFF
+    return (int(base_seed) + offset) & 0x7FFFFFFFFFFFFFFF
+
+
+def _resample_z_parametric(z, rng):
+    """Build a noise-perturbed copy of ``z``.
+
+    Adds independent N(0, σ²) Gaussian noise to the real and
+    imaginary parts of each component, with σ = ``z.z_error / √2``
+    (so the magnitude of the complex perturbation is ``z.z_error``
+    on average — the same "1-sigma per component" convention as
+    :func:`...common._resample_residuals`).
+    """
+    from mtpy.core.transfer_function.z import Z as _Z
+
+    z_arr = np.asarray(z.z, dtype=np.complex128)
+    z_err = np.asarray(z.z_error, dtype=np.float64)
+    sigma = z_err / np.sqrt(2.0)
+    re = rng.standard_normal(z_arr.shape) * sigma
+    im = rng.standard_normal(z_arr.shape) * sigma
+    return _Z(z=z_arr + (re + 1j * im), z_error=z_err, frequency=z.frequency)
+
+
+def _bootstrap_site_observables(
+    mt_object,
+    *,
+    period_bands,
+    canonical_gauge: str,
+    n_starts: int,
+    seed: int,
+    band_overlap_fraction: float,
+    n_replicates: int,
+) -> list[dict[str, dict[str, Any]]]:
+    """Run :func:`compute_site_observables` ``n_replicates`` times
+    with parametric noise added to ``mt_object.Z``.
+
+    Returns a list of length ``n_replicates``; each entry is a
+    dict ``{period_band_label: row_dict}`` collected from one
+    replicate's :class:`SiteObservables`. The caller derives p05 /
+    p50 / p95 across replicates per band per observable.
+
+    The bootstrap is *parametric*: each replicate adds independent
+    Gaussian noise to the real and imaginary parts of ``Z`` with
+    σ = ``z.z_error / √2`` per component. The full per-site
+    pipeline (GB + BCB + Lilley + Marti + Gomez-Treviño + PT +
+    magnetic-distortion diagnostic + cross-method disagreement)
+    re-runs on each replicate so every bootstrap-tracked
+    observable has a real CI — including the phase-tensor angles
+    that are independent of GB.
+
+    The recursive call passes ``bootstrap_n_replicates=0`` so the
+    inner pipeline does not bootstrap itself.
+    """
+    from types import SimpleNamespace
+
+    station = str(getattr(mt_object, "station", "") or "")
+    rng = np.random.default_rng(_site_sub_seed(seed, station))
+    replicates: list[dict[str, dict[str, Any]]] = []
+    for k in range(n_replicates):
+        z_noisy = _resample_z_parametric(mt_object.Z, rng)
+        # Build a SimpleNamespace so the inner pipeline gets the
+        # noisy Z but every other site attribute is preserved.
+        # Tipper is not bootstrapped (the magnetic-distortion
+        # diagnostic uses Tipper independently of Z; bootstrapping
+        # both is a Phase-2 enhancement).
+        mt_noisy = SimpleNamespace(
+            Z=z_noisy,
+            Tipper=getattr(mt_object, "Tipper", None),
+            station=station,
+            longitude=getattr(mt_object, "longitude", float("nan")),
+            latitude=getattr(mt_object, "latitude", float("nan")),
+            elevation=getattr(mt_object, "elevation", float("nan")),
+        )
+        try:
+            site_obs = compute_site_observables(
+                mt_noisy,
+                period_bands=period_bands,
+                canonical_gauge=canonical_gauge,
+                n_starts=n_starts,
+                seed=int(seed) + k + 1,
+                band_overlap_fraction=band_overlap_fraction,
+                bootstrap_n_replicates=0,
+            )
+        except Exception:
+            # A single failed replicate doesn't tank the bootstrap
+            # — skip and continue. The CI is computed from
+            # whatever finite values survive.
+            replicates.append({})
+            continue
+        replicates.append(
+            {row["period_band_label"]: row for row in site_obs.band_observables}
+        )
+    return replicates
+
+
+def _apply_bootstrap_cis(
+    band_rows: list[dict[str, Any]],
+    replicates: list[dict[str, dict[str, Any]]],
+) -> None:
+    """Update ``band_rows`` in-place with p05 / p50 / p95 per
+    bootstrap observable, plus the discordance significance.
+    """
+    for row in band_rows:
+        band_label = row["period_band_label"]
+        for obs in BOOTSTRAP_OBSERVABLES:
+            vals: list[float] = []
+            for rep in replicates:
+                if band_label not in rep:
+                    continue
+                v = rep[band_label].get(obs)
+                if v is None or v is pd.NA:
+                    continue
+                try:
+                    fv = float(v)
+                except (TypeError, ValueError):
+                    continue
+                if np.isfinite(fv):
+                    vals.append(fv)
+            if not vals:
+                continue
+            row[f"{obs}_p05"] = float(np.percentile(vals, 5))
+            row[f"{obs}_p50"] = float(np.percentile(vals, 50))
+            row[f"{obs}_p95"] = float(np.percentile(vals, 95))
+
+        # Discordance significance: mean / std across replicates.
+        # NaN unless we have ≥ 2 finite samples and a non-zero
+        # standard deviation.
+        disc_vals: list[float] = []
+        for rep in replicates:
+            if band_label not in rep:
+                continue
+            v = rep[band_label].get("discordance_deg")
+            if v is None or v is pd.NA:
+                continue
+            try:
+                fv = float(v)
+            except (TypeError, ValueError):
+                continue
+            if np.isfinite(fv):
+                disc_vals.append(fv)
+        if len(disc_vals) >= 2:
+            mean_d = float(np.mean(disc_vals))
+            std_d = float(np.std(disc_vals, ddof=1))
+            if std_d > 1e-12:
+                row["discordance_significance"] = mean_d / std_d
+
+
+def _site_to_picklable(mt_object) -> dict:
+    """Reduce a site (``MT``-like object) to a plain dict that
+    pickles cleanly for :class:`multiprocessing.Pool`.
+
+    ``Z`` instances hold ``loguru`` references which can fail to
+    pickle under certain test runners (pytest's ``EncodedFile``
+    captures, etc.); we extract the raw arrays the inner pipeline
+    actually needs and rebuild a fresh ``Z`` inside the worker
+    via :func:`_picklable_to_site`.
+    """
+    z = mt_object.Z
+    z_arr = np.asarray(z.z).copy()
+    z_err = (
+        np.asarray(z.z_error).copy() if z.z_error is not None else None
+    )
+    z_freq = np.asarray(z.frequency).copy()
+    return {
+        "z_state": (z_arr, z_err, z_freq),
+        "station": str(getattr(mt_object, "station", "") or ""),
+        "longitude": float(
+            getattr(mt_object, "longitude", float("nan")) or 0.0
+        ),
+        "latitude": float(
+            getattr(mt_object, "latitude", float("nan")) or 0.0
+        ),
+        "elevation": float(
+            getattr(mt_object, "elevation", float("nan")) or 0.0
+        ),
+    }
+
+
+def _picklable_to_site(payload: dict):
+    """Inverse of :func:`_site_to_picklable`. Builds a fresh
+    ``SimpleNamespace`` with a fresh ``Z`` from the raw arrays.
+    Tipper is set to ``None`` in the worker — magnetic-distortion
+    diagnostics in the bootstrap path are deferred (they do not
+    add CIs to any of the bootstrap observables and would require
+    pickling a Tipper too).
+    """
+    from types import SimpleNamespace
+
+    from mtpy.core.transfer_function.z import Z as _Z
+
+    z_arr, z_err, z_freq = payload["z_state"]
+    z = _Z(z=z_arr, z_error=z_err, frequency=z_freq)
+    return SimpleNamespace(
+        Z=z,
+        Tipper=None,
+        station=payload["station"],
+        longitude=payload["longitude"],
+        latitude=payload["latitude"],
+        elevation=payload["elevation"],
+    )
+
+
+def _compute_one_site_worker(args):
+    """Top-level worker for :func:`_compute_sites_in_parallel`.
+
+    Defined at module scope so it pickles cleanly for
+    :class:`multiprocessing.Pool`. Reconstitutes the site from the
+    raw-array payload (see :func:`_site_to_picklable`) and runs
+    the per-site pipeline with bootstrap. Returns
+    ``(site_obs, exc)``; on success ``exc is None``, on failure
+    ``site_obs is None``.
+    """
+    (
+        site_payload,
+        period_bands,
+        canonical_gauge,
+        n_starts,
+        seed,
+        band_overlap_fraction,
+        bootstrap_n_replicates,
+    ) = args
+    try:
+        mt_object = _picklable_to_site(site_payload)
+        site_obs = compute_site_observables(
+            mt_object,
+            period_bands=period_bands,
+            canonical_gauge=canonical_gauge,
+            n_starts=n_starts,
+            seed=seed,
+            band_overlap_fraction=band_overlap_fraction,
+            bootstrap_n_replicates=bootstrap_n_replicates,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return None, exc
+    return site_obs, None
+
+
+def _compute_sites_in_parallel(
+    sites,
+    *,
+    bands,
+    canonical_gauge: str,
+    n_starts: int,
+    seed: int,
+    band_overlap_fraction: float,
+    bootstrap_n_replicates: int,
+) -> list[tuple]:
+    """Distribute :func:`compute_site_observables` across worker
+    processes via :class:`multiprocessing.Pool`.
+
+    Returns a list of ``(site_obs, exc)`` tuples in the same order
+    as ``sites``; the caller decides how to surface failures.
+    Per-site bootstrap RNG is seeded by
+    :func:`_site_sub_seed(seed, station)` so the parallel result
+    is bit-identical to the sequential one (no inter-worker
+    communication; each worker re-derives its own seed from the
+    station id and the global ``seed``).
+
+    Sites are reduced to raw-array payloads via
+    :func:`_site_to_picklable` before being sent to workers
+    because ``Z`` instances hold ``loguru`` references that don't
+    survive multiprocessing pickling under some test runners.
+    """
+    from multiprocessing import Pool
+
+    args_iter = [
+        (
+            _site_to_picklable(site),
+            bands,
+            canonical_gauge,
+            n_starts,
+            seed,
+            band_overlap_fraction,
+            bootstrap_n_replicates,
+        )
+        for site in sites
+    ]
+    with Pool() as pool:
+        return list(pool.imap(_compute_one_site_worker, args_iter))
+
+
+# ---------------------------------------------------------------------------
 # Public per-site entry point
 # ---------------------------------------------------------------------------
 
@@ -1057,6 +1398,7 @@ def compute_site_observables(
     n_starts: int = 5,
     seed: int = 42,
     band_overlap_fraction: float = 0.0,
+    bootstrap_n_replicates: int = 0,
 ) -> SiteObservables:
     """All distortion-as-signal observables for a single site.
 
@@ -1085,6 +1427,35 @@ def compute_site_observables(
         backward-compatible tiled default; ``> 0`` widens each
         band so adjacent bands share data — useful for smoother
         spatial-coherence and period-vs-observable sweeps.
+    bootstrap_n_replicates : int, default 0
+        Number of parametric-bootstrap replicates. ``0`` (default)
+        skips the bootstrap and leaves every ``<obs>_p05`` /
+        ``<obs>_p50`` / ``<obs>_p95`` column as ``NaN`` —
+        backward-compatible.
+
+        ``> 0`` runs ``bootstrap_n_replicates`` full-pipeline
+        replicates with parametric Gaussian noise added to
+        ``mt_object.Z`` (σ per component = ``z.z_error / √2``).
+        Each replicate re-runs GB + BCB + Lilley + Marti + PT +
+        magnetic-distortion + cross-method disagreement — so
+        every bootstrap-tracked observable in
+        :data:`BOOTSTRAP_OBSERVABLES` gets a real per-band CI
+        (including the phase-tensor angles, which are
+        independent of GB and would otherwise need their own
+        bootstrap path).
+
+        ``discordance_significance`` is also re-computed from the
+        bootstrap distribution as ``mean(disc_deg) /
+        std(disc_deg, ddof=1)``; replaces the ``NaN`` fallback.
+
+        Cost: each replicate runs the full per-site pipeline.
+        For the default ``n_starts=5`` and the AusLAMP six-band
+        default, a single replicate is ~ 1 s on a single core;
+        ``bootstrap_n_replicates=50`` is ~ 50 s per site, ~ 19 h
+        for 1353 AusLAMP sites single-threaded. Use
+        :func:`compute_collection_observables` with
+        ``parallel=True`` for production (see that function's
+        docstring).
 
     Returns
     -------
@@ -1177,10 +1548,24 @@ def compute_site_observables(
             float(row["gamma_principal_axis_deg"]),
             float(row["PT_alpha_deg"]),
         )
-        # Bootstrap-based significance is a follow-up; report NaN.
+        # discordance_significance is filled by the bootstrap loop
+        # below when bootstrap_n_replicates > 0; otherwise NaN.
         row["discordance_significance"] = float("nan")
 
         band_rows.append(row)
+
+    # Bootstrap CIs + discordance significance.
+    if int(bootstrap_n_replicates) > 0:
+        replicates = _bootstrap_site_observables(
+            mt_object,
+            period_bands=bands,
+            canonical_gauge=canonical_gauge,
+            n_starts=n_starts,
+            seed=seed,
+            band_overlap_fraction=band_overlap_fraction,
+            n_replicates=int(bootstrap_n_replicates),
+        )
+        _apply_bootstrap_cis(band_rows, replicates)
 
     return SiteObservables(
         site_id=site_id,
@@ -1195,6 +1580,7 @@ def compute_site_observables(
             period_bands=bands,
             input_identifier=site_id,
             band_overlap_fraction=band_overlap_fraction,
+            bootstrap_n_replicates=int(bootstrap_n_replicates),
         ),
     )
 
@@ -1352,6 +1738,7 @@ def _build_metadata(
     period_bands: list[_PeriodBand],
     input_identifier: str,
     band_overlap_fraction: float = 0.0,
+    bootstrap_n_replicates: int = 0,
 ) -> dict[str, Any]:
     return {
         "mtpy_version": _mtpy_version(),
@@ -1373,6 +1760,7 @@ def _build_metadata(
         "canonical_gauge": canonical_gauge,
         "rng_seed": int(seed),
         "n_starts": int(n_starts),
+        "bootstrap_n_replicates": int(bootstrap_n_replicates),
         "input_identifier": str(input_identifier),
     }
 
@@ -1400,6 +1788,8 @@ def compute_collection_observables(
     seed: int = 42,
     skip_failed: bool = True,
     band_overlap_fraction: float = 0.0,
+    bootstrap_n_replicates: int = 0,
+    parallel: bool = False,
 ) -> ObservableTable:
     """Continental-scale observable table across an MT collection.
 
@@ -1415,16 +1805,49 @@ def compute_collection_observables(
         iterated via ``.dataframe`` + ``.get_tf``; otherwise the
         argument is treated as an iterable of ``MT`` objects.
     period_bands, canonical_gauge, n_starts, seed,
-    band_overlap_fraction
+    band_overlap_fraction, bootstrap_n_replicates
         See :func:`compute_site_observables`.
     skip_failed : bool, default True
         If True, sites whose pipeline raises are logged into the
         metadata's ``failed_sites`` list and skipped. If False,
         the first raise propagates.
+    parallel : bool, default False
+        Distribute the per-site pipeline (including bootstrap
+        replicates) across worker processes via
+        :class:`multiprocessing.Pool`. Off by default to keep
+        small-N test runs deterministic and to avoid the
+        cost of fork/spawn for trivial collections.
+
+        When ``parallel=True`` the per-site bootstrap RNG is
+        seeded from
+        :func:`_site_sub_seed(base_seed, station)`, so a
+        sequential and parallel run of the same collection with
+        the same ``seed`` produce *bit-identical* tables. The
+        joint MJ fit (which is collection-level, not per-site)
+        always runs sequentially.
+
+        Recommended only when ``bootstrap_n_replicates > 0`` —
+        the non-bootstrap pipeline is fast enough that
+        multiprocessing overhead dominates.
 
     Returns
     -------
     ObservableTable
+
+    Notes
+    -----
+    Approximate AusLAMP-scale runtimes (1353 sites, 6 default
+    bands, ``n_starts=5``, on a 16-core workstation):
+
+    * ``bootstrap_n_replicates=0`` — ~ 5 minutes sequential.
+    * ``bootstrap_n_replicates=50, parallel=True`` —
+      ~ 1.5 hours.
+    * ``bootstrap_n_replicates=50, parallel=False`` —
+      ~ 19 hours (don't).
+
+    Order-of-magnitude only; the exact runtime depends on the
+    period grid, the optimiser convergence, and the joint-MJ
+    instability across instrument types.
     """
     bands = _coerce_period_bands(period_bands, band_overlap_fraction)
     all_rows: list[dict[str, Any]] = []
@@ -1436,28 +1859,57 @@ def compute_collection_observables(
     # helper. ``_iter_mt_objects`` is a generator on MTCollection.
     sites = list(_iter_mt_objects(mt_collection_or_list))
 
-    for mt_object in sites:
-        site_count += 1
-        try:
-            site_obs = compute_site_observables(
-                mt_object,
-                period_bands=bands,
-                canonical_gauge=canonical_gauge,
-                n_starts=n_starts,
-                seed=seed,
-                band_overlap_fraction=band_overlap_fraction,
-            )
-        except Exception as exc:
-            failed.append(
-                {
-                    "site_id": str(getattr(mt_object, "station", "")),
-                    "reason": repr(exc),
-                }
-            )
-            if not skip_failed:
-                raise
-            continue
-        all_rows.extend(site_obs.band_observables)
+    if (
+        parallel
+        and int(bootstrap_n_replicates) > 0
+        and len(sites) > 1
+    ):
+        site_obs_list = _compute_sites_in_parallel(
+            sites,
+            bands=bands,
+            canonical_gauge=canonical_gauge,
+            n_starts=n_starts,
+            seed=seed,
+            band_overlap_fraction=band_overlap_fraction,
+            bootstrap_n_replicates=bootstrap_n_replicates,
+        )
+        for mt_object, (site_obs, exc) in zip(sites, site_obs_list):
+            site_count += 1
+            if exc is not None:
+                failed.append(
+                    {
+                        "site_id": str(getattr(mt_object, "station", "")),
+                        "reason": repr(exc),
+                    }
+                )
+                if not skip_failed:
+                    raise exc
+                continue
+            all_rows.extend(site_obs.band_observables)
+    else:
+        for mt_object in sites:
+            site_count += 1
+            try:
+                site_obs = compute_site_observables(
+                    mt_object,
+                    period_bands=bands,
+                    canonical_gauge=canonical_gauge,
+                    n_starts=n_starts,
+                    seed=seed,
+                    band_overlap_fraction=band_overlap_fraction,
+                    bootstrap_n_replicates=bootstrap_n_replicates,
+                )
+            except Exception as exc:
+                failed.append(
+                    {
+                        "site_id": str(getattr(mt_object, "station", "")),
+                        "reason": repr(exc),
+                    }
+                )
+                if not skip_failed:
+                    raise
+                continue
+            all_rows.extend(site_obs.band_observables)
 
     # Joint MJ across all sites (≥2 only; single-site collections
     # leave MJ_rms_misfit as NaN per the column contract). The
@@ -1486,9 +1938,11 @@ def compute_collection_observables(
         period_bands=bands,
         input_identifier=_hash_collection(mt_collection_or_list),
         band_overlap_fraction=band_overlap_fraction,
+        bootstrap_n_replicates=int(bootstrap_n_replicates),
     )
     metadata["site_count"] = int(site_count)
     metadata["failed_sites"] = failed
+    metadata["parallel"] = bool(parallel)
     # MJ joint summary in metadata (NaN when fewer than 2 sites or
     # the joint fit failed). The MJ_rms_misfit column has the
     # per-site values; this is the single across-sites rollup.
