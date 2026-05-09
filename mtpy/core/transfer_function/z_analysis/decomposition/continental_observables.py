@@ -77,9 +77,22 @@ Usage
 
 The default :data:`DEFAULT_PERIOD_BANDS` is six 1-decade-wide bands
 tiled across ``[0.01, 10000]`` s (the AusLAMP design range). Pass
-``period_bands=`` for a different specification; band definitions
-*do* affect downstream observables and should be reported in any
-publication using these outputs.
+``period_bands=`` for a different specification, or pass
+``band_overlap_fraction=f`` (with ``f ∈ [0, 1)``) to widen the
+default bands so adjacent bands share a fraction ``f`` of a unit
+band width — useful for smoother spatial-coherence and
+period-vs-observable plots.
+
+**Paper-1 reproducibility note.** The choice of band geometry
+(``n_bands`` *and* ``band_overlap_fraction``) materially affects
+every downstream observable: with overlap > 0, a single per-period
+GB / Lilley / Marti output contributes to multiple bands' aggregations.
+Both numbers are captured in :class:`ObservableTable.metadata` (under
+``n_bands`` and ``band_overlap_fraction``) so the long-format table
+is reproducible from the metadata alone. **Any publication using
+these outputs MUST report both values** — defaults today
+(``n_bands=6``, ``band_overlap_fraction=0.0``) are documented but
+are not assumed.
 
 Reproducibility
 ---------------
@@ -171,44 +184,135 @@ def _format_band_label(p_min: float, p_max: float) -> str:
     return f"{p_min:g}s_{p_max:g}s"
 
 
-def default_period_bands() -> list[_PeriodBand]:
-    """Six tiled 1-decade-wide bands across ``[0.01, 10000]`` s.
+def default_period_bands(
+    band_overlap_fraction: float = 0.0,
+    *,
+    n_bands: int = 6,
+    log_min: float = -2.0,
+    log_max: float = 4.0,
+) -> list[_PeriodBand]:
+    """Six log-spaced period bands across ``[0.01, 10000]`` s.
 
-    Returns the canonical AusLAMP-design-range band specification:
-    ``0.01-0.1``, ``0.1-1``, ``1-10``, ``10-100``, ``100-1000``,
-    ``1000-10000`` seconds. Tiled (no overlap) for clarity. Pass a
-    user-defined list to :func:`compute_collection_observables` to
-    override.
+    Parameters
+    ----------
+    band_overlap_fraction : float, default 0.0
+        Overlap between adjacent bands as a fraction of the unit
+        band width ``L / n_bands``. Must be in ``[0, 1)``.
+
+        * ``0.0`` (default) — bands tile with no overlap. Each
+          band is exactly ``L / n_bands`` decades wide.
+        * ``> 0`` — each band is widened by a factor ``(1 + f)``
+          on each side, so adjacent bands share an ``f``-fraction
+          of a unit width. Useful for smoother sweeps in spatial
+          coherence and period-vs-observable plots, at the cost
+          of one period contributing to multiple bands.
+    n_bands : int, default 6
+    log_min, log_max : float
+        Total log10-period span. Defaults give the AusLAMP design
+        range ``log10(period) ∈ [-2, 4]`` (0.01 s to 10000 s).
+
+    Returns
+    -------
+    list[_PeriodBand]
+        Length ``n_bands``. Each band's ``[period_min, period_max]``
+        is constructed from the worked formula below.
+
+    Worked example
+    --------------
+    With ``L = log_max - log_min``, the formula for band ``i``
+    (``i = 0 ... n_bands-1``) is::
+
+        start_i = log_min + i · L / n_bands - f · L / (2 · n_bands)
+        end_i   = start_i + (1 + f) · L / n_bands
+
+    so each band has *log-width* ``(1 + f) · L / n_bands`` and
+    centres are spaced by ``L / n_bands``. The shared overlap
+    between adjacent bands is ``f · L / n_bands``.
+
+    Default case (``f = 0``)::
+
+        L = 6, n_bands = 6, log_min = -2, log_max = 4
+        band 0: [10^-2,   10^-1] = [0.01,    0.1] s
+        band 1: [10^-1,   10^0 ] = [0.1,     1  ] s
+        band 2: [10^0,    10^1 ] = [1,       10 ] s
+        band 3: [10^1,    10^2 ] = [10,      100] s
+        band 4: [10^2,    10^3 ] = [100,    1000] s
+        band 5: [10^3,    10^4 ] = [1000,  10000] s
+
+    With ``f = 0.5``::
+
+        Each band is 1.5 decades wide; adjacent bands overlap by
+        0.5 decade (the ``f · L / n_bands`` overlap).
+        band 0: [10^-2.25, 10^-0.75] ≈ [0.0056,    0.178] s
+        band 1: [10^-1.25, 10^ 0.25] ≈ [0.0562,    1.778] s
+        band 2: [10^-0.25, 10^ 1.25] ≈ [0.562,    17.78 ] s
+        band 3: [10^ 0.75, 10^ 2.25] ≈ [5.62,    177.8  ] s
+        band 4: [10^ 1.75, 10^ 3.25] ≈ [56.2,   1778    ] s
+        band 5: [10^ 2.75, 10^ 4.25] ≈ [562,   17783    ] s
+
+        A period at 1 s (``log10 = 0``) lies in bands 1 and 2.
+
+    Raises
+    ------
+    ValueError
+        If ``band_overlap_fraction`` is outside ``[0, 1)``.
     """
-    edges = [10.0**k for k in range(-2, 5)]  # -2..4 inclusive
-    return [
-        _PeriodBand(
-            label=_format_band_label(edges[k], edges[k + 1]),
-            period_min=edges[k],
-            period_max=edges[k + 1],
+    if not (0.0 <= band_overlap_fraction < 1.0):
+        raise ValueError(
+            f"default_period_bands: band_overlap_fraction must be "
+            f"in [0, 1); got {band_overlap_fraction}"
         )
-        for k in range(len(edges) - 1)
-    ]
+    f = float(band_overlap_fraction)
+    L = float(log_max - log_min)
+    width = (1.0 + f) * L / n_bands
+    out: list[_PeriodBand] = []
+    for i in range(n_bands):
+        start = log_min + i * L / n_bands - f * L / (2.0 * n_bands)
+        end = start + width
+        p_min = float(10.0**start)
+        p_max = float(10.0**end)
+        out.append(
+            _PeriodBand(
+                label=_format_band_label(p_min, p_max),
+                period_min=p_min,
+                period_max=p_max,
+            )
+        )
+    return out
 
 
 DEFAULT_PERIOD_BANDS: list[_PeriodBand] = default_period_bands()
-"""Module-level default. See :func:`default_period_bands`."""
+"""Module-level default (no overlap). See
+:func:`default_period_bands`. Mutating this list in place is
+unsupported — pass ``period_bands=`` to override per-call.
+"""
 
 
-def _coerce_period_bands(period_bands) -> list[_PeriodBand]:
+def _coerce_period_bands(
+    period_bands,
+    band_overlap_fraction: float = 0.0,
+) -> list[_PeriodBand]:
     """Accept a variety of band specifications and normalise to
     ``list[_PeriodBand]``.
 
     Accepted forms:
 
-    * ``None`` -> :data:`DEFAULT_PERIOD_BANDS`
-    * ``list[_PeriodBand]`` -> returned as-is
-    * ``list[(p_min, p_max)]`` -> labels auto-generated
+    * ``None`` -> :func:`default_period_bands` with the supplied
+      ``band_overlap_fraction``. The cached
+      :data:`DEFAULT_PERIOD_BANDS` is returned only when the
+      caller explicitly accepts ``band_overlap_fraction == 0.0``.
+    * ``list[_PeriodBand]`` -> returned as-is (overlap kwarg is
+      ignored — explicit specifications win).
+    * ``list[(p_min, p_max)]`` -> labels auto-generated.
     * ``list[dict]`` with keys ``label``, ``period_min``,
-      ``period_max`` -> coerced
+      ``period_max`` -> coerced.
     """
     if period_bands is None:
-        return DEFAULT_PERIOD_BANDS
+        if band_overlap_fraction == 0.0:
+            return DEFAULT_PERIOD_BANDS
+        return default_period_bands(
+            band_overlap_fraction=band_overlap_fraction
+        )
     out: list[_PeriodBand] = []
     for spec in period_bands:
         if isinstance(spec, _PeriodBand):
@@ -825,6 +929,7 @@ def compute_site_observables(
     canonical_gauge: str = "pt_aligned",
     n_starts: int = 5,
     seed: int = 42,
+    band_overlap_fraction: float = 0.0,
 ) -> SiteObservables:
     """All distortion-as-signal observables for a single site.
 
@@ -837,7 +942,8 @@ def compute_site_observables(
         Band specification; see :func:`default_period_bands` for the
         default. Each entry can be a :class:`_PeriodBand`, a
         ``(p_min, p_max)`` tuple, or a dict with keys ``label``,
-        ``period_min``, ``period_max``.
+        ``period_min``, ``period_max``. When supplied,
+        ``band_overlap_fraction`` is ignored.
     canonical_gauge : str, default ``'pt_aligned'``
         GB canonical-gauge selection. Forwarded verbatim to
         :func:`...groom_bailey.decompose`.
@@ -845,12 +951,19 @@ def compute_site_observables(
         Multi-start count for GB.
     seed : int, default 42
         RNG seed for any stochastic component.
+    band_overlap_fraction : float, default 0.0
+        Adjacent-band overlap as a fraction of the unit band
+        width. Forwarded to :func:`default_period_bands` only
+        when ``period_bands is None``. ``0.0`` keeps the
+        backward-compatible tiled default; ``> 0`` widens each
+        band so adjacent bands share data — useful for smoother
+        spatial-coherence and period-vs-observable sweeps.
 
     Returns
     -------
     SiteObservables
     """
-    bands = _coerce_period_bands(period_bands)
+    bands = _coerce_period_bands(period_bands, band_overlap_fraction)
 
     site_id = str(getattr(mt_object, "station", "") or "")
     longitude = float(getattr(mt_object, "longitude", float("nan")) or 0.0)
@@ -954,6 +1067,7 @@ def compute_site_observables(
             n_starts=n_starts,
             period_bands=bands,
             input_identifier=site_id,
+            band_overlap_fraction=band_overlap_fraction,
         ),
     )
 
@@ -1046,6 +1160,7 @@ def _build_metadata(
     n_starts: int,
     period_bands: list[_PeriodBand],
     input_identifier: str,
+    band_overlap_fraction: float = 0.0,
 ) -> dict[str, Any]:
     return {
         "mtpy_version": _mtpy_version(),
@@ -1062,6 +1177,8 @@ def _build_metadata(
             "magnetic_distortion_diagnostic": "phase_1",
         },
         "period_bands": [b.to_dict() for b in period_bands],
+        "n_bands": len(period_bands),
+        "band_overlap_fraction": float(band_overlap_fraction),
         "canonical_gauge": canonical_gauge,
         "rng_seed": int(seed),
         "n_starts": int(n_starts),
@@ -1091,6 +1208,7 @@ def compute_collection_observables(
     n_starts: int = 5,
     seed: int = 42,
     skip_failed: bool = True,
+    band_overlap_fraction: float = 0.0,
 ) -> ObservableTable:
     """Continental-scale observable table across an MT collection.
 
@@ -1105,7 +1223,8 @@ def compute_collection_observables(
         Source of sites. If an :class:`MTCollection`, sites are
         iterated via ``.dataframe`` + ``.get_tf``; otherwise the
         argument is treated as an iterable of ``MT`` objects.
-    period_bands, canonical_gauge, n_starts, seed
+    period_bands, canonical_gauge, n_starts, seed,
+    band_overlap_fraction
         See :func:`compute_site_observables`.
     skip_failed : bool, default True
         If True, sites whose pipeline raises are logged into the
@@ -1116,7 +1235,7 @@ def compute_collection_observables(
     -------
     ObservableTable
     """
-    bands = _coerce_period_bands(period_bands)
+    bands = _coerce_period_bands(period_bands, band_overlap_fraction)
     all_rows: list[dict[str, Any]] = []
     failed: list[dict[str, str]] = []
     site_count = 0
@@ -1129,6 +1248,7 @@ def compute_collection_observables(
                 canonical_gauge=canonical_gauge,
                 n_starts=n_starts,
                 seed=seed,
+                band_overlap_fraction=band_overlap_fraction,
             )
         except Exception as exc:
             failed.append(
@@ -1151,6 +1271,7 @@ def compute_collection_observables(
         n_starts=n_starts,
         period_bands=bands,
         input_identifier=_hash_collection(mt_collection_or_list),
+        band_overlap_fraction=band_overlap_fraction,
     )
     metadata["site_count"] = int(site_count)
     metadata["failed_sites"] = failed

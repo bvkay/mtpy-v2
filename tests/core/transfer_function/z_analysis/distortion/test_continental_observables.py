@@ -505,6 +505,168 @@ def test_gamma_magnitude_periodwise_in_table_and_distinguishable():
 
 
 # ---------------------------------------------------------------------------
+# band_overlap_fraction: backward-compat default + opt-in overlap
+# ---------------------------------------------------------------------------
+
+
+def test_default_period_bands_overlap_zero_matches_legacy():
+    """``default_period_bands(0.0)`` is bit-identical to the
+    pre-existing tiled defaults (regression check).
+    """
+    from mtpy.core.transfer_function.z_analysis.decomposition.continental_observables import (
+        DEFAULT_PERIOD_BANDS,
+        default_period_bands,
+    )
+
+    fresh = default_period_bands(0.0)
+    assert len(fresh) == len(DEFAULT_PERIOD_BANDS) == 6
+    for new, ref in zip(fresh, DEFAULT_PERIOD_BANDS):
+        assert new.period_min == ref.period_min
+        assert new.period_max == ref.period_max
+        assert new.label == ref.label
+
+
+def test_default_period_bands_overlap_half_membership():
+    """With ``band_overlap_fraction=0.5``, each band is 1.5
+    decades wide and adjacent bands overlap by 0.5 decade. A
+    period at 1 s (``log10 = 0``) lies in exactly two bands.
+    """
+    from mtpy.core.transfer_function.z_analysis.decomposition.continental_observables import (
+        default_period_bands,
+    )
+
+    bands = default_period_bands(0.5)
+    assert len(bands) == 6  # n_bands unchanged
+
+    # Per-band log-width is (1 + 0.5) * 6 / 6 = 1.5 decades.
+    for band in bands:
+        log_width = float(np.log10(band.period_max / band.period_min))
+        assert abs(log_width - 1.5) < 1e-9, (
+            f"band {band.label!r}: log-width {log_width:.6f} != 1.5"
+        )
+
+    # Period 1 s appears in exactly two bands.
+    p_test = 1.0
+    in_bands = [
+        i for i, b in enumerate(bands)
+        if b.period_min <= p_test <= b.period_max
+    ]
+    assert in_bands == [1, 2], (
+        f"period 1 s should be in bands 1 and 2 with overlap=0.5; "
+        f"got bands {in_bands}"
+    )
+
+
+def test_default_period_bands_invalid_overlap():
+    """Overlap fractions outside ``[0, 1)`` raise."""
+    from mtpy.core.transfer_function.z_analysis.decomposition.continental_observables import (
+        default_period_bands,
+    )
+
+    with pytest.raises(ValueError, match=r"\[0, 1\)"):
+        default_period_bands(-0.1)
+    with pytest.raises(ValueError, match=r"\[0, 1\)"):
+        default_period_bands(1.0)
+
+
+def test_compute_collection_observables_overlap_zero_regression():
+    """``compute_collection_observables`` with
+    ``band_overlap_fraction=0.0`` is identical to the call
+    without the kwarg (defaults remain backward-compatible).
+    """
+    periods = _make_periods()
+    syn = generate_synthetic_z(
+        regional_type="2D",
+        distortion_strength="moderate",
+        distortion_shear="moderate",
+        noise_level="clean",
+        periods=periods,
+        site_id="OL00",
+        seed=42,
+    )
+    mt = _make_mt(syn["z_obj"], station="OL00")
+
+    bands = _restricted_bands()
+    table_default = compute_collection_observables(
+        [mt], period_bands=bands, n_starts=3, seed=42,
+    )
+    table_explicit = compute_collection_observables(
+        [mt], period_bands=bands, n_starts=3, seed=42,
+        band_overlap_fraction=0.0,
+    )
+    pd.testing.assert_frame_equal(
+        table_default.dataframe, table_explicit.dataframe
+    )
+    # Provenance metadata records the overlap.
+    assert table_default.metadata["band_overlap_fraction"] == 0.0
+    assert table_explicit.metadata["band_overlap_fraction"] == 0.0
+
+
+def test_compute_collection_observables_overlap_preserves_row_count():
+    """``band_overlap_fraction > 0`` keeps the same number of
+    bands per site (n_bands itself is unchanged; bands are wider,
+    not more numerous).
+    """
+    periods = _make_periods()
+    syn = generate_synthetic_z(
+        regional_type="2D",
+        distortion_strength="moderate",
+        distortion_shear="moderate",
+        noise_level="clean",
+        periods=periods,
+        site_id="OL05",
+        seed=42,
+    )
+    mt = _make_mt(syn["z_obj"], station="OL05")
+
+    # Use the module-level default bands (full 6-band set) so the
+    # overlap kwarg drives band construction.
+    table_zero = compute_collection_observables(
+        [mt], n_starts=3, seed=42, band_overlap_fraction=0.0,
+    )
+    table_half = compute_collection_observables(
+        [mt], n_starts=3, seed=42, band_overlap_fraction=0.5,
+    )
+    assert len(table_zero.dataframe) == len(table_half.dataframe) == 6, (
+        f"row count should be 6 for a single site at f=0 and f=0.5; "
+        f"got {len(table_zero.dataframe)} and "
+        f"{len(table_half.dataframe)}"
+    )
+    assert table_half.metadata["band_overlap_fraction"] == 0.5
+    assert table_half.metadata["n_bands"] == 6
+    # Per-band edges in metadata reflect the overlap geometry.
+    bands_meta = table_half.metadata["period_bands"]
+    assert len(bands_meta) == 6
+    log_widths = [
+        np.log10(b["period_max"] / b["period_min"]) for b in bands_meta
+    ]
+    for w in log_widths:
+        assert abs(w - 1.5) < 1e-9
+
+
+def test_compute_site_observables_overlap_metadata():
+    """``band_overlap_fraction`` is recorded in
+    :class:`SiteObservables.metadata`."""
+    periods = _make_periods()
+    syn = generate_synthetic_z(
+        regional_type="2D",
+        distortion_strength="weak",
+        distortion_shear="low",
+        noise_level="clean",
+        periods=periods,
+        site_id="MET01",
+        seed=42,
+    )
+    mt = _make_mt(syn["z_obj"], station="MET01")
+
+    obs = compute_site_observables(
+        mt, n_starts=3, seed=42, band_overlap_fraction=0.5,
+    )
+    assert obs.metadata["band_overlap_fraction"] == 0.5
+    assert obs.metadata["n_bands"] == 6
+
+
+# ---------------------------------------------------------------------------
 # Stop-condition smoke test: ≤ 10 s for a 2-site synthetic collection
 # ---------------------------------------------------------------------------
 
