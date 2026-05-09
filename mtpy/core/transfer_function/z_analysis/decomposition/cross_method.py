@@ -80,6 +80,26 @@ _MU_0 = 4.0 * np.pi * 1.0e-7
 # ---------------------------------------------------------------------------
 
 
+def _period_window_mask(
+    result_periods: np.ndarray,
+    window: tuple[float, float] | None,
+) -> np.ndarray:
+    """Boolean mask selecting elements of ``result_periods`` that
+    fall in ``window``.
+
+    ``window`` is a ``(pmin, pmax)`` tuple or ``None`` (no
+    filtering). Used by adapters whose underlying decomposition
+    function does not accept a ``periods`` kwarg
+    (:func:`decompose_lilley`, :func:`decompose_marti`) to filter
+    results post-call so that every adapter returns arrays of
+    matching length on the same period grid.
+    """
+    if window is None:
+        return np.ones(result_periods.size, dtype=bool)
+    pmin, pmax = window
+    return (result_periods >= pmin) & (result_periods <= pmax)
+
+
 def _z_strike_frame(
     z_meas: np.ndarray, strike_deg_per_period: np.ndarray
 ) -> np.ndarray:
@@ -204,6 +224,18 @@ def _adapter_bibby(z, periods=None, **kwargs):
     BCB itself does not produce a strike directly; we use the
     site's phase-tensor alpha (across-strike azimuth) plus 90°
     (the GB-PT convention offset, see F3) as the strike reference.
+
+    Note (intentional design): :func:`decompose_bibby` returns a
+    *single* band-averaged ``C`` tensor (Bibby et al. 2005); the
+    per-period ``twist`` and ``shear`` arrays are therefore derived
+    from a single ``C`` rotated to each period's PT-alpha frame.
+    They have the correct shape (one entry per period in the
+    window) but the values are *not* independent samples — close-by
+    periods will report the same ``C``, only their PT-alpha-driven
+    rotation differs. This matches the spec contract that adapter
+    arrays must equal ``len(selected_periods)`` and is documented in
+    the cross-method caveats. ``periods=(pmin, pmax)`` is honoured
+    by passing the window through to :func:`decompose_bibby`.
     """
     period_window: tuple[float, float] | None = None
     if periods is not None and len(periods) >= 2:
@@ -272,27 +304,47 @@ def _adapter_lilley(z, periods=None, **kwargs):
     Strike is the across-strike rotation (per F3 docstring) plus
     90° to bring it to along-strike, mod 90° for the comparison
     space.
+
+    ``decompose_lilley`` does not accept a ``periods`` kwarg, so
+    we filter its full-grid output post-call to the requested
+    window. This keeps every adapter's per-period output aligned
+    on the same period set as :func:`compute_cross_method`'s
+    ``selected_periods``, which is the contract :func:`agreement_summary`
+    relies on.
     """
     try:
         result = decompose_lilley(z, **kwargs)
     except Exception as exc:
         return _fail("error", f"decompose_lilley raised: {exc!r}")
 
-    rotation_real_rad = np.asarray(result.rotation_real_rad, dtype=np.float64)
+    mask = _period_window_mask(np.asarray(result.periods), periods)
+
+    rotation_real_rad = np.asarray(
+        result.rotation_real_rad, dtype=np.float64
+    )[mask]
     along_strike_deg = (np.degrees(rotation_real_rad) + 90.0) % 180.0
     strike = np.mod(along_strike_deg, 90.0)
 
-    dimensionality = list(result.dimensionality)
+    full_dim = list(result.dimensionality)
+    dimensionality = [
+        full_dim[i] for i in range(len(full_dim)) if bool(mask[i])
+    ]
     return _ok(strike=strike, dimensionality=dimensionality)
 
 
 def _adapter_marti(z, periods=None, **kwargs):
-    """Marti WALDIM: integer dimensionality codes per period."""
+    """Marti WALDIM: integer dimensionality codes per period.
+
+    ``decompose_marti`` does not accept a ``periods`` kwarg, so
+    we filter its full-grid output post-call to the requested
+    window — same pattern as :func:`_adapter_lilley`.
+    """
     try:
         result = decompose_marti(z, **kwargs)
     except Exception as exc:
         return _fail("error", f"decompose_marti raised: {exc!r}")
-    dim = np.asarray(result.dimensionality, dtype=np.int64)
+    mask = _period_window_mask(np.asarray(result.periods), periods)
+    dim = np.asarray(result.dimensionality, dtype=np.int64)[mask]
     return _ok(dimensionality=dim)
 
 
@@ -587,6 +639,24 @@ def agreement_summary(
     reference_method: str = "groom_bailey",
 ) -> dict[str, dict[str, float]]:
     """Per-method RMS difference vs a chosen reference method.
+
+    Statistic semantics
+    -------------------
+    Each RMS is a **per-period-pair** statistic: at every period
+    ``k`` in :attr:`CrossMethodResult.periods` we compute
+    ``Δ_k = method[k] - ref[k]`` (with circular folding for
+    strikes and log10-magnitude / radians-of-phase for regional
+    ``Z``), then square-mean across periods. This is *not* a
+    band-median-of-medians — every period contributes one
+    residual.
+
+    Per-period-pair comparison requires that every method's
+    output array has the same length and is indexed on the same
+    period grid. This is enforced by :func:`compute_cross_method`
+    and the adapters (``_adapter_lilley`` /
+    ``_adapter_marti`` post-filter the underlying methods'
+    full-grid output to the requested window, so they match GB /
+    BCB shapes); see :func:`_period_window_mask`.
 
     Returns
     -------

@@ -375,3 +375,175 @@ def test_unknown_method_recorded():
     )
     assert result.method_status["not_a_method"] == "error"
     assert "unknown" in result.method_messages["not_a_method"].lower()
+
+
+# ---------------------------------------------------------------------------
+# Period-window shape consistency (regression)
+# ---------------------------------------------------------------------------
+
+
+class TestPeriodWindowShapeConsistency:
+    """Regression for the Lilley / Marti adapter shape bug.
+
+    Prior to the fix in cross_method.py, ``_adapter_lilley`` and
+    ``_adapter_marti`` ignored the ``periods`` window and returned
+    full-grid arrays, so ``strike_estimates["lilley"]`` and
+    ``strike_estimates["groom_bailey"]`` had different lengths
+    when ``compute_cross_method(..., periods=window)`` was used.
+    This locked-in test asserts that *every* method's per-period
+    arrays now match in shape and that filtering does not perturb
+    the numerical values at the overlapping periods.
+    """
+
+    @staticmethod
+    def _ten_period_z() -> Z:
+        """Site with a clean 10-period grid 1..1000 s, 2-D regional
+        + moderate distortion. Wide enough that we can carve out a
+        sub-window of 5 contiguous periods.
+        """
+        periods = np.logspace(0.0, 3.0, 10)
+        z_regional = _build_regional_z(periods, "2D", 30.0)
+        c = _construct_C_gb89(30.0, 10.0, 8.0, 1.0)
+        z_obs = np.einsum("ij,kjl->kil", c, z_regional)
+        sigma = np.maximum(0.005 * np.abs(z_obs), 1e-9)
+        return Z(z=z_obs, z_error=sigma, frequency=1.0 / periods)
+
+    def test_full_window_yields_full_length_arrays(self):
+        z = self._ten_period_z()
+        full_periods = 1.0 / np.asarray(z.frequency, dtype=np.float64)
+        result_full = compute_cross_method(
+            z, site="full",
+            periods=(float(full_periods.min()),
+                     float(full_periods.max())),
+        )
+        assert result_full.periods.size == 10
+        for name, arr in result_full.strike_estimates.items():
+            assert arr.size == 10, (
+                f"method {name!r}: strike length {arr.size} != 10"
+            )
+        # dimensionality_estimates may also be per-period.
+        for name, dim in result_full.dimensionality_estimates.items():
+            assert len(dim) == 10, (
+                f"method {name!r}: dimensionality length "
+                f"{len(dim)} != 10"
+            )
+
+    def test_subwindow_yields_subwindow_length_arrays(self):
+        z = self._ten_period_z()
+        full_periods = np.sort(
+            1.0 / np.asarray(z.frequency, dtype=np.float64)
+        )
+        # Windows 3..7 (1-indexed) => indices 2..6 inclusive (5
+        # periods).
+        sub_pmin = float(full_periods[2])
+        sub_pmax = float(full_periods[6])
+        result_sub = compute_cross_method(
+            z, site="sub", periods=(sub_pmin, sub_pmax),
+        )
+        assert result_sub.periods.size == 5
+        for name, arr in result_sub.strike_estimates.items():
+            assert arr.size == 5, (
+                f"method {name!r}: sub-window strike length "
+                f"{arr.size} != 5"
+            )
+        for name, dim in result_sub.dimensionality_estimates.items():
+            assert len(dim) == 5, (
+                f"method {name!r}: sub-window dimensionality length "
+                f"{len(dim)} != 5"
+            )
+
+    def test_subwindow_values_match_full_window_overlap(self):
+        """Filtering does not perturb numerical values at the
+        overlapping periods.
+
+        Run two ``compute_cross_method`` calls — one over the full
+        10-period grid, one over the 5-period sub-window — and
+        assert that ``strike_estimates[name]`` values at the
+        overlapping 5 periods match between the two.
+        """
+        z = self._ten_period_z()
+        full_periods = np.sort(
+            1.0 / np.asarray(z.frequency, dtype=np.float64)
+        )
+        sub_pmin = float(full_periods[2])
+        sub_pmax = float(full_periods[6])
+
+        result_full = compute_cross_method(
+            z, site="full",
+            periods=(float(full_periods.min()),
+                     float(full_periods.max())),
+        )
+        result_sub = compute_cross_method(
+            z, site="sub", periods=(sub_pmin, sub_pmax),
+        )
+
+        # Identify the indices in the full result that correspond
+        # to the sub-window (periods 2..6 inclusive of the sorted
+        # full grid).
+        full_p = np.asarray(result_full.periods, dtype=np.float64)
+        full_indices = []
+        for p in result_sub.periods:
+            full_indices.append(int(np.argmin(np.abs(full_p - p))))
+        full_indices = np.asarray(full_indices, dtype=np.int64)
+
+        # Iterate every method that produced a strike in both runs.
+        common = (
+            set(result_full.strike_estimates.keys())
+            & set(result_sub.strike_estimates.keys())
+        )
+        # Methods whose underlying optimiser uses random starts
+        # (GB / MJ) can land on different but-equivalent modes
+        # across runs because the multi-start RNG is seeded against
+        # the full vs sub-window optimisation independently. We
+        # accept up to a 90° / 0° symmetry shift on those by
+        # comparing modulo 90°.
+        random_start = {"groom_bailey", "mcneice_jones"}
+        assert common, "no methods in common between the two runs"
+        for name in common:
+            sub_vals = np.asarray(result_sub.strike_estimates[name])
+            full_vals = np.asarray(
+                result_full.strike_estimates[name]
+            )[full_indices]
+            if name in random_start:
+                # Strict tolerance; the GB-symmetry branch is
+                # already collapsed by canonical_gauge="pt_aligned"
+                # default so values should match closely.
+                np.testing.assert_allclose(
+                    sub_vals, full_vals, atol=1.0,
+                    err_msg=(
+                        f"method {name!r}: sub-window strike "
+                        f"values diverge from full-window values"
+                    ),
+                )
+            else:
+                # Lilley / BCB / Marti are deterministic given z.
+                np.testing.assert_allclose(
+                    sub_vals, full_vals, atol=1e-6,
+                    err_msg=(
+                        f"method {name!r}: filtering perturbed "
+                        f"per-period values"
+                    ),
+                )
+
+    def test_agreement_summary_works_with_window(self):
+        """``agreement_summary`` previously raised
+        ``ValueError`` on shape mismatch when a period window was
+        supplied. With the adapter fix, it returns finite per-method
+        RMS values for every method that produces a strike or
+        regional Z.
+        """
+        z = self._ten_period_z()
+        full_periods = np.sort(
+            1.0 / np.asarray(z.frequency, dtype=np.float64)
+        )
+        result = compute_cross_method(
+            z, site="agree",
+            periods=(float(full_periods[2]), float(full_periods[6])),
+        )
+        agreement = agreement_summary(
+            result, reference_method="groom_bailey"
+        )
+        # Lilley should appear (it produces a strike) and have a
+        # finite ``strike_rms_deg``.
+        assert "lilley" in agreement
+        assert np.isfinite(agreement["lilley"]["strike_rms_deg"])
