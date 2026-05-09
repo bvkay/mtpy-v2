@@ -1287,73 +1287,312 @@ class ObservableTable:
 
     Serialisation
     -------------
-    :meth:`to_parquet` / :meth:`from_parquet` round-trip the table
-    with metadata as a sidecar JSON. Parquet preserves dtypes
-    natively (so e.g. ``WALDIM_case`` stays ``int64`` and the
-    string classifications stay ``object`` / ``string`` dtype),
-    enabling fast continental-scale loading. Parquet engine is
-    pandas-default (``pyarrow`` if installed, else ``fastparquet``);
-    if neither is installed, the I/O methods raise
-    :class:`ImportError` with a guidance message.
+    :meth:`to_netcdf` / :meth:`from_netcdf` round-trip the table
+    with full dtype preservation (nullable ``Int64``, ``boolean``,
+    string, complex columns all survive intact). The format is a
+    single self-contained netCDF file — no sidecars — with the
+    ``metadata`` dict packed into ``Dataset.attrs``. netCDF /
+    xarray is the canonical serialisation format used elsewhere in
+    this package (e.g. :meth:`DecompositionResult.to_netcdf`); the
+    ``netcdf4`` dependency is already part of the project closure.
+
+    :meth:`to_csv` is a one-way export for human-readable
+    workflows (supervisor review, GIS overlay, publication
+    supplementary data). It writes a sidecar ``.metadata.json``
+    next to the CSV but does *not* claim to preserve dtypes —
+    use :meth:`to_netcdf` / :meth:`from_netcdf` for round-tripping.
+    There is no ``from_csv``; re-loading is the user's
+    responsibility via :func:`pandas.read_csv`.
+
+    Schema-evolution behaviour
+    --------------------------
+    :meth:`from_netcdf` validates the loaded columns against the
+    current :data:`...continental_observables.OBSERVABLE_COLUMNS`:
+
+    * a column present in the file but missing from the current
+      schema is loaded with a :class:`UserWarning` (forward
+      compatibility — an older mtpy reading a file from a newer
+      version sees an extra column);
+    * a column missing from the file but required by the current
+      schema raises :class:`ValueError` (the file is too old to
+      use; re-write from the source).
     """
 
     dataframe: Any  # pandas.DataFrame; declared `Any` to avoid hard import
     metadata: dict[str, Any] = field(default_factory=dict)
 
-    def to_parquet(self, path: "str | Path") -> None:
-        """Write the table + metadata sidecar to a parquet file.
+    def to_netcdf(self, path: "str | Path") -> None:
+        """Write the table + metadata to a single netCDF file.
 
-        Sidecar metadata JSON path is ``<path>.metadata.json``.
+        Each DataFrame column becomes a netCDF variable indexed by
+        a single ``row`` dimension. Dtype handling:
+
+        * ``string`` columns: stored as object arrays of unicode
+          strings; ``pd.NA`` and ``NaN`` are serialised as the
+          empty string and reconstructed via the per-column
+          ``_isna`` mask.
+        * Nullable ``Int64`` columns (e.g. ``WALDIM_case``):
+          stored as float64 with ``NaN`` for ``pd.NA``;
+          reconstructed via the original-dtype attrs map.
+        * ``boolean`` (nullable) columns (e.g.
+          ``GB_mode_warning``, ``dimensionality_concordant``):
+          stored as float64 with ``NaN`` for ``pd.NA``;
+          reconstructed to ``boolean`` dtype on read.
+        * ``complex`` columns: stored as paired ``<col>_real``
+          and ``<col>_imag`` float64 arrays with the original
+          dtype recorded in attrs.
+        * Plain numeric columns: stored as their native dtype.
+
+        Metadata: scalar entries become :attr:`xarray.Dataset.attrs`
+        directly; list / dict entries (including
+        ``period_bands`` and ``failed_sites``) are JSON-encoded
+        into per-key ``<name>_json`` attrs.
+
+        Parameters
+        ----------
+        path : str or Path
+            Output path; ``.nc`` extension by convention.
+        """
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        ds = self._build_dataset()
+        ds.to_netcdf(path, mode="w")
+        # Close any underlying file handles eagerly.
+        if hasattr(ds, "close"):
+            ds.close()
+
+    @classmethod
+    def from_netcdf(cls, path: "str | Path") -> "ObservableTable":
+        """Inverse of :meth:`to_netcdf`.
+
+        Reconstructs the DataFrame (with original dtypes) and
+        the metadata dict.
 
         Raises
         ------
-        ImportError
-            If neither ``pyarrow`` nor ``fastparquet`` is installed
-            (pandas requires one of them as a parquet engine).
+        ValueError
+            If the loaded netCDF is missing one or more columns
+            required by the current
+            :data:`...continental_observables.OBSERVABLE_COLUMNS`.
+        UserWarning (warning, not exception)
+            If the loaded netCDF contains columns not present in
+            the current schema (i.e. the file came from a newer
+            mtpy with extra columns).
+        """
+        import xarray as xr
+
+        path = Path(path)
+        ds = xr.open_dataset(path)
+        try:
+            return cls._from_dataset(ds)
+        finally:
+            ds.close()
+
+    def to_csv(self, path: "str | Path") -> None:
+        """Write the DataFrame to a CSV file plus a sidecar
+        ``<path>.metadata.json``.
+
+        CSV is a *one-way* export for humans, GIS overlay, and
+        publication. Use :meth:`to_netcdf` / :meth:`from_netcdf`
+        for round-tripping — CSV does not preserve nullable
+        ``Int64`` / ``boolean`` dtypes (they roundtrip as float
+        with ``NaN``). The sidecar JSON is the user's
+        responsibility to keep paired with the CSV; there is no
+        ``from_csv``.
+
+        Parameters
+        ----------
+        path : str or Path
         """
         import json
 
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            self.dataframe.to_parquet(path, index=False)
-        except ImportError as exc:
-            raise ImportError(
-                "ObservableTable.to_parquet: requires pyarrow or "
-                "fastparquet to be installed. Install one with "
-                "`pip install pyarrow` or `pip install fastparquet`."
-            ) from exc
-
-        metadata_path = Path(str(path) + ".metadata.json")
-        with metadata_path.open("w") as f:
+        self.dataframe.to_csv(path, index=False)
+        sidecar = Path(str(path) + ".metadata.json")
+        with sidecar.open("w") as f:
             json.dump(self.metadata, f, indent=2, default=_json_serialise_numpy)
 
-    @classmethod
-    def from_parquet(cls, path: "str | Path") -> "ObservableTable":
-        """Read a parquet file written by :meth:`to_parquet`.
+    # -----------------------------------------------------------------
+    # netCDF round-trip helpers (private)
+    # -----------------------------------------------------------------
 
-        Reads metadata from the sidecar JSON if present; an absent
-        sidecar produces an empty metadata dict.
-        """
+    def _build_dataset(self):
+        """Encode the DataFrame + metadata into an xarray Dataset."""
         import json
 
         import pandas as pd
+        import xarray as xr
 
-        path = Path(path)
-        try:
-            df = pd.read_parquet(path)
-        except ImportError as exc:
-            raise ImportError(
-                "ObservableTable.from_parquet: requires pyarrow or "
-                "fastparquet to be installed."
-            ) from exc
+        df = self.dataframe
+        n_rows = len(df)
 
-        metadata_path = Path(str(path) + ".metadata.json")
-        if metadata_path.exists():
-            with metadata_path.open() as f:
-                metadata = json.load(f, object_hook=_json_deserialise_numpy)
-        else:
-            metadata = {}
+        data_vars: dict[str, Any] = {}
+        column_dtypes: dict[str, str] = {}
+        # Track which columns are encoded as paired real/imag.
+        complex_columns: list[str] = []
+
+        for col in df.columns:
+            s = df[col]
+            dtype_name = str(s.dtype)
+            column_dtypes[col] = dtype_name
+
+            if pd.api.types.is_complex_dtype(s):
+                arr = s.to_numpy()
+                data_vars[f"{col}_real"] = (("row",), np.real(arr).astype(np.float64))
+                data_vars[f"{col}_imag"] = (("row",), np.imag(arr).astype(np.float64))
+                complex_columns.append(col)
+                continue
+
+            if dtype_name == "Int64":
+                # Nullable int → float with NaN sentinels.
+                arr = s.astype("float64").to_numpy()
+                data_vars[col] = (("row",), arr)
+                continue
+
+            if dtype_name == "boolean":
+                # Nullable bool → float with NaN sentinels.
+                arr = s.astype("Float64").to_numpy(dtype=np.float64, na_value=np.nan)
+                data_vars[col] = (("row",), arr)
+                continue
+
+            if dtype_name in ("string", "object") or pd.api.types.is_string_dtype(s):
+                # String → object array; pd.NA / NaN → "".
+                isna = s.isna().to_numpy(dtype=bool)
+                strs = np.empty(n_rows, dtype=object)
+                vals = s.to_numpy()
+                for i in range(n_rows):
+                    if isna[i]:
+                        strs[i] = ""
+                    else:
+                        strs[i] = str(vals[i])
+                data_vars[col] = (("row",), strs)
+                data_vars[f"{col}__isna"] = (("row",), isna.astype(np.int8))
+                continue
+
+            # Plain numeric.
+            data_vars[col] = (("row",), s.to_numpy())
+
+        ds = xr.Dataset(
+            data_vars=data_vars,
+            coords={"row": np.arange(n_rows)},
+        )
+
+        # Provenance of dtype & complex columns for round-trip.
+        ds.attrs["__column_dtypes_json"] = json.dumps(column_dtypes)
+        ds.attrs["__complex_columns_json"] = json.dumps(complex_columns)
+        ds.attrs["__schema_version"] = "1"
+
+        # Metadata: scalars direct, lists/dicts JSON-encoded.
+        for key, val in (self.metadata or {}).items():
+            if val is None:
+                continue
+            if isinstance(val, (str, int, float, bool, np.integer, np.floating)):
+                # Native scalar.
+                ds.attrs[key] = val if not isinstance(val, np.generic) else val.item()
+            else:
+                ds.attrs[f"{key}__json"] = json.dumps(
+                    val, default=_json_serialise_numpy
+                )
+        return ds
+
+    @classmethod
+    def _from_dataset(cls, ds) -> "ObservableTable":
+        """Decode an xarray Dataset back into an ObservableTable."""
+        import json
+        import warnings
+
+        import pandas as pd
+
+        from .continental_observables import OBSERVABLE_COLUMNS
+
+        column_dtypes: dict[str, str] = json.loads(
+            ds.attrs.get("__column_dtypes_json", "{}")
+        )
+        complex_columns: list[str] = json.loads(
+            ds.attrs.get("__complex_columns_json", "[]")
+        )
+
+        # Rebuild columns in their original dtypes.
+        data: dict[str, Any] = {}
+        for col, dtype_name in column_dtypes.items():
+            if col in complex_columns:
+                real = ds[f"{col}_real"].values
+                imag = ds[f"{col}_imag"].values
+                data[col] = (real + 1j * imag).astype(dtype_name)
+                continue
+
+            if dtype_name == "Int64":
+                arr = ds[col].values.astype(np.float64)
+                data[col] = pd.array(arr, dtype="Int64")
+                continue
+
+            if dtype_name == "boolean":
+                arr = ds[col].values.astype(np.float64)
+                mask = np.isnan(arr)
+                bool_arr = pd.array(arr.astype(bool), dtype="boolean")
+                bool_arr[mask] = pd.NA
+                data[col] = bool_arr
+                continue
+
+            if dtype_name in ("string", "object"):
+                strs = np.asarray(ds[col].values)
+                isna_var = f"{col}__isna"
+                if isna_var in ds.data_vars:
+                    isna = ds[isna_var].values.astype(bool)
+                else:
+                    isna = np.zeros(strs.size, dtype=bool)
+                obj = np.empty(strs.size, dtype=object)
+                for i in range(strs.size):
+                    obj[i] = pd.NA if isna[i] else str(strs[i])
+                data[col] = pd.array(obj, dtype="string")
+                continue
+
+            data[col] = np.asarray(ds[col].values).astype(dtype_name)
+
+        df = pd.DataFrame(data)
+
+        # Schema evolution checks.
+        expected = list(OBSERVABLE_COLUMNS)
+        present = list(df.columns)
+        missing = [c for c in expected if c not in present]
+        extra = [c for c in present if c not in expected]
+        if missing:
+            raise ValueError(
+                f"ObservableTable.from_netcdf: required columns missing "
+                f"from netCDF: {missing}. The file is from an older "
+                f"mtpy version; re-write from the source."
+            )
+        if extra:
+            warnings.warn(
+                f"ObservableTable.from_netcdf: netCDF contains columns "
+                f"not in the current schema: {extra}. They are loaded "
+                f"as-is (forward compatibility); upgrade mtpy if you "
+                f"want first-class support for these columns.",
+                UserWarning,
+                stacklevel=3,
+            )
+        # Reorder so schema columns come first.
+        ordered = expected + [c for c in present if c not in expected]
+        df = df[ordered]
+
+        # Reconstruct metadata. Coerce numpy scalars (which xarray
+        # returns for integer / float attrs) back to Python
+        # primitives so equality with originally-written
+        # ``dict[str, int | float | str]`` metadata is exact.
+        metadata: dict[str, Any] = {}
+        for attr_key, attr_val in ds.attrs.items():
+            if attr_key.startswith("__"):
+                continue  # internal provenance
+            if attr_key.endswith("__json"):
+                base = attr_key[: -len("__json")]
+                metadata[base] = json.loads(
+                    attr_val, object_hook=_json_deserialise_numpy
+                )
+            elif isinstance(attr_val, np.generic):
+                metadata[attr_key] = attr_val.item()
+            else:
+                metadata[attr_key] = attr_val
         return cls(dataframe=df, metadata=metadata)
 
 

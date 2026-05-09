@@ -72,8 +72,19 @@ Usage
     )
 
     table = compute_collection_observables(mt_collection)
-    table.to_parquet("auslamp_observables.parquet")
-    df = table.dataframe   # long-format pandas DataFrame
+    table.to_netcdf("auslamp_observables.nc")    # round-trippable
+    table.to_csv("auslamp_observables.csv")      # human-readable export
+    df = table.dataframe                         # long-format DataFrame
+
+netCDF is the canonical serialisation format — round-trippable with
+full dtype preservation (nullable ``Int64``, ``boolean``, string,
+complex columns all survive intact); ``netcdf4`` is already in
+the project closure. CSV is a one-way export for humans, GIS
+overlay, and publication; it does not preserve nullable dtypes.
+``ObservableTable.from_netcdf`` validates the loaded schema against
+the current :data:`OBSERVABLE_COLUMNS`: extra columns load with a
+:class:`UserWarning` (forward compatibility), missing columns
+raise :class:`ValueError`.
 
 The default :data:`DEFAULT_PERIOD_BANDS` is six 1-decade-wide bands
 tiled across ``[0.01, 10000]`` s (the AusLAMP design range). Pass

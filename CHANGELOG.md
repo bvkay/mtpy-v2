@@ -14,6 +14,19 @@ traditions in MT, and lays the groundwork for adding
 non-Groom-Bailey methods (Bahr, WAL, Lilley, García & Jones) under
 the same API.
 
+### Dependency removed
+- **``pyarrow`` is no longer referenced** by ``ObservableTable``.
+  ``to_parquet`` / ``from_parquet`` have been replaced with
+  ``to_netcdf`` / ``from_netcdf`` (canonical xarray-backed I/O,
+  matching :meth:`DecompositionResult.to_netcdf` elsewhere in
+  the package); a one-way ``to_csv`` plus sidecar
+  ``<path>.metadata.json`` is provided for human-readable
+  export. ``netcdf4`` is already in the project closure
+  (``mt_decomp`` requires it transitively via ``xarray``); no
+  new dependency is added. The two tests that previously
+  ``importorskip``-ed ``pyarrow`` are now first-class and run
+  unconditionally.
+
 ### Changed
 - **Restructured `decomposition.py` into a package** at
   `mtpy/core/transfer_function/z_analysis/decomposition/`. The

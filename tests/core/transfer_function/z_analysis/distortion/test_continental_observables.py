@@ -1,6 +1,6 @@
 """Tests for the continental_observables pipeline.
 
-Six required scenarios:
+Required scenarios:
 
 1. Single-site schema completeness on a synthetic 2-D site.
 2. Five-site profile assembly into the long-format table.
@@ -10,8 +10,11 @@ Six required scenarios:
    bit-identical except for timestamp.
 5. Discordance computation: synthetic site with known
    C-axis / PT-alpha offset → recovers the offset.
-6. Round-trip through parquet preserves dataframe equality and
-   dtypes.
+6. netCDF round-trip preserves DataFrame (incl. nullable Int64,
+   nullable string, nullable boolean dtypes) AND metadata.
+   CSV one-way export with metadata sidecar JSON.
+   Schema-evolution tolerance (extra column warns, missing
+   column raises).
 """
 
 from __future__ import annotations
@@ -355,56 +358,257 @@ def test_discordance_recovery():
 
 
 # ---------------------------------------------------------------------------
-# Test 6: parquet round trip
+# Test 6 (replaced): netCDF round-trip + CSV export
 # ---------------------------------------------------------------------------
 
 
-def test_parquet_round_trip(tmp_path):
-    pytest.importorskip(
-        "pyarrow",
-        reason="parquet round trip requires pyarrow or fastparquet",
+def _build_synthetic_table(
+    site_ids: list[str] | None = None,
+    *,
+    n_rows: int = 4,
+) -> ObservableTable:
+    """Construct a small ObservableTable directly from rows so the
+    serialisation tests can exercise every dtype hazard
+    (nullable Int64, nullable string, nullable boolean) without
+    depending on the full GB pipeline.
+    """
+    if site_ids is None:
+        site_ids = [f"S{i:03d}" for i in range(n_rows)]
+    rng = np.random.default_rng(0)
+    rows = []
+    for i, sid in enumerate(site_ids):
+        row = {col: np.nan for col in OBSERVABLE_COLUMNS}
+        row["site_id"] = sid
+        row["period_band_label"] = "1s_10s"
+        row["period_band_geomean_s"] = 3.16
+        row["longitude_deg"] = 140.0 + 0.5 * i
+        row["latitude_deg"] = -30.0 - 0.5 * i
+        row["elevation_m"] = 0.0
+        row["gamma_magnitude"] = 0.05 + 0.01 * i
+        row["gamma_magnitude_periodwise"] = 0.05 + 0.01 * i
+        row["GB_rms_misfit"] = 1.5 + 0.1 * rng.standard_normal()
+        row["PT_abs_beta_deg"] = 1.0 + 0.5 * rng.standard_normal()
+        # Coverage: leave one row with <NA> for nullable columns.
+        if i % 2 == 0:
+            row["WALDIM_case"] = 2
+            row["Lilley_category"] = "2D"
+            row["magnetic_distortion_flag"] = "low_risk"
+            row["GB_mode_warning"] = False
+            row["dimensionality_concordant"] = True
+        else:
+            row["WALDIM_case"] = pd.NA
+            row["Lilley_category"] = pd.NA
+            row["magnetic_distortion_flag"] = pd.NA
+            row["GB_mode_warning"] = pd.NA
+            row["dimensionality_concordant"] = pd.NA
+        rows.append(row)
+    df = pd.DataFrame(rows, columns=OBSERVABLE_COLUMNS)
+    df["site_id"] = df["site_id"].astype("string")
+    df["period_band_label"] = df["period_band_label"].astype("string")
+    df["WALDIM_case"] = df["WALDIM_case"].astype("Int64")
+    df["Lilley_category"] = df["Lilley_category"].astype("string")
+    df["magnetic_distortion_flag"] = df["magnetic_distortion_flag"].astype(
+        "string"
     )
-    periods = _make_periods()
-    bands = _restricted_bands()
-    syn = generate_synthetic_z(
-        regional_type="2D",
-        distortion_strength="weak",
-        distortion_shear="low",
-        noise_level="clean",
-        periods=periods,
-        site_id="PRQ",
-        seed=42,
+    df["GB_mode_warning"] = df["GB_mode_warning"].astype("boolean")
+    df["dimensionality_concordant"] = df["dimensionality_concordant"].astype(
+        "boolean"
     )
-    mt = _make_mt(syn["z_obj"], station="PRQ")
+    metadata = {
+        "mtpy_version": "test",
+        "decomposition_git_sha": "abcdef0",
+        "timestamp_utc": "2026-05-09T00:00:00+00:00",
+        "canonical_gauge": "pt_aligned",
+        "rng_seed": 42,
+        "n_starts": 3,
+        "n_bands": 1,
+        "band_overlap_fraction": 0.0,
+        "input_identifier": "synth",
+        "period_bands": [
+            {"label": "1s_10s", "period_min": 1.0, "period_max": 10.0,
+             "geomean": 3.16}
+        ],
+        "method_versions": {"groom_bailey": "phase_1"},
+        "failed_sites": [],
+    }
+    return ObservableTable(dataframe=df, metadata=metadata)
 
-    table = compute_collection_observables(
-        [mt], period_bands=bands, n_starts=3, seed=42,
-    )
 
-    path = tmp_path / "obs.parquet"
-    table.to_parquet(path)
+def test_to_netcdf_from_netcdf_roundtrip(tmp_path):
+    """Full DataFrame and metadata round-trip through netCDF."""
+    table = _build_synthetic_table()
+    path = tmp_path / "obs.nc"
+    table.to_netcdf(path)
     assert path.exists()
-    sidecar = Path(str(path) + ".metadata.json")
-    assert sidecar.exists()
-    # Sidecar JSON is valid.
-    with sidecar.open() as f:
-        json.load(f)
+    table_back = ObservableTable.from_netcdf(path)
 
-    table_back = ObservableTable.from_parquet(path)
     pd.testing.assert_frame_equal(
         table.dataframe.reset_index(drop=True),
         table_back.dataframe.reset_index(drop=True),
     )
-    # Dtype preservation: schema-fixed columns survive the round
-    # trip with the same dtypes.
-    for col in (
-        "site_id", "period_band_label", "Lilley_category",
-        "magnetic_distortion_flag",
-    ):
-        assert (
-            str(table.dataframe[col].dtype)
-            == str(table_back.dataframe[col].dtype)
+    # Metadata equality (period_bands round-trips through JSON).
+    assert table.metadata == table_back.metadata
+
+
+def test_to_netcdf_preserves_nullable_int(tmp_path):
+    """``WALDIM_case`` keeps both its ``Int64`` dtype and its
+    ``<NA>`` pattern across the round-trip."""
+    table = _build_synthetic_table(n_rows=6)
+    path = tmp_path / "obs.nc"
+    table.to_netcdf(path)
+    back = ObservableTable.from_netcdf(path)
+    assert str(back.dataframe["WALDIM_case"].dtype) == "Int64"
+    pd.testing.assert_series_equal(
+        back.dataframe["WALDIM_case"].reset_index(drop=True),
+        table.dataframe["WALDIM_case"].reset_index(drop=True),
+    )
+
+
+def test_to_netcdf_preserves_bool(tmp_path):
+    """Nullable ``boolean`` columns round-trip with ``<NA>``
+    intact."""
+    table = _build_synthetic_table(n_rows=6)
+    path = tmp_path / "obs.nc"
+    table.to_netcdf(path)
+    back = ObservableTable.from_netcdf(path)
+    for col in ("GB_mode_warning", "dimensionality_concordant"):
+        assert str(back.dataframe[col].dtype) == "boolean"
+        pd.testing.assert_series_equal(
+            back.dataframe[col].reset_index(drop=True),
+            table.dataframe[col].reset_index(drop=True),
         )
+
+
+def test_to_netcdf_preserves_string(tmp_path):
+    """``string`` columns round-trip with ``<NA>`` intact."""
+    table = _build_synthetic_table(n_rows=6)
+    path = tmp_path / "obs.nc"
+    table.to_netcdf(path)
+    back = ObservableTable.from_netcdf(path)
+    for col in ("site_id", "period_band_label", "Lilley_category",
+                "magnetic_distortion_flag"):
+        assert str(back.dataframe[col].dtype) == "string"
+        pd.testing.assert_series_equal(
+            back.dataframe[col].reset_index(drop=True),
+            table.dataframe[col].reset_index(drop=True),
+        )
+
+
+def test_to_netcdf_preserves_complex(tmp_path):
+    """Complex columns added outside the schema round-trip
+    correctly (paired real/imag float arrays).
+
+    The current schema has ``C_determinant_real`` /
+    ``C_determinant_imag`` rather than a single complex
+    ``C_determinant`` column, but the netCDF I/O is
+    forward-compatible: an extra complex column appended to the
+    DataFrame round-trips with its dtype preserved.
+    """
+    table = _build_synthetic_table(n_rows=4)
+    df = table.dataframe.copy()
+    n = len(df)
+    df["__complex_test"] = pd.array(
+        np.array([1.0 + 2.0j, 3.0 - 4.0j, 5.0, 0.0], dtype=np.complex128),
+        dtype=np.complex128,
+    )
+    table_with_complex = ObservableTable(
+        dataframe=df, metadata=table.metadata
+    )
+    path = tmp_path / "obs.nc"
+    table_with_complex.to_netcdf(path)
+    # Reading it back triggers the extra-column UserWarning
+    # (validated separately in test_from_netcdf_extra_column_warns).
+    import warnings
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        back = ObservableTable.from_netcdf(path)
+    assert "__complex_test" in back.dataframe.columns
+    np.testing.assert_array_equal(
+        back.dataframe["__complex_test"].to_numpy(),
+        df["__complex_test"].to_numpy(),
+    )
+    assert str(back.dataframe["__complex_test"].dtype) == "complex128"
+    assert n == len(back.dataframe)
+
+
+def test_to_csv_writes_dataframe(tmp_path):
+    """``to_csv`` produces a CSV that re-loads (via pandas) with
+    matching values for non-nullable columns. Dtypes are *not*
+    asserted — CSV doesn't preserve nullable Int64 / boolean.
+    """
+    table = _build_synthetic_table(n_rows=4)
+    path = tmp_path / "obs.csv"
+    table.to_csv(path)
+    assert path.exists()
+
+    df_back = pd.read_csv(path)
+    # site_id and period_band_label survive as object/string.
+    assert df_back["site_id"].tolist() == table.dataframe["site_id"].tolist()
+    # Float columns match numerically.
+    np.testing.assert_allclose(
+        df_back["gamma_magnitude"].to_numpy(),
+        table.dataframe["gamma_magnitude"].to_numpy(dtype=np.float64),
+    )
+
+
+def test_to_csv_writes_metadata_sidecar(tmp_path):
+    """The sidecar ``<path>.metadata.json`` is written and
+    parses to the original metadata dict."""
+    table = _build_synthetic_table()
+    path = tmp_path / "obs.csv"
+    table.to_csv(path)
+    sidecar = Path(str(path) + ".metadata.json")
+    assert sidecar.exists()
+    with sidecar.open() as f:
+        loaded = json.load(f)
+    assert loaded["rng_seed"] == 42
+    assert loaded["canonical_gauge"] == "pt_aligned"
+    assert isinstance(loaded["period_bands"], list)
+
+
+def test_from_netcdf_extra_column_warns(tmp_path):
+    """A netCDF with a column not present in the current schema
+    loads with a :class:`UserWarning` rather than raising."""
+    table = _build_synthetic_table()
+    df = table.dataframe.copy()
+    df["__future_column"] = np.linspace(0.0, 1.0, len(df))
+    table2 = ObservableTable(dataframe=df, metadata=table.metadata)
+    path = tmp_path / "obs.nc"
+    table2.to_netcdf(path)
+
+    with pytest.warns(UserWarning, match="__future_column"):
+        back = ObservableTable.from_netcdf(path)
+    assert "__future_column" in back.dataframe.columns
+
+
+def test_from_netcdf_missing_column_raises(tmp_path):
+    """A netCDF missing a required schema column raises
+    :class:`ValueError`."""
+    table = _build_synthetic_table()
+    df = table.dataframe.drop(columns=["gamma_magnitude_periodwise"])
+    table2 = ObservableTable(dataframe=df, metadata=table.metadata)
+    path = tmp_path / "obs.nc"
+    table2.to_netcdf(path)
+
+    with pytest.raises(
+        ValueError, match=r"required columns missing.*gamma_magnitude_periodwise"
+    ):
+        ObservableTable.from_netcdf(path)
+
+
+def test_to_netcdf_no_sidecar_files(tmp_path):
+    """The netCDF file is self-contained: no sidecar JSON is
+    written (unlike the CSV path)."""
+    table = _build_synthetic_table()
+    path = tmp_path / "obs.nc"
+    table.to_netcdf(path)
+    assert path.exists()
+    sidecar = Path(str(path) + ".metadata.json")
+    assert not sidecar.exists(), (
+        "to_netcdf must not write a sidecar JSON; metadata travels "
+        "in the netCDF Dataset.attrs."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -672,11 +876,9 @@ def test_compute_site_observables_overlap_metadata():
 
 
 def test_pipeline_speed_smoke(tmp_path):
-    """The pipeline produces a parquet file from a small synthetic
+    """The pipeline produces a netCDF file from a small synthetic
     MTCollection in under 10 seconds.
     """
-    if not _has_parquet_engine():
-        pytest.skip("parquet round trip requires pyarrow or fastparquet")
     periods = _make_periods()
     bands = _restricted_bands()
     sites = []
@@ -696,20 +898,7 @@ def test_pipeline_speed_smoke(tmp_path):
     table = compute_collection_observables(
         sites, period_bands=bands, n_starts=3, seed=42,
     )
-    table.to_parquet(tmp_path / "smoke.parquet")
+    table.to_netcdf(tmp_path / "smoke.nc")
     elapsed = time.perf_counter() - t0
 
     assert elapsed < 10.0, f"pipeline took {elapsed:.2f}s, > 10s budget"
-
-
-def _has_parquet_engine() -> bool:
-    try:
-        import pyarrow  # noqa: F401
-        return True
-    except ImportError:
-        pass
-    try:
-        import fastparquet  # noqa: F401
-        return True
-    except ImportError:
-        return False
