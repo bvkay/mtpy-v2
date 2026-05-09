@@ -68,8 +68,72 @@ ALL_METHODS: list[str] = [
     "garcia_jones",
     "gomez_trevino",
 ]
-"""The full list of registered method names. To add a new method,
-write its adapter and append the name here."""
+"""The full registry of method names. To add a new method, write
+its adapter and append the name here. Always includes
+``mcneice_jones`` even though it is not in
+:data:`DEFAULT_METHODS` — see that constant's docstring for the
+single-site contract.
+"""
+
+
+DEFAULT_METHODS: list[str] = [
+    "groom_bailey",
+    "bibby",
+    "lilley",
+    "marti",
+    "garcia_jones",
+    "gomez_trevino",
+]
+"""Methods :func:`compute_cross_method` runs by default.
+
+Excludes ``mcneice_jones`` because the joint MJ fit requires
+``≥ 2`` sites; :func:`compute_cross_method` is single-site
+machinery, and MJ in single-site mode reduces exactly to GB —
+running it would duplicate the GB output. The continental
+pipeline runs joint MJ separately at the collection level (see
+:func:`...continental_observables._run_joint_mj_for_collection`).
+
+``garcia_jones`` is included for completeness — it returns
+``status="no_solution"`` on single-site calls (its joint nature
+makes it unhelpful at one site), and the test suite asserts that
+the other five methods succeed alongside the GJ no-solution.
+
+The "three traditions converge" claim of Paper 1 (parametric
+GB / joint MJ / gauge-fixed BCB / Mohr-circle Lilley / WALDIM
+Marti / 3-D-regional GJ / rotational-invariant Gomez-Treviño)
+is empirically stronger when every method participates; the
+default expansion makes that the out-of-the-box behaviour rather
+than a kwarg the caller must remember.
+"""
+
+
+METHOD_CAPABILITIES: dict[str, list[str]] = {
+    "groom_bailey": ["strike", "twist_shear", "regional_z"],
+    "mcneice_jones": ["strike", "twist_shear", "regional_z"],
+    "bibby": ["strike", "twist_shear", "regional_z"],
+    "lilley": ["strike", "dimensionality"],
+    "marti": ["dimensionality"],
+    "garcia_jones": ["strike", "twist_shear", "regional_z"],
+    "gomez_trevino": ["regional_z", "dimensionality"],
+}
+"""Per-method capability map: which fields each adapter
+populates on success.
+
+Available capability tags:
+
+* ``"strike"`` — per-period strike (degrees, mod 90°)
+* ``"twist_shear"`` — per-period twist & shear (degrees)
+* ``"regional_z"`` — per-period regional ``Z`` (anti-diagonal
+  in strike frame for 2-D methods; full ``2x2`` for 3-D-regional
+  methods like Garcia-Jones)
+* ``"dimensionality"`` — per-period dimensionality classification
+
+Methods absent from a capability category are documented in
+:func:`agreement_summary`'s "outer-key" docstring as not
+appearing for that comparison. The map is the source of truth
+for downstream code that wants to know "which methods produce
+strikes?" without inspecting each adapter.
+"""
 
 
 _MU_0 = 4.0 * np.pi * 1.0e-7
@@ -444,7 +508,12 @@ def compute_cross_method(
         Identifier; defaults to ``""``.
     methods : list of str, optional
         Subset of :data:`ALL_METHODS` to run. ``None`` (default)
-        runs all.
+        uses :data:`DEFAULT_METHODS` — every implemented method
+        except ``mcneice_jones`` (which requires ≥2 sites and is
+        plumbed at the collection level by
+        :mod:`...continental_observables`). Pass
+        ``methods=ALL_METHODS`` to include MJ in single-site mode
+        (it then reduces to GB).
     periods : (pmin, pmax), optional
         Restrict each method to this period window where
         applicable.
@@ -453,7 +522,7 @@ def compute_cross_method(
         (must be in :data:`ALL_METHODS`); values are dicts forwarded
         to the underlying decomposition function.
     """
-    methods = methods if methods is not None else ALL_METHODS
+    methods = methods if methods is not None else DEFAULT_METHODS
     method_kwargs = method_kwargs or {}
 
     site_id = site or ""
@@ -516,6 +585,12 @@ def compute_cross_method(
         if out["dimensionality"] is not None:
             dimensionality_estimates[name] = out["dimensionality"]
 
+    capabilities = {
+        name: list(METHOD_CAPABILITIES.get(name, []))
+        for name in methods
+        if name in METHOD_CAPABILITIES
+    }
+
     return CrossMethodResult(
         site=site_id,
         periods=selected_periods,
@@ -525,6 +600,7 @@ def compute_cross_method(
         dimensionality_estimates=dimensionality_estimates,
         method_status=method_status,
         method_messages=method_messages,
+        method_capabilities=capabilities,
     )
 
 

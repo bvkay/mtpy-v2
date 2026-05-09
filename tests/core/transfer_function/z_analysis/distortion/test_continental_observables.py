@@ -301,10 +301,33 @@ def test_provenance_metadata():
     )
     pd.testing.assert_frame_equal(table_a.dataframe, table_b.dataframe)
     md_b = table_b.metadata
-    # timestamps differ; everything else matches.
+
+    # Timestamps differ; everything else matches. Handle NaN-valued
+    # metadata fields (like MJ_joint_rms_misfit on a single-site
+    # collection) explicitly because plain ``dict ==`` returns
+    # False for ``nan == nan``.
+    def _md_equal(a: dict, b: dict) -> bool:
+        if set(a.keys()) != set(b.keys()):
+            return False
+        for k in a:
+            va, vb = a[k], b[k]
+            try:
+                a_nan = isinstance(va, float) and np.isnan(va)
+                b_nan = isinstance(vb, float) and np.isnan(vb)
+            except TypeError:
+                a_nan = b_nan = False
+            if a_nan and b_nan:
+                continue
+            if va != vb:
+                return False
+        return True
+
     md_a_no_ts = {k: v for k, v in md.items() if k != "timestamp_utc"}
     md_b_no_ts = {k: v for k, v in md_b.items() if k != "timestamp_utc"}
-    assert md_a_no_ts == md_b_no_ts
+    assert _md_equal(md_a_no_ts, md_b_no_ts), (
+        f"metadata diverged across same-seed runs:\n"
+        f"  a={md_a_no_ts}\n  b={md_b_no_ts}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -705,6 +728,142 @@ def test_gamma_magnitude_periodwise_in_table_and_distinguishable():
             f"({row['gamma_magnitude_periodwise']:.4f}) differ by "
             f"factor {ratio:.2f} on a clean synthetic — "
             f"unexpectedly large divergence"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Joint MJ: per-site rms_misfit, single-site degenerate case, GB comparison
+# ---------------------------------------------------------------------------
+
+
+def test_mj_rms_misfit_finite_for_multi_site_collection():
+    """On a 3-site profile sharing a true regional strike, the joint
+    MJ fit produces a finite per-site ``MJ_rms_misfit`` for every
+    site. The metadata records the joint scalar
+    ``MJ_joint_rms_misfit``.
+    """
+    periods = _make_periods()
+    bands = _restricted_bands()
+    sites = []
+    for i, sid in enumerate(["MJ_A", "MJ_B", "MJ_C"]):
+        syn = generate_synthetic_z(
+            regional_type="2D",
+            distortion_strength="weak",
+            distortion_shear="low",
+            noise_level="clean",
+            periods=periods,
+            site_id=sid,
+            seed=42 + i,
+        )
+        sites.append(_make_mt(syn["z_obj"], station=sid))
+
+    table = compute_collection_observables(
+        sites, period_bands=bands, n_starts=3, seed=42,
+    )
+    df = table.dataframe
+    # Every row has a finite, non-NaN MJ_rms_misfit.
+    finite_mj = df["MJ_rms_misfit"].astype(float).to_numpy()
+    assert np.all(np.isfinite(finite_mj)), (
+        f"MJ_rms_misfit should be finite for every row in a "
+        f"multi-site collection; got "
+        f"{df[['site_id', 'period_band_label', 'MJ_rms_misfit']]}"
+    )
+    # The joint RMS is recorded in metadata.
+    assert "MJ_joint_rms_misfit" in table.metadata
+    assert np.isfinite(table.metadata["MJ_joint_rms_misfit"])
+    # MJ should fit a clean synthetic well — pick a generous
+    # ceiling that catches optimiser pathology without flapping
+    # on minor variability.
+    assert table.metadata["MJ_joint_rms_misfit"] < 50.0, (
+        f"joint MJ RMS suspiciously large: "
+        f"{table.metadata['MJ_joint_rms_misfit']:.3f}"
+    )
+
+
+def test_mj_rms_misfit_nan_for_single_site_collection():
+    """Single-site collections record ``NaN`` for
+    ``MJ_rms_misfit`` on every row and ``NaN`` for the joint
+    metadata; no exception or warning is raised (it is the
+    documented behaviour, MJ requires ≥ 2 sites)."""
+    periods = _make_periods()
+    bands = _restricted_bands()
+    syn = generate_synthetic_z(
+        regional_type="2D",
+        distortion_strength="weak",
+        distortion_shear="low",
+        noise_level="clean",
+        periods=periods,
+        site_id="LONE",
+        seed=42,
+    )
+    mt = _make_mt(syn["z_obj"], station="LONE")
+
+    import warnings
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")  # any warning becomes an error
+        # The pipeline emits an unrelated UserWarning from
+        # _per_site_bootstrap_variance (single-band fallback) that
+        # is not the documented MJ-NaN behaviour. Re-allow it.
+        warnings.simplefilter("default", UserWarning)
+        table = compute_collection_observables(
+            [mt], period_bands=bands, n_starts=3, seed=42,
+        )
+
+    df = table.dataframe
+    assert df["MJ_rms_misfit"].isna().all(), (
+        "single-site collection must leave MJ_rms_misfit as NaN"
+    )
+    assert np.isnan(table.metadata["MJ_joint_rms_misfit"]), (
+        f"single-site MJ_joint_rms_misfit should be NaN; got "
+        f"{table.metadata['MJ_joint_rms_misfit']!r}"
+    )
+
+
+def test_mj_per_site_rms_comparable_to_gb_rms():
+    """For a 3-site clean-2-D synthetic, the joint MJ per-site RMS
+    should be the same order of magnitude as the single-site GB
+    RMS. A factor-of-3 deviation in either direction would
+    indicate either MJ pathology (joint over-constraint) or
+    site-specific 3-D-ness; the test enforces the moderate band.
+    """
+    periods = _make_periods()
+    bands = _restricted_bands()
+    sites = []
+    for i, sid in enumerate(["G1", "G2", "G3"]):
+        syn = generate_synthetic_z(
+            regional_type="2D",
+            distortion_strength="moderate",
+            distortion_shear="low",
+            noise_level="clean",
+            periods=periods,
+            site_id=sid,
+            seed=42 + i,
+        )
+        sites.append(_make_mt(syn["z_obj"], station=sid))
+
+    table = compute_collection_observables(
+        sites, period_bands=bands, n_starts=3, seed=42,
+    )
+    df = table.dataframe
+
+    for sid in ("G1", "G2", "G3"):
+        sub = df[df["site_id"] == sid]
+        # Each site has rows for each band; their MJ is constant
+        # across bands (single joint fit broadcast). GB varies
+        # per band (per-band single-site fit).
+        mj = float(sub["MJ_rms_misfit"].iloc[0])
+        gb = sub["GB_rms_misfit"].astype(float).to_numpy()
+        gb_finite = gb[np.isfinite(gb)]
+        if gb_finite.size == 0:
+            continue
+        gb_mean = float(np.mean(gb_finite))
+        # Within a factor of 3 in either direction.
+        assert (
+            mj < 3.0 * max(gb_mean, 1e-9)
+            and gb_mean < 3.0 * max(mj, 1e-9)
+        ), (
+            f"site {sid}: MJ={mj:.3f}, GB mean={gb_mean:.3f} — "
+            f"differ by more than a factor of 3."
         )
 
 

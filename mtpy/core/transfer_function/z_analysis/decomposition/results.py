@@ -1038,6 +1038,19 @@ class CrossMethodResult:
     method_messages : dict[str, str]
         ``{method_name: explanatory string}``. Empty for
         ``"success"``.
+    method_capabilities : dict[str, list[str]]
+        Per-method "what does this adapter populate on success"
+        map, populated from
+        :data:`...cross_method.METHOD_CAPABILITIES`. Keys are the
+        method names that were *requested* in the call (i.e. the
+        ``methods`` argument or :data:`...cross_method.DEFAULT_METHODS`),
+        not necessarily the ones that succeeded. Values are
+        capability tags: any subset of ``"strike"``,
+        ``"twist_shear"``, ``"regional_z"``, ``"dimensionality"``.
+        Downstream consumers should consult this map *before*
+        cross-iterating ``strike_estimates`` /
+        ``twist_shear_estimates`` / etc., to know which methods
+        even attempt each comparison space.
     """
 
     site: str
@@ -1052,6 +1065,7 @@ class CrossMethodResult:
     dimensionality_estimates: dict[str, Any] = field(default_factory=dict)
     method_status: dict[str, str] = field(default_factory=dict)
     method_messages: dict[str, str] = field(default_factory=dict)
+    method_capabilities: dict[str, list[str]] = field(default_factory=dict)
 
 
 @dataclass

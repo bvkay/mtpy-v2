@@ -68,9 +68,43 @@ class TestCleanTwoDimensionalConvergence:
     """
 
     def test_methods_run(self):
+        """The default method set (every adapter except
+        ``mcneice_jones``, which requires ≥2 sites) all appear
+        in method_status, and the five single-site-capable
+        methods succeed. ``garcia_jones`` reports
+        ``no_solution`` because it requires ≥2 sites.
+        """
+        from mtpy.core.transfer_function.z_analysis.decomposition import (
+            DEFAULT_METHODS,
+        )
+
         z = _make_synthetic_z(strike_deg=30.0)
         result = compute_cross_method(z, site="S01")
-        # All methods registered should appear in method_status.
+        # Every default method appears in method_status.
+        for name in DEFAULT_METHODS:
+            assert name in result.method_status, (
+                f"method {name!r} missing from method_status"
+            )
+        # MJ excluded by default (single-site machinery; runs at
+        # the collection level via continental_observables).
+        assert "mcneice_jones" not in result.method_status
+        # All non-GJ methods succeed.
+        for name in DEFAULT_METHODS:
+            if name == "garcia_jones":
+                continue
+            assert result.method_status[name] == "success", (
+                f"{name}: status={result.method_status[name]} "
+                f"({result.method_messages[name]})"
+            )
+        # GJ on a single site is documented no_solution.
+        assert result.method_status["garcia_jones"] == "no_solution"
+
+    def test_full_method_set_via_explicit_kwarg(self):
+        """Passing ``methods=ALL_METHODS`` includes
+        ``mcneice_jones`` (which reduces to GB on a single site)
+        and yields all seven entries in method_status."""
+        z = _make_synthetic_z(strike_deg=30.0)
+        result = compute_cross_method(z, site="S01", methods=ALL_METHODS)
         for name in ALL_METHODS:
             assert name in result.method_status, (
                 f"method {name!r} missing from method_status"
@@ -113,9 +147,13 @@ class TestCleanTwoDimensionalConvergence:
         """The GB / MJ / BCB triad should agree on strike to a
         fraction of a degree on a clean synthetic; the
         agreement_summary RMS reflects that.
+
+        Explicitly request ALL_METHODS so MJ is included for the
+        agreement check; the default method set excludes MJ
+        because it duplicates GB in single-site mode.
         """
         z = _make_synthetic_z(strike_deg=30.0)
-        result = compute_cross_method(z, site="S01")
+        result = compute_cross_method(z, site="S01", methods=ALL_METHODS)
         agreement = agreement_summary(result, reference_method="groom_bailey")
         assert "mcneice_jones" in agreement
         assert "bibby" in agreement
@@ -139,10 +177,12 @@ class TestDistortedTwoDimensional:
     """
 
     def test_gb_mj_recover_distortion(self):
+        # Explicitly include MJ — default omits it (it reduces to
+        # GB on a single site and duplicates the output).
         z = _make_synthetic_z(
             strike_deg=30.0, twist_deg=15.0, shear_deg=20.0
         )
-        result = compute_cross_method(z, site="S02")
+        result = compute_cross_method(z, site="S02", methods=ALL_METHODS)
         for name in ("groom_bailey", "mcneice_jones"):
             twist, shear = result.twist_shear_estimates[name]
             assert (
@@ -262,9 +302,14 @@ class TestThreeDimensionalDivergence:
         )
 
     def test_methods_run(self):
-        """All single-site methods complete without raising."""
+        """All single-site methods complete without raising.
+
+        Pass ``methods=ALL_METHODS`` so MJ is included (it
+        reduces to GB on a single site and is excluded from the
+        default to avoid duplication).
+        """
         z = self._three_d_z()
-        result = compute_cross_method(z, site="3D")
+        result = compute_cross_method(z, site="3D", methods=ALL_METHODS)
         for name in (
             "groom_bailey",
             "mcneice_jones",
@@ -334,8 +379,9 @@ class TestMethodFailureHandling:
 
     def test_other_methods_unaffected_by_gj_failure(self):
         z = _make_synthetic_z(strike_deg=30.0)
-        result = compute_cross_method(z, site="single")
-        # Six methods should succeed even though GJ couldn't run.
+        result = compute_cross_method(z, site="single", methods=ALL_METHODS)
+        # Six methods should succeed (the seven methods minus GJ
+        # which reports no_solution on single-site input).
         n_success = sum(
             1
             for s in result.method_status.values()
@@ -375,6 +421,63 @@ def test_unknown_method_recorded():
     )
     assert result.method_status["not_a_method"] == "error"
     assert "unknown" in result.method_messages["not_a_method"].lower()
+
+
+# ---------------------------------------------------------------------------
+# Default method coverage + capability map
+# ---------------------------------------------------------------------------
+
+
+def test_default_method_list_runs_all_six_single_site_capable_methods():
+    """The default cross-method list spans every single-site-capable
+    decomposition tradition.
+
+    On a clean 2-D synthetic, the five methods that can run on a
+    single site (GB, BCB, Lilley, Marti, Gomez-Treviño) all report
+    ``status="success"``. Garcia-Jones is included in the default
+    list but reports ``no_solution`` because it requires ≥ 2 sites
+    by construction (it is plumbed at the collection level by
+    :mod:`...continental_observables`).
+    """
+    from mtpy.core.transfer_function.z_analysis.decomposition import (
+        DEFAULT_METHODS,
+    )
+
+    z = _make_synthetic_z(strike_deg=30.0)
+    result = compute_cross_method(z, site="default")
+    assert set(result.method_status.keys()) == set(DEFAULT_METHODS)
+    success_methods = {
+        n for n, s in result.method_status.items() if s == "success"
+    }
+    expected_success = set(DEFAULT_METHODS) - {"garcia_jones"}
+    assert success_methods == expected_success, (
+        f"expected non-GJ default methods to all succeed; "
+        f"successes were {success_methods}, expected {expected_success}; "
+        f"full status: {result.method_status}"
+    )
+    assert result.method_status["garcia_jones"] == "no_solution"
+
+
+def test_method_capabilities_populated():
+    """Every method in the default list has a populated
+    capability list, and the lists match
+    :data:`METHOD_CAPABILITIES`."""
+    from mtpy.core.transfer_function.z_analysis.decomposition import (
+        DEFAULT_METHODS,
+        METHOD_CAPABILITIES,
+    )
+
+    z = _make_synthetic_z(strike_deg=30.0)
+    result = compute_cross_method(z, site="caps")
+    for name in DEFAULT_METHODS:
+        assert name in result.method_capabilities
+        assert (
+            result.method_capabilities[name] == METHOD_CAPABILITIES[name]
+        ), (
+            f"method {name!r} capability list "
+            f"{result.method_capabilities[name]!r} differs from "
+            f"the static map {METHOD_CAPABILITIES[name]!r}"
+        )
 
 
 # ---------------------------------------------------------------------------

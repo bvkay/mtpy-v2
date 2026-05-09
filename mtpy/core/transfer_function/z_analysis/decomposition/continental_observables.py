@@ -948,9 +948,13 @@ def _cross_method_disagreements(
         "cross_method_shear_disagreement_deg": float("nan"),
     }
     try:
+        # Use the cross_method default (DEFAULT_METHODS) so all six
+        # single-site-capable methods participate in the comparison.
+        # GJ runs but reports ``no_solution`` (it requires ≥ 2 sites);
+        # the other five succeed and contribute to the per-period
+        # pair-RMS pool.
         cm = compute_cross_method(
             z,
-            methods=["groom_bailey", "bibby", "lilley"],
             periods=(band.period_min, band.period_max),
             method_kwargs={
                 "groom_bailey": {"canonical_gauge": canonical_gauge}
@@ -1217,6 +1221,70 @@ def _iter_mt_objects(mt_collection_or_list):
         yield from mt_collection_or_list
 
 
+def _run_joint_mj_for_collection(
+    sites: list,
+    *,
+    n_starts: int,
+    seed: int,
+    canonical_gauge: str,
+) -> tuple[dict[str, float], float]:
+    """Run joint McNeice-Jones across a collection of sites.
+
+    Returns a tuple ``(per_site_rms, joint_rms)``. ``per_site_rms``
+    is a dict ``{site_id: rms_misfit}`` populated from the
+    :class:`JointDecompositionResult`'s ``rms_misfit_per_site``;
+    ``joint_rms`` is ``sqrt(mean(per_site_rms²))`` aggregated to a
+    single scalar for the metadata.
+
+    Returns ``({}, NaN)`` when:
+
+    * fewer than two sites are supplied (joint MJ requires ≥2),
+    * the sites have mismatched frequency grids (the joint
+      validator raises),
+    * the optimiser raises any other error (gracefully degraded;
+      caller decides whether to surface).
+
+    The MJ joint fit uses ``canonical_gauge="pt_aligned"`` by
+    default so the recovered shared strike is geographically
+    anchored — same convention as
+    :func:`...groom_bailey.decompose` after F4.
+    """
+    from .mcneice_jones import decompose_mcneice_jones
+
+    if len(sites) < 2:
+        return {}, float("nan")
+    z_objs = []
+    site_ids = []
+    for i, site in enumerate(sites):
+        z = getattr(site, "Z", None)
+        if z is None:
+            return {}, float("nan")
+        z_objs.append(z)
+        sid = str(getattr(site, "station", f"site_{i}"))
+        site_ids.append(sid)
+
+    try:
+        result = decompose_mcneice_jones(
+            z_objs,
+            site_ids,
+            n_starts=int(n_starts),
+            seed=int(seed),
+            canonical_gauge=canonical_gauge,
+        )
+    except Exception:
+        # Frequency-grid mismatch, optimiser failure, etc.
+        # MJ_rms_misfit stays NaN for every row.
+        return {}, float("nan")
+
+    per_site = {sid: float(rms) for sid, rms in result.rms_misfit_per_site.items()}
+    rms_arr = np.asarray(list(per_site.values()), dtype=np.float64)
+    finite = rms_arr[np.isfinite(rms_arr)]
+    joint_rms = (
+        float(np.sqrt(np.mean(finite**2))) if finite.size > 0 else float("nan")
+    )
+    return per_site, joint_rms
+
+
 def _hash_collection(mt_collection_or_list) -> str:
     """Hash of file list + modification times for the input.
 
@@ -1362,7 +1430,13 @@ def compute_collection_observables(
     all_rows: list[dict[str, Any]] = []
     failed: list[dict[str, str]] = []
     site_count = 0
-    for mt_object in _iter_mt_objects(mt_collection_or_list):
+
+    # Realise the iterator once so we can both iterate it for the
+    # per-site loop and pass the same site list into the joint MJ
+    # helper. ``_iter_mt_objects`` is a generator on MTCollection.
+    sites = list(_iter_mt_objects(mt_collection_or_list))
+
+    for mt_object in sites:
         site_count += 1
         try:
             site_obs = compute_site_observables(
@@ -1385,6 +1459,23 @@ def compute_collection_observables(
             continue
         all_rows.extend(site_obs.band_observables)
 
+    # Joint MJ across all sites (≥2 only; single-site collections
+    # leave MJ_rms_misfit as NaN per the column contract). The
+    # joint fit happens once at the collection level — not per
+    # site, not per band — and its per-site RMS is broadcast to
+    # every band-row of that site.
+    mj_per_site_rms, mj_joint_rms = _run_joint_mj_for_collection(
+        sites,
+        n_starts=n_starts,
+        seed=seed,
+        canonical_gauge=canonical_gauge,
+    )
+    if mj_per_site_rms:
+        for row in all_rows:
+            sid = row.get("site_id")
+            if sid in mj_per_site_rms:
+                row["MJ_rms_misfit"] = float(mj_per_site_rms[sid])
+
     df = pd.DataFrame(all_rows, columns=OBSERVABLE_COLUMNS)
     df = _coerce_dtypes(df)
 
@@ -1398,5 +1489,9 @@ def compute_collection_observables(
     )
     metadata["site_count"] = int(site_count)
     metadata["failed_sites"] = failed
+    # MJ joint summary in metadata (NaN when fewer than 2 sites or
+    # the joint fit failed). The MJ_rms_misfit column has the
+    # per-site values; this is the single across-sites rollup.
+    metadata["MJ_joint_rms_misfit"] = mj_joint_rms
 
     return ObservableTable(dataframe=df, metadata=metadata)

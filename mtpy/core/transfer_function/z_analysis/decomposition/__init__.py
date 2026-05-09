@@ -229,6 +229,8 @@ from .continental_observables import (
 )
 from .cross_method import (
     ALL_METHODS,
+    DEFAULT_METHODS,
+    METHOD_CAPABILITIES,
     agreement_summary,
     compute_cross_method,
     compute_cross_method_collection,
@@ -328,6 +330,7 @@ __all__ = [
     "CoherenceResult",
     "CrossMethodResult",
     "DEFAULT_BIN_EDGES_KM",
+    "DEFAULT_METHODS",
     "DEFAULT_PERIOD_BANDS",
     "DEFAULT_SUMMARY_OBSERVABLES",
     "DEFAULT_TRUST_RULES",
@@ -338,6 +341,7 @@ __all__ = [
     "LilleyDimensionalityResult",
     "LilleyResult",
     "MAGNITUDE_OBSERVABLES",
+    "METHOD_CAPABILITIES",
     "MagneticDistortionFlag",
     "MartiResult",
     "OBSERVABLE_COLUMNS",
