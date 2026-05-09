@@ -187,6 +187,7 @@ quality progression A → B → C → D.
 DEFAULT_SUMMARY_OBSERVABLES: list[str] = [
     "discordance_deg",
     "gamma_magnitude",
+    "gamma_magnitude_periodwise",
     "C_minus_I_F",
     "PT_abs_beta_deg",
     "GB_rms_misfit",
@@ -194,6 +195,25 @@ DEFAULT_SUMMARY_OBSERVABLES: list[str] = [
 ]
 """Observables included in :class:`StratificationSummary` by
 default. Pass ``summary_observables=`` to override.
+
+The list deliberately references ``gamma_magnitude`` and
+``gamma_magnitude_periodwise`` as the two distinct columns
+produced by :mod:`...continental_observables`:
+
+* ``gamma_magnitude`` — ``|γ|`` of the band-aggregate ``C``
+  tensor (internally consistent with ``C_strike_deg`` /
+  ``C_twist_deg`` / ``C_shear_deg`` in the same row).
+* ``gamma_magnitude_periodwise`` — geometric mean of per-period
+  ``|γ|`` values within the band (robust to within-band
+  parameter scatter).
+
+Both are reported per stratum so users can compare the typical
+distortion magnitude across the two definitions. The trust
+filter rules themselves (in :data:`DEFAULT_TRUST_RULES`) do not
+reference either column — see the spec for why distortion
+magnitude is *not* a trust criterion (large ``|γ|`` is a
+physically meaningful signal at galvanic-distorted sites and
+not in itself a sign of model invalidity).
 """
 
 

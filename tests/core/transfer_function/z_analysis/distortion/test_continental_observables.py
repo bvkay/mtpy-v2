@@ -408,6 +408,103 @@ def test_parquet_round_trip(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# gamma_magnitude_periodwise: geometric-mean of per-period |γ|
+# ---------------------------------------------------------------------------
+
+
+def test_geomean_finite_with_known_values():
+    """The internal helper that computes the periodwise magnitude
+    is the geometric mean of finite, non-negative inputs.
+
+    Direct unit test of the maths: ``[0.1, 0.4, 0.9]`` →
+    ``(0.1 · 0.4 · 0.9)^(1/3) ≈ 0.330192724`` to 1e-9.
+    """
+    from mtpy.core.transfer_function.z_analysis.decomposition.continental_observables import (
+        _geomean_finite,
+    )
+
+    out = _geomean_finite([0.1, 0.4, 0.9])
+    expected = (0.1 * 0.4 * 0.9) ** (1.0 / 3.0)
+    assert abs(out - expected) < 1e-9
+    # Nominal precision to 1e-6 (the spec target).
+    assert abs(out - 0.3301927249) < 1e-6
+
+
+def test_geomean_finite_excludes_non_finite():
+    """``NaN``, ``inf``, ``-inf`` are excluded before the log."""
+    from mtpy.core.transfer_function.z_analysis.decomposition.continental_observables import (
+        _geomean_finite,
+    )
+
+    out = _geomean_finite([0.1, np.nan, 0.4, np.inf, 0.9, -np.inf])
+    expected = (0.1 * 0.4 * 0.9) ** (1.0 / 3.0)
+    assert abs(out - expected) < 1e-9
+
+
+def test_geomean_finite_returns_nan_when_no_finite_values():
+    from mtpy.core.transfer_function.z_analysis.decomposition.continental_observables import (
+        _geomean_finite,
+    )
+
+    assert np.isnan(_geomean_finite([np.nan, np.inf]))
+    assert np.isnan(_geomean_finite([]))
+
+
+def test_gamma_magnitude_periodwise_in_table_and_distinguishable():
+    """``gamma_magnitude_periodwise`` is present in the long-format
+    table, finite for clean 2-D synthetics, and distinct from
+    ``gamma_magnitude`` (the band-aggregate-C definition) when the
+    band spans multiple GB sub-bands.
+
+    For a clean 2-D synthetic with constant true distortion both
+    columns recover the true ``|γ|``, so they're approximately
+    equal at single-band continental windows. A multi-decade
+    continental window with multi-start optimiser noise can drive
+    them apart at the per-band-fit level — we report both for that
+    diagnostic comparison.
+    """
+    periods = _make_periods()
+    syn = generate_synthetic_z(
+        regional_type="2D",
+        distortion_strength="moderate",
+        distortion_shear="moderate",
+        noise_level="clean",
+        periods=periods,
+        site_id="GP01",
+        seed=42,
+    )
+    mt = _make_mt(syn["z_obj"], station="GP01")
+    obs = compute_site_observables(
+        mt, period_bands=_restricted_bands(), n_starts=3, seed=42,
+    )
+    rows = obs.band_observables
+    assert rows, "no rows produced; cannot test"
+    for row in rows:
+        assert "gamma_magnitude_periodwise" in row, (
+            "gamma_magnitude_periodwise not in row schema"
+        )
+        # Both finite for a clean synthetic with adequate periods.
+        assert np.isfinite(row["gamma_magnitude"])
+        assert np.isfinite(row["gamma_magnitude_periodwise"])
+        # Both > 0 for a moderate-distortion site.
+        assert row["gamma_magnitude"] > 0.0
+        assert row["gamma_magnitude_periodwise"] > 0.0
+        # Both should be in the same order of magnitude (within
+        # 50%) on a clean synthetic with constant-C distortion.
+        ratio = (
+            row["gamma_magnitude"]
+            / max(row["gamma_magnitude_periodwise"], 1e-30)
+        )
+        assert 0.5 < ratio < 2.0, (
+            f"gamma_magnitude ({row['gamma_magnitude']:.4f}) and "
+            f"gamma_magnitude_periodwise "
+            f"({row['gamma_magnitude_periodwise']:.4f}) differ by "
+            f"factor {ratio:.2f} on a clean synthetic — "
+            f"unexpectedly large divergence"
+        )
+
+
+# ---------------------------------------------------------------------------
 # Stop-condition smoke test: ≤ 10 s for a 2-site synthetic collection
 # ---------------------------------------------------------------------------
 

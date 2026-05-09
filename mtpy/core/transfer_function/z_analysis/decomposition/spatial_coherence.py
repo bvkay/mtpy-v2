@@ -36,10 +36,25 @@ observable:
 
 Per-observable special handling
 -------------------------------
-* **Magnitudes** (``gamma_magnitude``, ``C_minus_I_F``,
+* **Magnitudes** (``gamma_magnitude``,
+  ``gamma_magnitude_periodwise``, ``C_minus_I_F``,
   ``GB_rms_misfit``, …): variogram on ``log10(value)`` so
   multiplicative scaling is captured additively. Non-positive
   values are filtered out.
+
+  ``gamma_magnitude`` and ``gamma_magnitude_periodwise`` are
+  *both* defaults in :data:`PRIMARY_OBSERVABLES`. The two
+  definitions (see the :mod:`...continental_observables`
+  module docstring's "Two definitions of the spin-2 magnitude")
+  can give *different* ``range_km`` estimates: the band-aggregate
+  ``gamma_magnitude`` mixes in the band's angular-aggregation
+  choice and is more sensitive to within-band parameter
+  instability, while ``gamma_magnitude_periodwise`` is the
+  geometric mean of per-period values and is robust to outlier
+  periods. Comparing the two variograms is itself diagnostic —
+  a substantially smaller range on ``gamma_magnitude`` than on
+  ``gamma_magnitude_periodwise`` flags within-band parameter
+  scatter as the dominant short-range structure.
 * **Line-direction angles** (``C_strike_deg``,
   ``gamma_principal_axis_deg``, ``PT_alpha_deg``): circular
   variogram with squared difference replaced by
@@ -140,6 +155,7 @@ variograms use the circular metric ``1 - cos(2 Δθ)``.
 
 MAGNITUDE_OBSERVABLES: set[str] = {
     "gamma_magnitude",
+    "gamma_magnitude_periodwise",
     "C_minus_I_F",
     "GB_rms_misfit",
     "MJ_rms_misfit",
@@ -173,6 +189,7 @@ variogram. Negative codes (``"indeterminate"``) are filtered out.
 PRIMARY_OBSERVABLES: list[str] = [
     "discordance_deg",
     "gamma_magnitude",
+    "gamma_magnitude_periodwise",
     "gamma_principal_axis_deg",
     "C_minus_I_F",
     "C_strike_deg",
@@ -180,9 +197,19 @@ PRIMARY_OBSERVABLES: list[str] = [
     "PT_abs_beta_deg",
     "PT_ellipticity",
 ]
-"""The eight observables :func:`compute_coherence_all` runs by
-default. Hand-picked as the most informative per-site outputs of
+"""The default observables that :func:`compute_coherence_all`
+runs. Hand-picked as the most informative per-site outputs of
 the continental pipeline; pass ``observables=`` to override.
+
+Both ``gamma_magnitude`` and ``gamma_magnitude_periodwise`` are
+included so spatial coherence reports a variogram for each: the
+two definitions can give different range estimates (the
+band-aggregate-C definition is sensitive to within-band parameter
+instability; the per-period geomean is robust to it), and the
+comparison is itself diagnostic — see the
+:mod:`...continental_observables` module docstring's "Two
+definitions of the spin-2 magnitude" for the side-by-side
+definitions.
 """
 
 

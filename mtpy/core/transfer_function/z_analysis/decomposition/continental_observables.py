@@ -28,6 +28,41 @@ ellipse points along the strike of the near-surface heterogeneity
 that produces it, which the phase tensor also tracks); systematic
 deviation is the empirical signal mapped continentally.
 
+Two definitions of the spin-2 magnitude
+=======================================
+The schema carries two complementary magnitude columns. Both are
+physically meaningful; including both supports sensitivity
+analysis and direct comparison.
+
+* ``gamma_magnitude``
+  For each band, reconstruct a single ``C`` tensor from the
+  band-aggregate ``(strike, twist, shear, gain)`` and compute
+  ``|γ|`` of ``C - I`` via
+  :func:`...distortion_geometry.irreducible_decomposition`.
+  Answers: *"What is |γ| of the band-representative C?"*
+  Internally consistent with the ``C_strike_deg`` /
+  ``C_twist_deg`` / ``C_shear_deg`` columns in the same row —
+  reconstructing those parameters into a ``C`` and taking ``γ``
+  reproduces this number.
+
+* ``gamma_magnitude_periodwise``
+  For each period in the band, build a per-period ``C`` from
+  GB's per-period optimised parameters, take ``|γ|``, then
+  return the **geometric mean** across periods within the band.
+  Periods with non-finite parameters (failed convergence) are
+  excluded; if all periods are excluded the value is ``NaN``.
+  Answers: *"What is the typical per-period distortion magnitude
+  in this band?"* Robust to outlier periods and decoupled from
+  the band's angular-aggregation choice.
+
+The two definitions agree when GB resolves the band into a
+single GB-internal sub-band (so per-period parameters are
+identical) and diverge when the continental band spans multiple
+GB sub-bands or when the optimiser picks competing modes at
+different periods. The divergence is itself diagnostic: a large
+``|gamma_magnitude − gamma_magnitude_periodwise|`` flags
+within-band parameter instability.
+
 Usage
 -----
 ::
@@ -232,6 +267,7 @@ OBSERVABLE_COLUMNS: list[str] = [
     "gamma_1",
     "gamma_2",
     "gamma_magnitude",
+    "gamma_magnitude_periodwise",
     "gamma_principal_axis_deg",
     "beta_antisymmetric",
     "trace_a",
@@ -352,6 +388,27 @@ def _arithmetic_mean(values: np.ndarray) -> float:
     return float(np.mean(values[finite]))
 
 
+def _geomean_finite(values) -> float:
+    """Geometric mean of a sequence of non-negative floats.
+
+    Non-finite entries (``NaN``, ``inf``, ``-inf``) are excluded.
+    Zero entries are clipped to ``1e-30`` before the log so they
+    pull the geomean toward zero without producing ``log(0)``.
+    Returns ``NaN`` when no finite values are available.
+
+    Used for the per-band aggregation of per-period ``|γ|``
+    values — see :data:`OBSERVABLE_COLUMNS` and the module
+    docstring's "Two definitions of the spin-2 magnitude"
+    section.
+    """
+    arr = np.asarray(values, dtype=np.float64)
+    finite = np.isfinite(arr)
+    if not finite.any():
+        return float("nan")
+    pos = np.maximum(arr[finite], 1e-30)
+    return float(np.exp(np.mean(np.log(pos))))
+
+
 def _axial_angular_distance_deg(a: float, b: float) -> float:
     """Smaller-arc distance between two line directions (mod 180°).
 
@@ -421,6 +478,7 @@ def _gb_band_observables(z, band: _PeriodBand, *, n_starts: int, seed: int,
         "gamma_1": float("nan"),
         "gamma_2": float("nan"),
         "gamma_magnitude": float("nan"),
+        "gamma_magnitude_periodwise": float("nan"),
         "gamma_principal_axis_deg": float("nan"),
         "beta_antisymmetric": float("nan"),
         "trace_a": float("nan"),
@@ -500,6 +558,32 @@ def _gb_band_observables(z, band: _PeriodBand, *, n_starts: int, seed: int,
     )
     out["beta_antisymmetric"] = float(irrep["beta"])
     out["trace_a"] = float(irrep["trace_a"])
+
+    # Periodwise |γ|: per-period C from per-period (strike, twist,
+    # shear, gain) → |γ| from each → geometric mean across periods.
+    # This is the magnitude observable that does *not* depend on
+    # the band's angular aggregation choice — see the module
+    # docstring's "Two definitions of the spin-2 magnitude".
+    per_period_gamma_mag = []
+    for k in range(strikes.size):
+        if not (
+            np.isfinite(strikes[k])
+            and np.isfinite(twists[k])
+            and np.isfinite(shears[k])
+            and np.isfinite(gains[k])
+        ):
+            continue
+        C_k = _construct_C_gb89(
+            float(strikes[k]),
+            float(twists[k]),
+            float(shears[k]),
+            float(gains[k]),
+        )
+        irrep_k = irreducible_decomposition(C_k - eye)
+        mag = float(np.hypot(irrep_k["gamma_1"], irrep_k["gamma_2"]))
+        if np.isfinite(mag):
+            per_period_gamma_mag.append(mag)
+    out["gamma_magnitude_periodwise"] = _geomean_finite(per_period_gamma_mag)
     return out
 
 
@@ -798,6 +882,7 @@ def compute_site_observables(
             "C_strike_deg", "C_twist_deg", "C_shear_deg",
             "C_minus_I_F", "C_determinant_real", "C_determinant_imag",
             "gamma_1", "gamma_2", "gamma_magnitude",
+            "gamma_magnitude_periodwise",
             "gamma_principal_axis_deg", "beta_antisymmetric", "trace_a",
             "GB_rms_misfit", "GB_mode_warning",
         ):
