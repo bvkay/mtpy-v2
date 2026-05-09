@@ -1055,6 +1055,103 @@ class CrossMethodResult:
 
 
 @dataclass
+class CoherenceResult:
+    """Spatial-coherence summary for a single observable.
+
+    Output of :func:`...spatial_coherence.compute_coherence`. Bundles
+    the empirical variogram, the randomisation-null distribution at
+    each bin, the nugget / sill / range geostatistical summaries, an
+    optional per-site bootstrap-variance reference, and a single
+    qualitative coherence label that compresses all of the above
+    into a one-of-three classification.
+
+    All distance-axis quantities are in kilometres (great-circle,
+    haversine; see :func:`...spatial_coherence.pairwise_distances`
+    for the geodesy notes).
+
+    Fields
+    ------
+    observable_name : str
+    bin_centers_km : ndarray
+    bin_counts : ndarray of int
+        Number of pairs falling in each bin (zero where the bin
+        is empty).
+    variogram_values : ndarray
+        Empirical semivariance per bin. For magnitude observables
+        the values are computed in log10 space; for line-direction
+        angles in the circular metric ``(1 - cos(2 Δθ)) / 2``.
+    null_p05, null_p50, null_p95 : ndarray
+        5th, 50th, and 95th percentiles of the value-shuffled
+        variogram at each bin. The 95th percentile is the upper
+        bound used for the structured / noise classification.
+    nugget : float
+        Variogram value at the smallest separation bin
+        (the limiting near-zero-distance behaviour).
+    sill : float
+        Plateau variogram value at large separation. Estimated as
+        the median of the largest 25 % of bins.
+    range_km : float
+        Distance at which the empirical variogram first reaches
+        ``nugget + 0.5 * (sill - nugget)``. ``NaN`` if the
+        variogram never reaches that level within the configured
+        range.
+    nugget_to_sill_ratio : float
+        ``nugget / sill`` clamped to ``[0, 1]``.
+    bootstrap_variance : float, optional
+        Per-site noise variance reference. Either pulled from
+        bootstrap CIs in the input table (when available) or, as a
+        fallback, the median across sites of the inter-band
+        variance of the same observable. ``None`` when neither
+        path produces a usable estimate.
+    coherence_label : str
+        One of:
+
+        * ``"structured"`` — variogram clearly above the null at
+          ≥ 50 % of bins and ``nugget / sill < 0.4``.
+        * ``"weakly_structured"`` — variogram above the null at
+          some bins; ``nugget / sill ∈ [0.4, 0.9)``.
+        * ``"noise_dominated"`` — variogram indistinguishable from
+          the null OR ``nugget / sill ≥ 0.9``.
+        * ``"insufficient_data"`` — fewer than 2 finite values
+          available; no variogram computable.
+    n_pairs_total : int
+        Number of (site_i, site_j) pairs whose values were both
+        finite. Pairs with ``NaN`` on either side are excluded
+        from the variogram.
+    period_band_label : str
+        The band the result is restricted to.
+    metadata : dict
+        Provenance: number of bins, the bin edges used, the random
+        seed, the number of shuffles, the value-kind
+        (``"linear"`` / ``"log"`` / ``"circular"`` / ``"ordinal"``),
+        and the input-table identifier when available.
+
+    See Also
+    --------
+    :mod:`...spatial_coherence` : the module that produces this
+        result type.
+    :class:`ObservableTable` : the input long-format table.
+    """
+
+    observable_name: str
+    bin_centers_km: np.ndarray
+    bin_counts: np.ndarray
+    variogram_values: np.ndarray
+    null_p05: np.ndarray
+    null_p50: np.ndarray
+    null_p95: np.ndarray
+    nugget: float
+    sill: float
+    range_km: float
+    nugget_to_sill_ratio: float
+    bootstrap_variance: float | None
+    coherence_label: str
+    n_pairs_total: int
+    period_band_label: str = ""
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
 class SiteObservables:
     """Per-site, per-band continental-aggregation observables.
 

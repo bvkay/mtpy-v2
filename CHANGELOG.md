@@ -169,6 +169,75 @@ opt-in skipped.
   / −25 %).
 
 ### New pipelines
+- **Spatial-coherence pipeline**
+  (:mod:`...spatial_coherence`,
+  :func:`compute_coherence`, :func:`compute_coherence_all`,
+  :func:`empirical_variogram`, :func:`randomisation_null`,
+  :func:`pairwise_distances`, :class:`CoherenceResult`,
+  :data:`PRIMARY_OBSERVABLES`). Quantifies whether each
+  observable produced by the continental pipeline is
+  *geographically structured* versus per-site noise — the
+  empirical foundation for the Paper 1 "distortion is signal,
+  not nuisance" claim. Per observable, per period band:
+
+  1. Empirical haversine variogram
+     ``γ(h) = (1/2) · mean[(z_i - z_j)²]`` over all site pairs at
+     separation ``h`` (great-circle, kilometres). Default 20
+     log-spaced bins from 50 to 2000 km plus a near-neighbour
+     bin for separations below 50 km.
+  2. Permutation null: shuffle observable values across sites
+     (preserving coordinates and the pair-binning), recompute
+     the variogram, repeat 100×, take the 5/50/95 percentiles
+     per bin as the "no spatial structure" envelope.
+  3. Geostat summary: nugget (smallest-h variance), sill
+     (large-h plateau), range (half-sill crossing in km), and
+     the nugget-to-sill ratio.
+  4. Coherence label: ``"structured"`` if ≥ 50 % of bins exceed
+     the null 95th percentile and ``nugget / sill < 0.4``;
+     ``"weakly_structured"`` for partial agreement;
+     ``"noise_dominated"`` when the variogram cannot be
+     distinguished from the shuffled null or
+     ``nugget / sill ≥ 0.9``; ``"insufficient_data"`` for too
+     few finite values.
+
+  Per-observable handling: magnitudes (``gamma_magnitude``,
+  ``C_minus_I_F``, ``GB_rms_misfit``, …) use ``log10`` before
+  variogramming; line-direction angles (``C_strike_deg``,
+  ``gamma_principal_axis_deg``, ``PT_alpha_deg``) use the
+  circular metric ``1 - cos(2 Δθ)`` so a 5° / 175° pair is
+  ``≈ 10°`` apart, not ``≈ 170°``; ordinal flags
+  (``magnetic_distortion_flag``, ``Lilley_category``) are mapped
+  to integer codes per :data:`ORDINAL_OBSERVABLES`.
+
+  Bootstrap-variance reference: pulled from a
+  ``f"{observable_name}_bootstrap_var"`` column when the input
+  table contains it (a Phase-2 follow-up on
+  :func:`compute_site_observables`); otherwise the median
+  inter-band variance per site, with a clear warning about the
+  upper-bound nature of the fallback.
+
+  Visualisation lives in a separate
+  :mod:`...spatial_coherence_plots` module so the core API
+  has no matplotlib dependency. :func:`plot_variogram` produces
+  a publication-style γ(h) plot with the null 5-95 % envelope,
+  bootstrap-variance reference line, and an annotated nugget /
+  sill / range box; :func:`plot_coherence_summary` tiles
+  variograms across all primary observables for a one-figure
+  array-level summary.
+
+  Eleven tests in
+  ``tests/.../distortion/test_spatial_coherence.py`` cover the
+  six required scenarios (pure noise → ``noise_dominated``;
+  smooth Gaussian random field → ``structured``; mixed
+  signal + noise → ``structured`` / ``weakly_structured`` with
+  positive nugget; circular variogram for line directions
+  including the 0/180° wrap; randomisation-null bracket
+  asymmetry; AusLAMP-scale 1353-site recovery of a 500-km
+  correlation length within 100 km in <60 s) plus five smoke
+  tests for the distance / classification helpers. The
+  AusLAMP-scale test auto-skips when no
+  ``site_summary.csv`` is found; on this machine it ran in 2 s.
+
 - **Continental-scale observables pipeline**
   (:mod:`...continental_observables`,
   :func:`compute_site_observables`,
