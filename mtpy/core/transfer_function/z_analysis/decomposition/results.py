@@ -1055,6 +1055,71 @@ class CrossMethodResult:
 
 
 @dataclass
+class StratificationSummary:
+    """Summary of a dimensionality-trust stratification.
+
+    Output of
+    :func:`...dimensionality_stratification.stratification_summary`.
+    Records per-stratum row counts, fractions of the total, and
+    per-observable means / standard deviations within each
+    stratum, plus the literal rules that were applied so the
+    summary is reproducible from the dataclass alone.
+
+    The trust strata are a *research choice*, not a measurement
+    (see :mod:`...dimensionality_stratification` for the full
+    rationale). The ``rules_used`` field is therefore
+    load-bearing: any conclusion drawn from a summary should be
+    cross-checked against a sensitivity analysis with perturbed
+    rule thresholds.
+
+    Fields
+    ------
+    n_total_rows : int
+        Number of rows in the source table (every row gets
+        assigned to exactly one stratum).
+    n_per_stratum : dict[str, int]
+        Per-stratum row counts. Keys are stratum names
+        (``"high_trust"``, ``"moderate_trust"``, ``"low_trust"``,
+        ``"excluded"``).
+    fraction_per_stratum : dict[str, float]
+        ``n_per_stratum[s] / n_total_rows`` per stratum. Sums to
+        ``1.0`` (within float tolerance).
+    observable_means_per_stratum : dict[str, dict[str, float]]
+        ``{stratum_name: {observable_name: mean}}``. Only the
+        observables explicitly listed in ``summary_observables``
+        (a kwarg to :func:`stratification_summary`) are included.
+        ``NaN`` when the stratum has no finite values.
+    observable_stds_per_stratum : dict[str, dict[str, float]]
+        Per-stratum standard deviations of the same observables
+        as ``observable_means_per_stratum``.
+    rules_used : dict
+        The literal rules dict passed to
+        :func:`stratification_summary`. Captured verbatim so the
+        summary is reproducible without external context.
+    metadata : dict
+        Provenance: timestamp, summary observable list, table
+        identifier when available.
+
+    See Also
+    --------
+    :mod:`...dimensionality_stratification` : module that
+        produces this summary.
+    """
+
+    n_total_rows: int
+    n_per_stratum: dict[str, int] = field(default_factory=dict)
+    fraction_per_stratum: dict[str, float] = field(default_factory=dict)
+    observable_means_per_stratum: dict[str, dict[str, float]] = field(
+        default_factory=dict
+    )
+    observable_stds_per_stratum: dict[str, dict[str, float]] = field(
+        default_factory=dict
+    )
+    rules_used: dict[str, Any] = field(default_factory=dict)
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
 class CoherenceResult:
     """Spatial-coherence summary for a single observable.
 

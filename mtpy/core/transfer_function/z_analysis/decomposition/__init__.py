@@ -233,6 +233,16 @@ from .cross_method import (
     compute_cross_method,
     compute_cross_method_collection,
 )
+from .dimensionality_stratification import (
+    DEFAULT_SUMMARY_OBSERVABLES,
+    DEFAULT_TRUST_RULES,
+    STRATA_ORDER,
+    apply_trust_filter,
+    stratification_summary,
+    stratify_table,
+    threshold_sensitivity,
+    trust_score,
+)
 from .distortion_geometry import (
     complex_to_gamma,
     gamma_field,
@@ -280,6 +290,7 @@ from .results import (  # noqa: F401  -- private helpers re-exported for backwar
     MartiResult,
     ObservableTable,
     SiteObservables,
+    StratificationSummary,
     _desanitize_station_id,
     _sanitize_station_id,
 )
@@ -318,6 +329,8 @@ __all__ = [
     "CrossMethodResult",
     "DEFAULT_BIN_EDGES_KM",
     "DEFAULT_PERIOD_BANDS",
+    "DEFAULT_SUMMARY_OBSERVABLES",
+    "DEFAULT_TRUST_RULES",
     "DecompositionResult",
     "GarciaJonesResult",
     "GomezTrevinoResult",
@@ -332,8 +345,11 @@ __all__ = [
     "ORDINAL_OBSERVABLES",
     "ObservableTable",
     "PRIMARY_OBSERVABLES",
+    "STRATA_ORDER",
     "SiteObservables",
+    "StratificationSummary",
     "agreement_summary",
+    "apply_trust_filter",
     "classify_dimensionality",
     "compare_lilley_marti",
     "complex_to_gamma",
@@ -374,7 +390,11 @@ __all__ = [
     "principal_axis",
     "randomisation_null",
     "series_parallel_resistivities",
+    "stratification_summary",
+    "stratify_table",
+    "threshold_sensitivity",
     "tipper_diagnostic",
+    "trust_score",
     "wal_invariants",
     "waldim_dimensionality",
 ]

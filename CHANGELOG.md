@@ -169,6 +169,71 @@ opt-in skipped.
   / −25 %).
 
 ### New pipelines
+- **Dimensionality-trust stratification**
+  (:mod:`...dimensionality_stratification`,
+  :func:`stratify_table`, :func:`trust_score`,
+  :func:`apply_trust_filter`, :func:`stratification_summary`,
+  :func:`threshold_sensitivity`,
+  :class:`StratificationSummary`,
+  :data:`DEFAULT_TRUST_RULES`). Filters and stratifies the
+  long-format observable table into four trust tiers based on
+  whether the GB / MJ model assumption (2-D regional with
+  galvanic distortion) is plausible at each (site, period_band):
+
+  * ``"high_trust"`` (Tier A) — model ideal: WALDIM ∈ {2, 3},
+    Lilley category ∈ {2D, 3D-2D}, ``|β_PT| < 3°``,
+    ``magnetic_distortion_flag == "low_risk"``,
+    ``GB_mode_warning is False``,
+    ``cross_method_strike_disagreement_deg < 5°``,
+    ``GB_rms_misfit < 2.0``.
+  * ``"moderate_trust"`` (Tier B) — borderline: WALDIM ∈
+    {2, 3, 4}, ``|β_PT| < 6°``,
+    ``magnetic_distortion_flag ∈ {"low_risk", "moderate_risk"}``,
+    ``cross_method_strike_disagreement_deg < 15°``.
+  * ``"low_trust"`` (Tier C) — neither high nor moderate, but
+    not excluded; results to be interpreted with care.
+  * ``"excluded"`` (Tier D) — WALDIM == 1 (1-D, no strike) **or**
+    WALDIM ∈ {6, 7} (true 3-D, model misfit) **or**
+    ``magnetic_distortion_flag == "high_risk"`` **or**
+    ``|β_PT| ≥ 6°`` **or**
+    ``Lilley_category == "indeterminate"``. Excluded sites are
+    *flagged*, not deleted from the source table.
+
+  ``DEFAULT_TRUST_RULES`` is a parameterised dict; every
+  threshold is overridable for sensitivity analysis.
+  ``threshold_sensitivity`` sweeps a single threshold across a
+  user-supplied range and reports the high-trust fraction and
+  the mean of a chosen observable, producing the "how does the
+  result move when I move the threshold?" curves Paper 1 needs.
+
+  Companion :func:`trust_score` is the smooth-edged version of
+  the high-trust criteria: each numeric criterion contributes a
+  sigmoid score around its threshold (default width
+  ``max(0.05 · |threshold|, 0.3)`` — sharp enough that a fully
+  excluded row scores ``≤ 0.1``, smooth enough that
+  :func:`trust_score` has no step discontinuities and so is
+  suitable as a continental-map colour scale).
+
+  The module docstring states explicitly that stratification is
+  a *research choice* (not a measurement), that the default
+  thresholds will be reported in Paper 1, that sensitivity
+  analysis is mandatory, and that excluded sites are flagged
+  rather than discarded. These caveats are load-bearing for any
+  downstream claim about model trustworthiness.
+
+  Eleven tests in
+  ``tests/.../distortion/test_dimensionality_stratification.py``
+  cover the six required scenarios — partition correctness,
+  ``trust_score`` continuity, default rules vs categorical
+  agreement at the high-trust ≥ 0.9 / excluded ≤ 0.1 endpoints,
+  monotonic threshold-sensitivity sweep, no input-mutation
+  guarantee, and the round-trip through
+  :func:`compute_collection_observables` — plus three smoke
+  tests for rule shape, missing-value handling, and the ≤ 5 s
+  pipeline-budget on a 1000-row synthetic table. Stratification
+  on the 1000-row table runs in < 1 s; the AusLAMP-scale
+  (~6500-row) call is comfortably under the 5 s target.
+
 - **Spatial-coherence pipeline**
   (:mod:`...spatial_coherence`,
   :func:`compute_coherence`, :func:`compute_coherence_all`,
