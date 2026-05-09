@@ -253,16 +253,24 @@ package-level summary that ``help(decomposition)`` surfaces.
   filter. Numerical values are not directly comparable to
   pre-F7 outputs.
 
-* **Joint MJ silently NaN on mixed-grid collections.** The
+* **Joint MJ failure modes surfaced in metadata (F9).** The
   joint :func:`...mcneice_jones.decompose_mcneice_jones` requires
   identical frequency grids across sites; mixed-grid AusLAMP
   collections (EDL log-base-10 + LEMI power-of-2) fail the
-  joint validator, the helper catches the exception, and
-  ``MJ_rms_misfit`` ends up ``NaN`` for every row plus
-  ``metadata["MJ_joint_rms_misfit"] = NaN`` *without a
-  warning*. **Manually check the metadata field before
-  trusting the MJ column** until F9 surfaces this in the
-  failed-step log.
+  joint validator. ``MJ_rms_misfit`` is then ``NaN`` for every
+  row, *and*
+  :func:`compute_collection_observables` emits a
+  :class:`UserWarning` and records the failure mode in
+  ``metadata["joint_mj_status"]``
+  (``"success"`` / ``"single_site"`` /
+  ``"frequency_grid_mismatch"`` / ``"convergence_failed"`` /
+  ``"other_error"``) plus
+  ``metadata["joint_mj_failure_message"]`` for the failure
+  cases. Always check
+  ``metadata["joint_mj_status"] == "success"`` before reading
+  the MJ column — a ``NaN`` column with status
+  ``"frequency_grid_mismatch"`` is expected on mixed-grid data,
+  not a bug in the pipeline.
 
 * **AusLAMP-scale runtime budgets** (1353 sites, 6 default
   bands, ``n_starts=5``, 16-core workstation; order-of-magnitude

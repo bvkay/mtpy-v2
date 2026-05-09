@@ -226,16 +226,29 @@ Intended as a grep target for researchers reading the source.
 * **MJ_rms_misfit is NaN for single-site collections** —
   single-site MJ ≡ single-site GB; the joint fit is meaningless
   with one site (documented in F5).
-* **Joint MJ silently degrades on frequency-grid mismatch.**
-  Mixed-grid AusLAMP collections (EDL on log-base-10, LEMI on
-  power-of-2) fail
-  :func:`...mcneice_jones.decompose_mcneice_jones`'s joint
-  validator; the helper catches the exception and returns
-  ``MJ_rms_misfit = NaN`` and
-  ``metadata["MJ_joint_rms_misfit"] = NaN`` *without a
-  warning*. Until F9 surfaces this in metadata, **manually
-  check ``metadata["MJ_joint_rms_misfit"]`` for NaN before
-  trusting the MJ columns** when running on mixed-grid data.
+* **Joint MJ failure modes are now surfaced (F9).** Mixed-grid
+  AusLAMP collections (EDL on log-base-10, LEMI on power-of-2)
+  fail :func:`...mcneice_jones.decompose_mcneice_jones`'s joint
+  validator; the helper still returns ``MJ_rms_misfit = NaN``
+  on every row, but it now also:
+
+  - emits a :class:`UserWarning` at pipeline start describing the
+    failure mode (so the user notices in the console output, not
+    just buried in the netCDF metadata);
+  - records ``metadata["joint_mj_status"]`` as one of
+    ``"success"``, ``"single_site"``,
+    ``"frequency_grid_mismatch"``, ``"convergence_failed"``, or
+    ``"other_error"``;
+  - records ``metadata["joint_mj_failure_message"]`` (the raw
+    diagnosis) when the status is one of the three failure
+    cases.
+
+  ``"single_site"`` is the documented "fewer than 2 sites"
+  short-circuit (no warning, no failure message — by design).
+  Always check ``metadata["joint_mj_status"]`` against
+  ``"success"`` before reading the ``MJ_rms_misfit`` column; a
+  ``NaN`` column with status ``"frequency_grid_mismatch"`` is
+  *expected* (mixed-grid data), not an error in the table.
 * **Bootstrap CIs are opt-in** (``bootstrap_n_replicates=0`` by
   default; F6 promoted from Phase-2 deferred to Phase-1 enabled).
   For tight per-site noise estimates use ``n=50+``. AusLAMP-scale
@@ -1724,22 +1737,37 @@ def _run_joint_mj_for_collection(
     n_starts: int,
     seed: int,
     canonical_gauge: str,
-) -> tuple[dict[str, float], float]:
+) -> tuple[dict[str, float], float, str, "str | None"]:
     """Run joint McNeice-Jones across a collection of sites.
 
-    Returns a tuple ``(per_site_rms, joint_rms)``. ``per_site_rms``
-    is a dict ``{site_id: rms_misfit}`` populated from the
-    :class:`JointDecompositionResult`'s ``rms_misfit_per_site``;
-    ``joint_rms`` is ``sqrt(mean(per_site_rms²))`` aggregated to a
-    single scalar for the metadata.
+    Returns a tuple
+    ``(per_site_rms, joint_rms, status, failure_message)``:
 
-    Returns ``({}, NaN)`` when:
+    * ``per_site_rms`` — dict ``{site_id: rms_misfit}``, empty
+      on any non-success status.
+    * ``joint_rms`` — single ``sqrt(mean(per_site_rms²))``
+      scalar, ``NaN`` on any non-success status.
+    * ``status`` — one of:
 
-    * fewer than two sites are supplied (joint MJ requires ≥2),
-    * the sites have mismatched frequency grids (the joint
-      validator raises),
-    * the optimiser raises any other error (gracefully degraded;
-      caller decides whether to surface).
+        - ``"success"`` — joint MJ ran and produced finite per-
+          site RMS values for every site.
+        - ``"single_site"`` — fewer than two sites supplied;
+          joint MJ skipped (documented behaviour, not an error).
+        - ``"frequency_grid_mismatch"`` — sites have
+          incompatible frequency grids; the joint validator
+          raised. Common in mixed-instrument AusLAMP datasets
+          (EDL log-base-10 + LEMI power-of-2). The caller
+          should surface this as a ``UserWarning`` so the
+          user notices.
+        - ``"convergence_failed"`` — joint MJ ran without
+          raising but produced no finite per-site RMS (every
+          site has ``NaN`` misfit). Caller should warn.
+        - ``"other_error"`` — any other exception; caller
+          should warn.
+
+    * ``failure_message`` — human-readable diagnosis for the
+      latter three statuses; ``None`` for ``"success"`` and
+      ``"single_site"``.
 
     The MJ joint fit uses ``canonical_gauge="pt_aligned"`` by
     default so the recovered shared strike is geographically
@@ -1749,13 +1777,16 @@ def _run_joint_mj_for_collection(
     from .mcneice_jones import decompose_mcneice_jones
 
     if len(sites) < 2:
-        return {}, float("nan")
+        return {}, float("nan"), "single_site", None
     z_objs = []
     site_ids = []
     for i, site in enumerate(sites):
         z = getattr(site, "Z", None)
         if z is None:
-            return {}, float("nan")
+            return (
+                {}, float("nan"), "other_error",
+                f"site index {i} has no Z attribute",
+            )
         z_objs.append(z)
         sid = str(getattr(site, "station", f"site_{i}"))
         site_ids.append(sid)
@@ -1768,18 +1799,42 @@ def _run_joint_mj_for_collection(
             seed=int(seed),
             canonical_gauge=canonical_gauge,
         )
-    except Exception:
-        # Frequency-grid mismatch, optimiser failure, etc.
-        # MJ_rms_misfit stays NaN for every row.
-        return {}, float("nan")
+    except ValueError as exc:
+        msg = str(exc)
+        msg_lower = msg.lower()
+        # The joint validator (_validate_joint_input) raises
+        # ValueError("decompose_joint: station ... has a different
+        # frequency grid than the first station; ...") on grid
+        # mismatch. Match on "frequency grid" or just "frequency"
+        # + "different" to be robust to small phrasing changes.
+        if "frequency grid" in msg_lower or (
+            "frequency" in msg_lower and "different" in msg_lower
+        ):
+            return (
+                {}, float("nan"), "frequency_grid_mismatch", msg,
+            )
+        return {}, float("nan"), "other_error", msg
+    except Exception as exc:
+        msg_lower = str(exc).lower()
+        if "converge" in msg_lower or "no solution" in msg_lower:
+            return (
+                {}, float("nan"), "convergence_failed", str(exc),
+            )
+        return (
+            {}, float("nan"), "other_error",
+            f"{type(exc).__name__}: {exc}",
+        )
 
     per_site = {sid: float(rms) for sid, rms in result.rms_misfit_per_site.items()}
     rms_arr = np.asarray(list(per_site.values()), dtype=np.float64)
     finite = rms_arr[np.isfinite(rms_arr)]
-    joint_rms = (
-        float(np.sqrt(np.mean(finite**2))) if finite.size > 0 else float("nan")
-    )
-    return per_site, joint_rms
+    if not per_site or finite.size == 0:
+        return (
+            {}, float("nan"), "convergence_failed",
+            "joint MJ produced no finite per-site RMS values",
+        )
+    joint_rms = float(np.sqrt(np.mean(finite**2)))
+    return per_site, joint_rms, "success", None
 
 
 def _hash_collection(mt_collection_or_list) -> str:
@@ -2027,12 +2082,34 @@ def compute_collection_observables(
     # joint fit happens once at the collection level — not per
     # site, not per band — and its per-site RMS is broadcast to
     # every band-row of that site.
-    mj_per_site_rms, mj_joint_rms = _run_joint_mj_for_collection(
+    (
+        mj_per_site_rms,
+        mj_joint_rms,
+        mj_status,
+        mj_failure_msg,
+    ) = _run_joint_mj_for_collection(
         sites,
         n_starts=n_starts,
         seed=seed,
         canonical_gauge=canonical_gauge,
     )
+    # Surface the failure modes (other than the documented
+    # single-site case) as a UserWarning so the user notices in
+    # the run's console output, not just the netCDF metadata. F9.
+    if mj_status in (
+        "frequency_grid_mismatch",
+        "convergence_failed",
+        "other_error",
+    ):
+        import warnings as _warnings
+
+        _warnings.warn(
+            f"compute_collection_observables: joint MJ skipped "
+            f"({mj_status}): {mj_failure_msg!s}. MJ_rms_misfit "
+            f"will be NaN for every row of the output table.",
+            UserWarning,
+            stacklevel=2,
+        )
     if mj_per_site_rms:
         for row in all_rows:
             sid = row.get("site_id")
@@ -2058,5 +2135,14 @@ def compute_collection_observables(
     # the joint fit failed). The MJ_rms_misfit column has the
     # per-site values; this is the single across-sites rollup.
     metadata["MJ_joint_rms_misfit"] = mj_joint_rms
+    # F9: surface joint-MJ status so silent NaN propagation is
+    # detectable from the metadata alone. ``joint_mj_status`` is
+    # one of {"success", "single_site", "frequency_grid_mismatch",
+    # "convergence_failed", "other_error"}.
+    # ``joint_mj_failure_message`` is set only for the failure
+    # statuses (the latter three).
+    metadata["joint_mj_status"] = mj_status
+    if mj_failure_msg is not None:
+        metadata["joint_mj_failure_message"] = mj_failure_msg
 
     return ObservableTable(dataframe=df, metadata=metadata)

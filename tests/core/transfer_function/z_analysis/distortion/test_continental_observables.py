@@ -1154,6 +1154,184 @@ def test_mj_rms_misfit_nan_for_single_site_collection():
     )
 
 
+# ---------------------------------------------------------------------------
+# F9: joint MJ failure modes are surfaced in metadata + console
+# ---------------------------------------------------------------------------
+
+
+def test_joint_mj_status_success_for_shared_grid_collection():
+    """Three-site shared-grid collection → ``joint_mj_status``
+    is ``"success"`` and no warning is emitted about MJ. Companion
+    to the F5 happy-path test; F9 just adds the status-field check.
+    """
+    import warnings
+
+    periods = _make_periods()
+    bands = _restricted_bands()
+    sites = []
+    for i, sid in enumerate(["F9_S1", "F9_S2", "F9_S3"]):
+        syn = generate_synthetic_z(
+            regional_type="2D",
+            distortion_strength="weak",
+            distortion_shear="low",
+            noise_level="clean",
+            periods=periods,
+            site_id=sid,
+            seed=42 + i,
+        )
+        sites.append(_make_mt(syn["z_obj"], station=sid))
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        table = compute_collection_observables(
+            sites, period_bands=bands, n_starts=3, seed=42,
+        )
+
+    assert table.metadata["joint_mj_status"] == "success", (
+        f"expected status='success' on shared-grid collection; got "
+        f"{table.metadata.get('joint_mj_status')!r}"
+    )
+    assert "joint_mj_failure_message" not in table.metadata, (
+        f"joint_mj_failure_message must be absent on success; got "
+        f"{table.metadata.get('joint_mj_failure_message')!r}"
+    )
+    # No MJ-related UserWarning was emitted.
+    mj_warnings = [
+        str(w.message) for w in caught
+        if "joint MJ" in str(w.message)
+    ]
+    assert not mj_warnings, (
+        f"happy-path collection should not emit MJ warnings; got "
+        f"{mj_warnings}"
+    )
+
+
+def test_joint_mj_status_single_site():
+    """Single-site collections record
+    ``joint_mj_status="single_site"`` (the documented "fewer
+    than 2 sites" short-circuit) and emit no warning. Companion
+    to the F5 single-site test.
+    """
+    import warnings
+
+    periods = _make_periods()
+    bands = _restricted_bands()
+    syn = generate_synthetic_z(
+        regional_type="2D",
+        distortion_strength="weak",
+        distortion_shear="low",
+        noise_level="clean",
+        periods=periods,
+        site_id="LONE_F9",
+        seed=42,
+    )
+    mt = _make_mt(syn["z_obj"], station="LONE_F9")
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        table = compute_collection_observables(
+            [mt], period_bands=bands, n_starts=3, seed=42,
+        )
+
+    assert table.metadata["joint_mj_status"] == "single_site"
+    assert "joint_mj_failure_message" not in table.metadata
+    # No MJ-related UserWarning is emitted (the short-circuit is
+    # documented behaviour, not an error).
+    mj_warnings = [
+        str(w.message) for w in caught
+        if "joint MJ" in str(w.message)
+    ]
+    assert not mj_warnings
+
+
+def test_joint_mj_status_frequency_grid_mismatch_warns():
+    """A multi-site collection with mismatched per-site
+    frequency grids triggers
+    ``joint_mj_status="frequency_grid_mismatch"``, populates a
+    human-readable ``joint_mj_failure_message``, emits a
+    :class:`UserWarning` describing the failure, and leaves
+    ``MJ_rms_misfit`` as ``NaN`` for every row.
+
+    Mixed-grid AusLAMP collections (EDL log-base-10 + LEMI
+    power-of-2) hit this path in production; F9 makes the
+    silent-NaN failure mode visible.
+    """
+    import warnings
+
+    periods_a = np.logspace(0.0, 2.0, 12)
+    periods_b = np.logspace(0.5, 2.5, 14)  # genuinely different grid
+    band = {
+        "label": "1s_100s", "period_min": 1.0, "period_max": 100.0
+    }
+
+    syn_a = generate_synthetic_z(
+        regional_type="2D",
+        distortion_strength="moderate",
+        distortion_shear="low",
+        noise_level="clean",
+        periods=periods_a,
+        site_id="MIX_A",
+        seed=42,
+    )
+    syn_b = generate_synthetic_z(
+        regional_type="2D",
+        distortion_strength="moderate",
+        distortion_shear="low",
+        noise_level="clean",
+        periods=periods_b,
+        site_id="MIX_B",
+        seed=42,
+    )
+    sites = [
+        _make_mt(syn_a["z_obj"], station="MIX_A"),
+        _make_mt(syn_b["z_obj"], station="MIX_B"),
+    ]
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        table = compute_collection_observables(
+            sites, period_bands=[band], n_starts=2, seed=42,
+        )
+
+    assert (
+        table.metadata["joint_mj_status"] == "frequency_grid_mismatch"
+    ), (
+        f"expected status='frequency_grid_mismatch'; got "
+        f"{table.metadata.get('joint_mj_status')!r}"
+    )
+    msg = table.metadata.get("joint_mj_failure_message", "")
+    assert msg, (
+        "joint_mj_failure_message must be populated on failure; "
+        f"got {msg!r}"
+    )
+    assert "frequency grid" in msg.lower() or "different" in msg.lower(), (
+        f"failure message should mention frequency grid; got {msg!r}"
+    )
+
+    # MJ_rms_misfit is NaN throughout the table.
+    assert table.dataframe["MJ_rms_misfit"].isna().all(), (
+        "MJ_rms_misfit must be NaN for every row when joint MJ "
+        "fails on frequency-grid mismatch"
+    )
+    assert np.isnan(table.metadata["MJ_joint_rms_misfit"])
+
+    # A UserWarning describing the failure is emitted at pipeline
+    # call (so the user notices in the console output, not just
+    # the netCDF metadata).
+    mj_warnings = [
+        str(w.message) for w in caught
+        if "joint MJ" in str(w.message)
+    ]
+    assert len(mj_warnings) >= 1, (
+        f"expected a joint-MJ UserWarning on frequency-grid "
+        f"mismatch; got {[str(w.message) for w in caught]}"
+    )
+    assert "frequency_grid_mismatch" in mj_warnings[0], (
+        f"warning message should mention frequency_grid_mismatch; "
+        f"got: {mj_warnings[0]}"
+    )
+
+
 def test_mj_per_site_rms_comparable_to_gb_rms():
     """For a 3-site clean-2-D synthetic, the joint MJ per-site RMS
     should be the same order of magnitude as the single-site GB
