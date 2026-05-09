@@ -709,6 +709,190 @@ def test_gamma_magnitude_periodwise_in_table_and_distinguishable():
 
 
 # ---------------------------------------------------------------------------
+# Cross-method disagreement: per-period pair-RMS, per-band RMS (post-F1)
+# ---------------------------------------------------------------------------
+
+
+def test_cross_method_strike_disagreement_uses_per_period_pair_rms():
+    """``cross_method_strike_disagreement_deg`` is the per-period
+    pair-wise RMS of the 90°-circular distance, aggregated by RMS
+    across periods. Verify the column value matches a hand-computed
+    per-period RMS on the same Z and differs from the pre-F4
+    median-of-medians fallback (the change is observable, not
+    just symbolic).
+    """
+    from mtpy.core.transfer_function.z_analysis.decomposition import (
+        compute_cross_method,
+    )
+    from mtpy.core.transfer_function.z_analysis.decomposition.continental_observables import (
+        _per_band_rms_of_finite,
+        _per_period_pair_rms,
+        _strike_distance_mod_90_deg,
+    )
+
+    periods = _make_periods()
+    syn = generate_synthetic_z(
+        regional_type="2D",
+        distortion_strength="moderate",
+        distortion_shear="moderate",
+        noise_level="low",
+        periods=periods,
+        site_id="DIS01",
+        seed=42,
+    )
+    mt = _make_mt(syn["z_obj"], station="DIS01")
+
+    bands = _restricted_bands()
+    obs = compute_site_observables(
+        mt, period_bands=bands, n_starts=3, seed=42,
+    )
+
+    # Pick the largest band that has at least 4 periods of z to
+    # ensure we exercise both the per-period RMS and the per-band
+    # RMS across multiple periods.
+    target_band = next(
+        b for b in bands
+        if b.label == "10s_100s"
+    )
+    row = next(
+        r for r in obs.band_observables
+        if r["period_band_label"] == target_band.label
+    )
+    new_value = float(row["cross_method_strike_disagreement_deg"])
+    assert np.isfinite(new_value)
+
+    # Re-run cross_method on the same band to recover per-method
+    # strike arrays for a hand-computed reference value.
+    cm = compute_cross_method(
+        mt.Z,
+        methods=["groom_bailey", "bibby", "lilley"],
+        periods=(target_band.period_min, target_band.period_max),
+        method_kwargs={
+            "groom_bailey": {"canonical_gauge": "pt_aligned"}
+        },
+    )
+    arrays = [np.asarray(a, dtype=np.float64)
+              for a in cm.strike_estimates.values()]
+    # F1 contract: every method's strike array has the same length.
+    n_periods = arrays[0].size
+    for arr in arrays:
+        assert arr.size == n_periods, (
+            "F1 cross-method shape contract violated"
+        )
+    expected_per_period = _per_period_pair_rms(
+        arrays, _strike_distance_mod_90_deg
+    )
+    expected_new = _per_band_rms_of_finite(expected_per_period)
+
+    # The column matches the hand-computed per-period RMS.
+    assert abs(new_value - expected_new) < 1e-9, (
+        f"cross_method_strike_disagreement_deg = {new_value:.6f}, "
+        f"hand-computed per-period RMS = {expected_new:.6f}"
+    )
+
+    # And differs from the pre-F4 median-of-medians fallback (the
+    # observability check). The pre-F4 value: median per method,
+    # then sqrt(mean((each_method_median - GB_median)^2)) using
+    # 90°-mod distance.
+    medians = {
+        name: float(
+            np.median([s for s in arr if np.isfinite(s)])
+        )
+        for name, arr in cm.strike_estimates.items()
+    }
+    if "groom_bailey" in medians:
+        ref = medians["groom_bailey"]
+        old_devs = []
+        for name, m in medians.items():
+            if name == "groom_bailey":
+                continue
+            d = abs(m - ref) % 90.0
+            d = min(d, 90.0 - d)
+            old_devs.append(d)
+        if old_devs:
+            old_value = float(
+                np.sqrt(np.mean(np.asarray(old_devs) ** 2))
+            )
+            # The values should differ by a clearly observable
+            # margin on a non-degenerate synthetic. Allow a 1e-3°
+            # floor for cases where the methods coincidentally
+            # produce identical pair-wise distances.
+            assert abs(new_value - old_value) > 1e-3, (
+                f"new per-period-pair-RMS value {new_value:.6f}° "
+                f"matches pre-F4 median-of-medians fallback "
+                f"{old_value:.6f}° to within 1e-3°; the change is "
+                f"not observable on this synthetic."
+            )
+
+    # Per-band aggregation respects the bound: the column value
+    # must lie within [min(per_period), max(per_period)] of the
+    # finite per-period values (since RMS of finite values lies
+    # in that interval).
+    finite = expected_per_period[np.isfinite(expected_per_period)]
+    if finite.size > 0:
+        assert (
+            float(np.min(finite)) - 1e-9
+            <= new_value
+            <= float(np.max(finite)) + 1e-9
+        ), (
+            f"band-aggregate {new_value:.6f}° falls outside the "
+            f"per-period range "
+            f"[{float(np.min(finite)):.6f}, "
+            f"{float(np.max(finite)):.6f}]"
+        )
+
+
+def test_cross_method_disagreement_nan_when_too_few_methods():
+    """When the cross_method run yields fewer than two methods
+    with a finite value at a period, that period contributes
+    ``NaN`` to the per-band RMS (and is excluded from the mean).
+    """
+    from mtpy.core.transfer_function.z_analysis.decomposition.continental_observables import (
+        _per_band_rms_of_finite,
+        _per_period_pair_rms,
+        _strike_distance_mod_90_deg,
+    )
+
+    # Single-method input → all per-period entries are NaN →
+    # per-band RMS is NaN.
+    arrs = [np.array([10.0, 20.0, 30.0])]
+    per_period = _per_period_pair_rms(arrs, _strike_distance_mod_90_deg)
+    assert per_period.shape == (3,)
+    assert np.all(np.isnan(per_period))
+    assert np.isnan(_per_band_rms_of_finite(per_period))
+
+
+def test_cross_method_disagreement_pair_rms_known_values():
+    """The per-period pair RMS reduces to the hand-computed value
+    on a small synthetic example.
+    """
+    from mtpy.core.transfer_function.z_analysis.decomposition.continental_observables import (
+        _per_band_rms_of_finite,
+        _per_period_pair_rms,
+        _strike_distance_mod_90_deg,
+    )
+
+    arrs = [
+        np.array([10.0, 20.0, 30.0]),
+        np.array([15.0, 22.0, 28.0]),
+        np.array([12.0, np.nan, 35.0]),
+    ]
+    per_period = _per_period_pair_rms(arrs, _strike_distance_mod_90_deg)
+    # Period 0: pairs (5°, 2°, 3°) → sqrt((25+4+9)/3) ≈ 3.559
+    # Period 1: pair (2°) only (one NaN) → sqrt(4/1) = 2.0
+    # Period 2: pairs (2°, 5°, 7°) → sqrt((4+25+49)/3) ≈ 5.099
+    np.testing.assert_allclose(
+        per_period,
+        [np.sqrt(38.0 / 3.0), 2.0, np.sqrt(78.0 / 3.0)],
+        atol=1e-9,
+    )
+    expected_band = float(
+        np.sqrt(np.mean(per_period ** 2))
+    )
+    assert abs(_per_band_rms_of_finite(per_period) - expected_band) < 1e-9
+
+
+# ---------------------------------------------------------------------------
 # band_overlap_fraction: backward-compat default + opt-in overlap
 # ---------------------------------------------------------------------------
 

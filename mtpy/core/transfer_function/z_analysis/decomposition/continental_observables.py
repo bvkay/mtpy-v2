@@ -28,6 +28,46 @@ ellipse points along the strike of the near-surface heterogeneity
 that produces it, which the phase tensor also tracks); systematic
 deviation is the empirical signal mapped continentally.
 
+Cross-method disagreement columns
+=================================
+Three columns report how strongly the cross-tradition methods
+disagree at each (site, band):
+
+* ``cross_method_strike_disagreement_deg``
+* ``cross_method_twist_disagreement_deg``
+* ``cross_method_shear_disagreement_deg``
+
+**Semantics (current, post-F1).** For each period ``p`` in the
+band, take all pair-wise distances ``d(m_i, m_j, p)`` across the
+methods that produced a finite value at ``p``, square-mean to
+obtain the per-period statistic
+``S(p) = sqrt(mean_pairs(d²))``. Aggregate across periods within
+the band as
+``column_value = sqrt(mean_p_in_band(S(p)²))``.
+
+Periods at which fewer than two methods produced a finite output
+are dropped from the per-band aggregation (the disagreement
+between a single method and itself is meaningless).
+
+* For the strike column: ``d`` is circular distance modulo 90°
+  (``abs(((d1 - d2 + 45) mod 90) - 45)``) — strikes are
+  90°-ambiguous in the parameterised methods (the GB-symmetry
+  branch).
+* For twist / shear: ``d`` is linear absolute distance.
+
+**Changed in F4.** Pre-F4, the columns were "median per method,
+then RMS of (each method - GB)" because the upstream Lilley
+adapter returned full-grid arrays even when a period window was
+requested, forcing pre-aggregation to per-method scalars. With
+the F1 cross-method shape-bug fix every adapter now returns
+arrays at the requested period grid, so per-period pair-RMS is
+sound. The column is now a per-band *uncertainty estimate*
+(scale of cross-method disagreement) rather than a per-band
+central tendency. Downstream consumers should re-interpret
+existing values accordingly: large values still indicate
+disagreement, but the units are now "RMS pair-wise distance
+across periods" not "RMS deviation of method medians from GB".
+
 Two definitions of the spin-2 magnitude
 =======================================
 The schema carries two complementary magnitude columns. Both are
@@ -539,6 +579,85 @@ def _axial_angular_distance_deg(a: float, b: float) -> float:
     return float(min(d, 180.0 - d))
 
 
+def _strike_distance_mod_90_deg(a: float, b: float) -> float:
+    """Circular angular distance modulo 90° between two strikes.
+
+    The parameterised methods (GB / MJ / BCB / Lilley) report
+    strike with a 90° ambiguity (the GB-symmetry branch). The
+    natural distance is therefore on a 90°-period circle, range
+    ``[0°, 45°]``. Equivalent to:
+
+        abs(((a - b + 45) mod 90) - 45)
+
+    A 5° / 85° pair gives 10° (close on the 90°-circle), not 80°.
+    """
+    if not (np.isfinite(a) and np.isfinite(b)):
+        return float("nan")
+    return float(abs(((a - b + 45.0) % 90.0) - 45.0))
+
+
+def _per_period_pair_rms(
+    arrays: list[np.ndarray],
+    distance_fn,
+) -> np.ndarray:
+    """Per-period RMS of the pair-wise distances across method
+    arrays.
+
+    For each period ``k``, collect the values from each method's
+    array at index ``k``, drop non-finite entries, and compute the
+    RMS of all pair-wise distances among the surviving values.
+    Periods where fewer than two methods contributed a finite
+    value yield ``NaN`` (cannot compute disagreement from one
+    method). All input arrays must have the same length (the
+    cross-method shape contract enforced by
+    :func:`compute_cross_method` post-fix; see the F1 commit).
+    """
+    if not arrays:
+        return np.empty(0, dtype=np.float64)
+    n_periods = arrays[0].size
+    for arr in arrays:
+        if arr.size != n_periods:  # pragma: no cover -- F1 contract
+            raise ValueError(
+                "_per_period_pair_rms: input arrays differ in length "
+                f"({[a.size for a in arrays]}). Cross-method adapters "
+                "must return matching shapes (see cross_method.py "
+                "shape-bug fix)."
+            )
+    out = np.full(n_periods, np.nan, dtype=np.float64)
+    for k in range(n_periods):
+        finite_vals = [
+            float(arr[k]) for arr in arrays if np.isfinite(arr[k])
+        ]
+        if len(finite_vals) < 2:
+            continue
+        sq_sum = 0.0
+        n_pairs = 0
+        for i in range(len(finite_vals)):
+            for j in range(i + 1, len(finite_vals)):
+                d = distance_fn(finite_vals[i], finite_vals[j])
+                if np.isfinite(d):
+                    sq_sum += d * d
+                    n_pairs += 1
+        if n_pairs > 0:
+            out[k] = float(np.sqrt(sq_sum / n_pairs))
+    return out
+
+
+def _per_band_rms_of_finite(values: np.ndarray) -> float:
+    """Root-mean-square of the finite entries of ``values``.
+
+    Used to aggregate per-period statistics into a single per-band
+    scalar (the second stage of the per-period-pair-RMS,
+    per-band-RMS pipeline). NaN periods are treated as missing
+    and excluded from the mean.
+    """
+    arr = np.asarray(values, dtype=np.float64)
+    finite = np.isfinite(arr)
+    if not finite.any():
+        return float("nan")
+    return float(np.sqrt(np.mean(arr[finite] ** 2)))
+
+
 # ---------------------------------------------------------------------------
 # Per-band observable computation
 # ---------------------------------------------------------------------------
@@ -804,12 +923,22 @@ def _cross_method_disagreements(
     *,
     canonical_gauge: str,
 ) -> dict[str, Any]:
-    """Cross-method strike / twist / shear disagreements.
+    """Per-band cross-method disagreement summaries.
 
-    Runs ``compute_cross_method`` with a minimal set of methods and
-    returns the per-method-vs-GB RMS strike / twist / shear
-    deviations averaged across all non-GB methods that produced an
-    estimate.
+    For each per-period observable (strike, twist, shear), compute
+    the per-period RMS of the pair-wise distances across all
+    methods that produced a finite value at that period, then take
+    the RMS across periods within the band. This is a per-period-
+    pair-RMS, per-band-RMS pipeline; see the module docstring's
+    "cross-method disagreement columns" section for the rigorous
+    definition.
+
+    The cross-method shape contract (each adapter returns arrays
+    of length ``n_periods`` matching :attr:`CrossMethodResult.periods`)
+    is required for this function to be sound. It was established
+    by the cross_method shape-bug fix (commit ``48a3280``); see the
+    docstring of :func:`...cross_method._adapter_lilley` for the
+    detailed history.
     """
     out: dict[str, Any] = {
         "status": "ok",
@@ -832,72 +961,55 @@ def _cross_method_disagreements(
         out["message"] = f"compute_cross_method raised: {exc!r}"
         return out
 
-    # Different adapters in compute_cross_method may return arrays
-    # of different lengths (Lilley operates on the full period grid;
-    # GB / BCB on the period-window). Aggregate each method's
-    # strike / twist / shear to a single per-band scalar (median of
-    # finite values) before comparing — the per-band comparison is
-    # the one we want for continental aggregation anyway.
-    def _scalar_strike(arr: np.ndarray) -> float:
-        finite = np.isfinite(arr)
-        if not finite.any():
-            return float("nan")
-        # Strikes are mod 90 already; median is fine.
-        return float(np.median(arr[finite]))
-
-    def _scalar_linear(arr: np.ndarray) -> float:
-        finite = np.isfinite(arr)
-        if not finite.any():
-            return float("nan")
-        return float(np.median(arr[finite]))
-
-    ref_strike = cm.strike_estimates.get("groom_bailey")
-    ref_ts = cm.twist_shear_estimates.get("groom_bailey")
-    if ref_strike is None:
-        out["status"] = "no_gb_strike"
-        out["message"] = "GB did not produce a strike for the band"
-        return out
-
-    ref_strike_scalar = _scalar_strike(np.asarray(ref_strike))
-    strike_devs = []
-    for name, m_strike in cm.strike_estimates.items():
-        if name == "groom_bailey":
-            continue
-        m_scalar = _scalar_strike(np.asarray(m_strike))
-        if not (np.isfinite(m_scalar) and np.isfinite(ref_strike_scalar)):
-            continue
-        d = abs(m_scalar - ref_strike_scalar) % 90.0
-        d = min(d, 90.0 - d)
-        strike_devs.append(d)
-
-    twist_devs = []
-    shear_devs = []
-    if ref_ts is not None:
-        ref_twist_scalar = _scalar_linear(np.asarray(ref_ts[0]))
-        ref_shear_scalar = _scalar_linear(np.asarray(ref_ts[1]))
-        for name, (twist, shear) in cm.twist_shear_estimates.items():
-            if name == "groom_bailey":
-                continue
-            t_scalar = _scalar_linear(np.asarray(twist))
-            s_scalar = _scalar_linear(np.asarray(shear))
-            if np.isfinite(t_scalar) and np.isfinite(ref_twist_scalar):
-                twist_devs.append(abs(t_scalar - ref_twist_scalar))
-            if np.isfinite(s_scalar) and np.isfinite(ref_shear_scalar):
-                shear_devs.append(abs(s_scalar - ref_shear_scalar))
-
-    if strike_devs:
-        out["cross_method_strike_disagreement_deg"] = float(
-            np.sqrt(np.mean(np.asarray(strike_devs) ** 2))
+    # Strike: all methods that produced a strike, all pair-wise
+    # circular distances mod 90°, RMS at each period, RMS across
+    # periods.
+    strike_arrays = [
+        np.asarray(arr, dtype=np.float64)
+        for arr in cm.strike_estimates.values()
+    ]
+    if len(strike_arrays) >= 2:
+        per_period = _per_period_pair_rms(
+            strike_arrays, _strike_distance_mod_90_deg
         )
-    if twist_devs:
-        out["cross_method_twist_disagreement_deg"] = float(
-            np.sqrt(np.mean(np.asarray(twist_devs) ** 2))
+        out["cross_method_strike_disagreement_deg"] = (
+            _per_band_rms_of_finite(per_period)
         )
-    if shear_devs:
-        out["cross_method_shear_disagreement_deg"] = float(
-            np.sqrt(np.mean(np.asarray(shear_devs) ** 2))
+
+    # Twist / shear: linear distance (no circular wrap); same
+    # pair-RMS pipeline. Methods that don't produce twist/shear
+    # (Lilley, Marti) are absent from cm.twist_shear_estimates,
+    # so the pair count is naturally smaller.
+    twist_arrays = [
+        np.asarray(twist, dtype=np.float64)
+        for twist, _shear in cm.twist_shear_estimates.values()
+    ]
+    if len(twist_arrays) >= 2:
+        per_period = _per_period_pair_rms(twist_arrays, _linear_abs_diff)
+        out["cross_method_twist_disagreement_deg"] = (
+            _per_band_rms_of_finite(per_period)
         )
+
+    shear_arrays = [
+        np.asarray(shear, dtype=np.float64)
+        for _twist, shear in cm.twist_shear_estimates.values()
+    ]
+    if len(shear_arrays) >= 2:
+        per_period = _per_period_pair_rms(shear_arrays, _linear_abs_diff)
+        out["cross_method_shear_disagreement_deg"] = (
+            _per_band_rms_of_finite(per_period)
+        )
+
     return out
+
+
+def _linear_abs_diff(a: float, b: float) -> float:
+    """Absolute linear distance ``|a - b|``. Used for the
+    twist / shear disagreement, which has no circular wrap.
+    """
+    if not (np.isfinite(a) and np.isfinite(b)):
+        return float("nan")
+    return float(abs(a - b))
 
 
 def _diagnostics_band_observables(

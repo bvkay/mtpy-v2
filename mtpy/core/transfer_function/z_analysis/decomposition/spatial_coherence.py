@@ -66,6 +66,25 @@ Per-observable special handling
 * **Linear angles** (``C_twist_deg``, ``C_shear_deg``,
   ``PT_beta_deg``, …) and other linear observables: standard
   squared-difference variogram.
+
+  The ``cross_method_*_disagreement_deg`` columns
+  (``cross_method_strike_disagreement_deg``,
+  ``cross_method_twist_disagreement_deg``,
+  ``cross_method_shear_disagreement_deg``) are *also* linear in
+  the variogram sense (they are non-negative scalar magnitudes,
+  not angles), but they require a special interpretation note.
+  Post-F4 (the cross_method shape-bug fix follow-up) these
+  columns are **per-band uncertainty estimates** — each value is
+  ``sqrt(mean_p(sqrt(mean_pairs(d²))²))``, the per-period-pair
+  RMS aggregated across periods. A variogram on this column
+  describes how the *uncertainty itself* varies geographically:
+  high-disagreement sites near other high-disagreement sites
+  produce small variogram values at small ``h``; uncertainty
+  that is uncorrelated across nearby sites produces a high
+  variogram that pegs the null. Range estimates on these
+  columns describe the spatial scale over which model-validity
+  varies, not the spatial scale of any underlying physical
+  signal.
 * **Ordinal flags** (``magnetic_distortion_flag``,
   ``Lilley_category``, ``WALDIM_case``,
   ``dimensionality_concordant``, ``GB_mode_warning``): converted
