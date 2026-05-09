@@ -168,6 +168,55 @@ opt-in skipped.
   2775 lines (down from 3681 at the start of the refactor — −906
   / −25 %).
 
+### New pipelines
+- **Continental-scale observables pipeline**
+  (:mod:`...continental_observables`,
+  :func:`compute_site_observables`,
+  :func:`compute_collection_observables`,
+  :class:`SiteObservables`, :class:`ObservableTable`,
+  :data:`OBSERVABLE_COLUMNS`). The canonical "compute everything
+  for an MT collection" entry point for the Paper 1 empirical
+  foundation. Composes the existing per-method modules (no
+  decomposition logic in the pipeline itself) into a tidy
+  long-format pandas DataFrame with one row per (site,
+  period_band) and a fixed schema covering distortion-tensor
+  primary observables, irreducible (spin-2) decomposition,
+  phase-tensor invariants, cross-method consistency,
+  dimensionality (WALDIM + Lilley 2020), magnetic-distortion
+  flag, Tipper amplitude, and the Paper 1 hero observable
+  ``discordance_deg`` (the angle between the recovered C
+  principal axis and the phase-tensor alpha, range
+  ``[0°, 90°]``).
+
+  Default :data:`DEFAULT_PERIOD_BANDS` are six 1-decade-wide
+  bands tiled across ``[0.01, 10000]`` s (the AusLAMP design
+  range); pass ``period_bands=`` to override. Aggregation rules
+  are documented per observable type: circular weighted mean
+  (mod 180°) for line-direction quantities, geometric mean for
+  positive magnitudes, arithmetic mean for misfits, "worst-case"
+  promotion for dimensionality labels, and integer-mode for
+  WALDIM cases.
+
+  :class:`ObservableTable` round-trips through parquet
+  (``to_parquet`` / ``from_parquet``) with a sidecar JSON for
+  the provenance metadata (mtpy version, decomposition module
+  git sha, timestamp, method versions, period-band spec,
+  ``canonical_gauge`` choice, RNG seed, input-collection hash).
+  Parquet I/O lazy-loads ``pyarrow``; if neither ``pyarrow`` nor
+  ``fastparquet`` is installed, the I/O methods raise
+  :class:`ImportError` with installation guidance. The package
+  does **not** declare ``pyarrow`` as a hard dependency — it is
+  optional and only required by the parquet path.
+
+  Five integration tests in
+  ``tests/.../distortion/test_continental_observables.py`` cover
+  the schema-completeness, multi-site assembly, period-band
+  aggregation, provenance / reproducibility, and discordance
+  scenarios; two further tests (parquet round-trip, ≤ 10 s
+  pipeline budget) auto-skip when no parquet engine is
+  installed. With three sites at ``n_starts=3`` the full
+  pipeline runs in ~1 s end-to-end.
+
 ### Unified dimensionality classifier
 - **Lilley 2020 unified phase-tensor / Bahr-eigenvector / Mohr-
   circle dimensionality classifier**

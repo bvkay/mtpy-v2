@@ -1055,6 +1055,147 @@ class CrossMethodResult:
 
 
 @dataclass
+class SiteObservables:
+    """Per-site, per-band continental-aggregation observables.
+
+    A flat container holding all distortion-as-signal observables
+    for one site at all configured period bands. The companion
+    :class:`ObservableTable` is the long-format aggregation
+    across many sites.
+
+    The schema is a *contract*: every band of every site has the
+    same set of fields, populated with NaN / sentinel values when a
+    particular observable is not computable (e.g. ``gamma_magnitude``
+    when GB fails to converge). This invariant is what allows
+    downstream continental-scale aggregation, mapping, variograms,
+    and stratification to consume the result without per-site
+    branches.
+
+    Field semantics are documented in
+    :data:`...continental_observables.OBSERVABLE_COLUMNS` and on
+    each band-level dict (whose keys must match the schema). See the
+    :mod:`...continental_observables` module docstring for the
+    full pipeline rationale and the Paper 1 mapping context.
+
+    Fields
+    ------
+    site_id : str
+    longitude_deg, latitude_deg, elevation_m : float
+        Geographic identification. ``elevation_m`` is ``NaN`` when
+        the source ``MT`` object does not carry elevation metadata.
+    band_observables : list of dict
+        One dict per period band; keys are the schema column names.
+    metadata : dict
+        Provenance: same payload as the parent
+        :class:`ObservableTable`'s metadata, recorded per-site for
+        diagnostic deep-dives that load only one site.
+    """
+
+    site_id: str
+    longitude_deg: float
+    latitude_deg: float
+    elevation_m: float
+    band_observables: list[dict[str, Any]] = field(default_factory=list)
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class ObservableTable:
+    """Long-format continental-scale observables table.
+
+    A thin wrapper around a :class:`pandas.DataFrame` whose schema
+    is fixed by :data:`...continental_observables.OBSERVABLE_COLUMNS`.
+    Each row is a (site, band) pair. The same DataFrame is consumed
+    directly by mapping, variogram, and stratification analyses
+    downstream.
+
+    Fields
+    ------
+    dataframe : pandas.DataFrame
+        Long-format. One row per (site, band). Schema matches
+        :data:`...continental_observables.OBSERVABLE_COLUMNS`. Site-
+        identification columns repeat per row; this is the standard
+        long-format trade-off (storage redundancy ↔ analysis
+        ergonomics).
+    metadata : dict
+        Provenance: mtpy version, decomposition module git sha,
+        timestamp (UTC), method versions, period band specification,
+        ``canonical_gauge`` setting, RNG seed, input-collection
+        identifier.
+
+    Serialisation
+    -------------
+    :meth:`to_parquet` / :meth:`from_parquet` round-trip the table
+    with metadata as a sidecar JSON. Parquet preserves dtypes
+    natively (so e.g. ``WALDIM_case`` stays ``int64`` and the
+    string classifications stay ``object`` / ``string`` dtype),
+    enabling fast continental-scale loading. Parquet engine is
+    pandas-default (``pyarrow`` if installed, else ``fastparquet``);
+    if neither is installed, the I/O methods raise
+    :class:`ImportError` with a guidance message.
+    """
+
+    dataframe: Any  # pandas.DataFrame; declared `Any` to avoid hard import
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def to_parquet(self, path: "str | Path") -> None:
+        """Write the table + metadata sidecar to a parquet file.
+
+        Sidecar metadata JSON path is ``<path>.metadata.json``.
+
+        Raises
+        ------
+        ImportError
+            If neither ``pyarrow`` nor ``fastparquet`` is installed
+            (pandas requires one of them as a parquet engine).
+        """
+        import json
+
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            self.dataframe.to_parquet(path, index=False)
+        except ImportError as exc:
+            raise ImportError(
+                "ObservableTable.to_parquet: requires pyarrow or "
+                "fastparquet to be installed. Install one with "
+                "`pip install pyarrow` or `pip install fastparquet`."
+            ) from exc
+
+        metadata_path = Path(str(path) + ".metadata.json")
+        with metadata_path.open("w") as f:
+            json.dump(self.metadata, f, indent=2, default=_json_serialise_numpy)
+
+    @classmethod
+    def from_parquet(cls, path: "str | Path") -> "ObservableTable":
+        """Read a parquet file written by :meth:`to_parquet`.
+
+        Reads metadata from the sidecar JSON if present; an absent
+        sidecar produces an empty metadata dict.
+        """
+        import json
+
+        import pandas as pd
+
+        path = Path(path)
+        try:
+            df = pd.read_parquet(path)
+        except ImportError as exc:
+            raise ImportError(
+                "ObservableTable.from_parquet: requires pyarrow or "
+                "fastparquet to be installed."
+            ) from exc
+
+        metadata_path = Path(str(path) + ".metadata.json")
+        if metadata_path.exists():
+            with metadata_path.open() as f:
+                metadata = json.load(f, object_hook=_json_deserialise_numpy)
+        else:
+            metadata = {}
+        return cls(dataframe=df, metadata=metadata)
+
+
+@dataclass
 class MagneticDistortionFlag:
     """Heuristic per-site flag for *suspected* magnetic galvanic
     distortion.
