@@ -58,17 +58,31 @@ def _empty_row() -> dict:
 
 
 def _make_high_trust_row(site_id: str = "HT001") -> dict:
-    """A row that satisfies every ``high_trust`` criterion."""
+    """A row that satisfies every ``high_trust`` criterion *deep
+    in the satisfied tail*.
+
+    With the conventional sigmoid scale ``max(0.1·threshold, 0.5)``
+    and the minimum-of-criteria aggregation, every numeric
+    criterion needs to be at least ~3 sigmoid scales inside its
+    threshold for the overall score to clear 0.9. The values
+    chosen here put each numeric criterion at sigmoid score
+    ≥ 0.95 (well into the satisfied tail), so the row scores
+    > 0.9 robustly.
+    """
     row = _empty_row()
     row["site_id"] = site_id
     row["WALDIM_case"] = 2
     row["Lilley_category"] = "2D"
-    row["PT_abs_beta_deg"] = 1.0
+    # Numeric thresholds (with conventional scale 0.5 each):
+    #   PT_abs_beta < 3°: 0.5° → sigmoid(5) = 0.993
+    #   cross_method_strike < 5°: 1.0° → sigmoid(8) = 0.9997
+    #   GB_rms_misfit < 2.0: 0.4 → sigmoid(3.2) = 0.961
+    row["PT_abs_beta_deg"] = 0.5
     row["magnetic_distortion_flag"] = "low_risk"
     row["GB_mode_warning"] = False
-    row["cross_method_strike_disagreement_deg"] = 2.0
-    row["GB_rms_misfit"] = 1.2
-    # Fill with sane numeric values for stat columns
+    row["cross_method_strike_disagreement_deg"] = 1.0
+    row["GB_rms_misfit"] = 0.4
+    # Fill with sane numeric values for stat columns.
     row["discordance_deg"] = 5.0
     row["gamma_magnitude"] = 0.1
     row["C_minus_I_F"] = 0.2
@@ -257,6 +271,86 @@ def test_excluded_score_below_threshold():
             f"excluded row reason={reason!r} scored {score:.3f}; "
             f"expected <= 0.1"
         )
+
+
+def test_trust_score_in_boundary_zone():
+    """A row that satisfies *most* high-trust rules but is right
+    at the boundary of one (``PT_abs_beta = 3.1°`` against
+    threshold = 3.0°) lands in the smooth transition zone, NOT
+    the bypass floor.
+
+    With the conventional sigmoid scale ``max(0.1·|threshold|,
+    0.5) = 0.5°``, a value 0.1° beyond the threshold gives
+    sigmoid score ``sigmoid(-0.2) ≈ 0.450``. Min-of-criteria
+    aggregation surfaces this single weak criterion as the
+    overall score (0.45), which lies in the user-spec'd
+    ``[0.4, 0.7]`` transition band — well above the 0.05 floor
+    and well below 1.0.
+    """
+    row = _make_high_trust_row()
+    row["PT_abs_beta_deg"] = 3.1  # 0.1° past the < 3 threshold
+    score = trust_score(row)
+    assert 0.4 <= score <= 0.7, (
+        f"boundary row (PT_abs_beta = 3.1°) scored {score:.3f}; "
+        f"expected smooth-zone score in [0.4, 0.7] (not the 0.05 "
+        f"floor and not 1.0). Min-of-criteria with conventional "
+        f"sigmoid scale should give ~0.45 here."
+    )
+
+
+def test_trust_score_continuity_sweep():
+    """Sweep ``PT_abs_beta_deg`` from 0 to 10° (threshold = 3°)
+    and assert the user-spec'd continuity properties:
+
+    1. Trust score is monotonically non-increasing.
+    2. Score crosses 0.5 within ±1° of the threshold (the
+       transition-zone width — wider than the pre-fix tightened
+       scale, narrower than a step function).
+    3. Score reaches the 0.05 floor by ~6° (3 sigmoid scales
+       beyond the threshold of 3° with conventional scale 0.5°
+       gives the failure-zone entry at ~4.5°; by 6° the floor is
+       firmly held).
+    """
+    base = _make_high_trust_row()
+    pt_betas = np.linspace(0.0, 10.0, 81)  # 0.125° step
+    scores = []
+    for b in pt_betas:
+        row = dict(base)
+        row["PT_abs_beta_deg"] = float(b)
+        scores.append(trust_score(row))
+    scores = np.asarray(scores, dtype=np.float64)
+
+    # 1. Monotonic non-increasing (constant plateaus are allowed:
+    # the satisfied tail is bounded by the *other* criteria, the
+    # failing tail by the floor).
+    assert np.all(np.diff(scores) <= 1e-9), (
+        f"trust_score is not monotonically non-increasing under "
+        f"PT_abs_beta sweep; max positive jump = "
+        f"{float(np.max(np.diff(scores))):.6f}"
+    )
+
+    # 2. Crosses 0.5 within ±1° of the threshold (3°). The first
+    # index where score ≤ 0.5 should correspond to a beta in
+    # [2°, 4°].
+    crossing_idx = int(np.argmax(scores <= 0.5))
+    assert scores[crossing_idx] <= 0.5
+    crossing_beta = float(pt_betas[crossing_idx])
+    assert 2.0 <= crossing_beta <= 4.0, (
+        f"trust_score crossed 0.5 at PT_abs_beta = "
+        f"{crossing_beta:.3f}°; expected within ±1° of "
+        f"threshold (3°)"
+    )
+
+    # 3. By PT_abs_beta = 6° (well into the failing tail) the
+    # score has reached the 0.05 floor and held it.
+    six_deg_idx = int(np.argmin(np.abs(pt_betas - 6.0)))
+    assert abs(scores[six_deg_idx] - 0.05) < 1e-9, (
+        f"trust_score at PT_abs_beta = 6° is "
+        f"{scores[six_deg_idx]:.6f}; expected the 0.05 floor "
+        f"(3 sigmoid scales beyond the threshold)"
+    )
+    # And every index past the 6° point is also at the floor.
+    assert np.all(np.abs(scores[six_deg_idx:] - 0.05) < 1e-9)
 
 
 # ---------------------------------------------------------------------------

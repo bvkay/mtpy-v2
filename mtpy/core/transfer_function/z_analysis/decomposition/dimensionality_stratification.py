@@ -274,9 +274,10 @@ def _criterion_score(
 
     For numeric inequality operators the score is a sigmoid
     centred at the threshold with width ``scale``; the default
-    ``scale = max(0.05 * |target|, 0.3)`` gives a transition over
-    ~``2 * scale`` units and matches the categorical hard-edged
-    rule asymptotically. For categorical operators the score is
+    ``scale = max(0.1 * |target|, 0.5)`` (the conventional
+    half-life choice) gives a transition over ~``2 * scale``
+    units and matches the categorical hard-edged rule
+    asymptotically. For categorical operators the score is
     binary.
 
     A missing value returns ``0.0`` (the cell did not contribute
@@ -291,10 +292,10 @@ def _criterion_score(
     if op == "!=":
         return 1.0 if value != target else 0.0
     if op in ("<", "<="):
-        s = scale if scale is not None else max(0.05 * abs(target), 0.3)
+        s = scale if scale is not None else max(0.1 * abs(target), 0.5)
         return _sigmoid((target - value) / s)
     if op in (">", ">="):
-        s = scale if scale is not None else max(0.05 * abs(target), 0.3)
+        s = scale if scale is not None else max(0.1 * abs(target), 0.5)
         return _sigmoid((value - target) / s)
     raise ValueError(f"_criterion_score: unknown op {op!r}")
 
@@ -365,6 +366,14 @@ def _assign_stratum(
     return "low_trust"
 
 
+_TRUST_SCORE_FLOOR: float = 0.05
+"""Hard-fail floor for :func:`trust_score`. Any criterion whose
+per-criterion score is below this value drives the overall score
+to exactly this floor — see the function docstring's
+*minimum-of-criteria* paragraph.
+"""
+
+
 def trust_score(
     observable_table_row,
     rules: dict[str, Any] | None = None,
@@ -376,9 +385,11 @@ def trust_score(
     Smooth-edged version of the ``"high_trust"`` rules: every
     criterion contributes a score in ``[0, 1]`` (sigmoid for
     numeric thresholds, binary for categorical), and the overall
-    score is the geometric mean. A categorical mismatch (e.g.
-    ``magnetic_distortion_flag == "high_risk"``) zeroes-out the
-    score; numeric near-misses smoothly reduce it.
+    score is **the minimum** of those per-criterion scores
+    (clipped at the :data:`_TRUST_SCORE_FLOOR`). A categorical
+    mismatch (e.g. ``magnetic_distortion_flag == "high_risk"``)
+    drives the score to the floor; numeric near-misses smoothly
+    reduce it through their sigmoid.
 
     Parameters
     ----------
@@ -389,25 +400,46 @@ def trust_score(
         ``"high_trust"`` entry is consulted.
     scales : dict[str, float], optional
         Per-column sigmoid widths. Default
-        ``max(0.1 * |threshold|, 0.5)`` per criterion; tighter
-        values give a sharper edge.
+        ``max(0.1 * |threshold|, 0.5)`` per criterion (the
+        conventional choice); tighter values give a sharper
+        transition zone, looser values a smoother one.
 
     Returns
     -------
     float
-        Geometric mean of per-criterion scores. Range ``[0, 1]``.
-        A score of ``1.0`` means every criterion is well above
-        its threshold; ``0.0`` means at least one categorical
-        criterion is violated *and* there is no missing data
-        elsewhere.
+        ``max(min(per_criterion_scores), 0.05)``. Range
+        ``[0.05, 1]``. A score of ``1.0`` means *every* criterion
+        is well above its threshold; ``0.05`` (the floor) means
+        *at least one* criterion is clearly failing — the row is
+        only as trustworthy as its weakest criterion.
 
     Notes
     -----
-    To avoid ``log(0)`` in the geometric mean, individual
-    criterion scores are clipped to ``1e-12``. The smallest
-    achievable trust score for a 7-criterion rule set is
-    therefore ``1e-12 ** (1/7) ≈ 0.02``, well below any
-    practical "trust" threshold.
+    *Minimum-of-criteria*. The earlier geometric-mean aggregation
+    smoothed out a single failing criterion against six passing
+    ones (giving e.g. a 0.89 score for a row with one criterion
+    at 0.45 and six at 1.0). That made the score insensitive to
+    individual rule failures and required tightening the sigmoid
+    scale to compensate, producing narrower transition zones than
+    researchers expected. The minimum-of-criteria aggregation is
+    the structurally correct fix: a row's trust is bounded by its
+    weakest criterion.
+
+    *Hard-fail floor*. The ``0.05`` floor is the
+    :data:`_TRUST_SCORE_FLOOR` constant. It serves two purposes:
+    it gives every clearly-failing row the same value (so
+    continental colour-scale maps don't show meaningless gradient
+    in the failing region), and it leaves a reserved sub-floor
+    range ``[0, 0.05)`` for sentinel encodings (e.g. a future
+    "data missing" tier).
+
+    *Conventional sigmoid scale*. The default
+    ``scale = max(0.1 · |threshold|, 0.5)`` is wide enough that
+    the score crosses 0.5 *exactly at* the threshold and reaches
+    the floor 3 sigmoid scales beyond it. With the canonical
+    Paper-1 ``PT_abs_beta_deg < 3°`` rule (scale = 0.5°), the
+    transition zone (score ∈ [0.1, 0.9]) is roughly
+    ``[2.5°, 3.5°]`` — about 1° wide.
     """
     rules = rules if rules is not None else DEFAULT_TRUST_RULES
     high = rules.get("high_trust", {})
@@ -416,14 +448,14 @@ def trust_score(
         return 1.0
     row = _row_to_dict(observable_table_row)
     scales = scales or {}
-    scores: list[float] = []
+    min_score = 1.0
     for col, (op, target) in criteria.items():
         s = _criterion_score(
             row.get(col), op, target, scale=scales.get(col),
         )
-        scores.append(max(s, 1e-12))
-    log_scores = np.log(np.asarray(scores))
-    return float(np.exp(np.mean(log_scores)))
+        if s < min_score:
+            min_score = s
+    return float(max(min_score, _TRUST_SCORE_FLOOR))
 
 
 # ---------------------------------------------------------------------------
