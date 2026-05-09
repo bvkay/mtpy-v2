@@ -125,6 +125,59 @@ See Also
 :mod:`...spatial_coherence_plots` : visualisation helpers
     (matplotlib-based) for variograms with the null bound and the
     bootstrap reference line.
+
+Caveats
+=======
+* **The 21-bin default intentionally exceeds the 20-bin spec.**
+  20 log-spaced bins from 50 to 2000 km, plus a single
+  near-neighbour bin from 0 to 50 km appended at the bottom.
+  The near-neighbour bin pools all sub-50-km pairs to avoid
+  binning sparseness; pass ``n_bins`` / ``near_threshold_km``
+  to override.
+* **Magnitude observables are log10-transformed before
+  variogramming.** Non-positive values become ``NaN`` and are
+  excluded from the variogram but still counted in the bin
+  occupancy statistics. So a zero ``gamma_magnitude`` (clean
+  2-D site) is silently dropped from magnitude variograms.
+* **Ordinal observables** (``Lilley_category``,
+  ``magnetic_distortion_flag``) are mapped to integer codes per
+  :data:`ORDINAL_OBSERVABLES` and run as standard linear
+  variograms — interpretable, but the bin distances are
+  conventional, not natural. ``WALDIM_case`` is already an
+  integer and runs as linear; ``dimensionality_concordant`` and
+  ``GB_mode_warning`` (booleans) coerce to 0/1 and run as
+  linear variograms.
+* **AusLAMP-scale test 6 has soft-skip behaviour.** The
+  realistic-coordinates synthetic relies on
+  ``site_summary.csv`` which lives in the ``mt_decomp``
+  repository, not in ``mtpy-v2``. Set the
+  ``AUSLAMP_SITE_SUMMARY`` environment variable or place the
+  file at the canonical mt_decomp path; otherwise the test is
+  skipped gracefully.
+* **Variograms on the cross-method disagreement columns now
+  describe how model-validity uncertainty varies geographically**
+  (post-F4 semantics), not the spatial scale of any underlying
+  physical signal. A high-disagreement region near other
+  high-disagreement regions produces small variogram values at
+  small ``h`` (i.e. uncertainty itself is spatially correlated);
+  uncorrelated uncertainty produces a high variogram pegged
+  against the null. Range estimates on these columns describe
+  the spatial scale of *model trustworthiness variation*, not
+  the structure of any physical observable.
+* **Bootstrap-variance reference is bootstrap-driven post-F6.**
+  When the input table has ``<obs>_p05`` / ``<obs>_p95`` columns
+  (i.e. ``compute_site_observables`` was called with
+  ``bootstrap_n_replicates > 0``),
+  :func:`_per_site_bootstrap_variance` reads them directly:
+  ``bootstrap_variance = median over rows of (p95 - p05) / 2``.
+  No warning. When the CI columns are absent (legacy /
+  ``bootstrap_n_replicates=0`` runs) the function falls back to
+  inter-band variance and emits a :class:`UserWarning` — the
+  fallback over-estimates noise (absorbs genuine
+  frequency-dependence) and should be treated as an upper
+  bound. The Phase-1 transition is to run with
+  ``bootstrap_n_replicates > 0`` by default on production
+  AusLAMP runs; the warning then does not fire.
 """
 
 from __future__ import annotations

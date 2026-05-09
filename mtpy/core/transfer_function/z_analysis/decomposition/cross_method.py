@@ -40,6 +40,64 @@ References
 See the per-method module docstrings for the foundational
 citations (GB89, MJ01, BCB05, Lilley98, Marti09, Garcia02,
 Gomez-Treviño 2018).
+
+Caveats and design quirks
+=========================
+The list below is the consolidated reference for every
+non-obvious behaviour in this module. Keyed off the F1–F8
+implementation series; intended as a grep target so a researcher
+reading the source can find every known design choice without
+consulting external notes.
+
+* **BCB band-averaged C is by design.** The per-period twist /
+  shear arrays returned by ``_adapter_bibby`` are derived from a
+  *single* band-averaged ``C`` tensor (Bibby et al. 2005); the
+  values are therefore *repeated* across periods within the
+  band, even though they have the correct shape. They are not a
+  per-period estimate and not a noise floor — close-by periods
+  report the same ``C``, only their PT-alpha-driven rotation
+  differs. Use ``method_capabilities`` to know what each adapter
+  produces; do not interpret BCB twist / shear arrays as
+  independent samples.
+* **BCB strike reference is PT alpha + 90°** (the GB-PT
+  convention offset; see F3). Direct comparison with GB strikes
+  already accounts for this offset — no further correction
+  needed at the consumer.
+* **Garcia-Jones returns no_solution on single-site inputs by
+  design.** GJ requires ≥ 2 sites for joint fitting; the
+  single-site adapter short-circuits to
+  ``status="no_solution"``. GJ stays in ``DEFAULT_METHODS``
+  despite this — the contract is "every default method appears
+  in ``method_status``"; ``no_solution`` is informative (the
+  method was attempted but didn't apply at this site). Use
+  ``method_status[name] == "success"`` as the gate before
+  reading per-method outputs from the result.
+* **MJ excluded from DEFAULT_METHODS on purpose.** Single-site
+  ``mcneice_jones`` reduces exactly to single-site GB; including
+  it in the default would duplicate the GB output and waste
+  optimiser cycles. MJ is plumbed at the *collection* level via
+  :func:`...continental_observables._run_joint_mj_for_collection`
+  (≥ 2 sites). To force MJ into a single-site cross-method run,
+  pass ``methods=ALL_METHODS`` explicitly.
+* **METHOD_CAPABILITIES** is the source-of-truth map of which
+  observables each method's adapter populates on success. Keys
+  are method names; values are subsets of ``"strike"``,
+  ``"twist_shear"``, ``"regional_z"``, ``"dimensionality"``.
+  Downstream code that wants "which methods produce strikes?"
+  should consult this map rather than inspect each adapter.
+  ``method_capabilities`` is a per-call dict on
+  :class:`...results.CrossMethodResult`; older serialised
+  ``CrossMethodResult`` instances from before F5 do not have
+  this field and will fail to load via the dataclass — re-run
+  the call to regenerate.
+* **agreement_summary changed in F1** from per-band-median to
+  per-period-pair RMS. The pre-F1 implementation forced
+  pre-aggregation to per-method scalars because the Lilley
+  adapter ignored the ``periods`` window and returned full-grid
+  arrays. With the F1 shape-bug fix every adapter returns
+  arrays at the requested period grid, so per-period-pair RMS
+  is sound. Numerical values of ``strike_rms_deg`` etc. are
+  not directly comparable between pre-F1 and post-F1 calls.
 """
 
 from __future__ import annotations

@@ -165,6 +165,117 @@ distortion tensor as a signal rather than a nuisance — is the
 project-level motivation; see ``CLAUDE.md`` and the
 ``docs/notes/Paper_01.md`` working notes in the parent
 ``mt_decomp`` repository.
+
+Caveats
+=======
+The list below consolidates every non-obvious behaviour of this
+pipeline introduced across the F1–F8 implementation series.
+Intended as a grep target for researchers reading the source.
+
+* **Two ``|γ|`` columns are emitted**: ``gamma_magnitude``
+  (``|γ|`` of the band-aggregate ``C``) and
+  ``gamma_magnitude_periodwise`` (geometric mean of per-period
+  ``|γ|``). Both are valid; they answer different questions.
+  Band-aggregate is internally consistent with ``C_strike_deg``
+  / ``C_twist_deg`` / ``C_shear_deg`` in the same row;
+  per-period geomean is robust to outlier periods and decoupled
+  from the angular-aggregation choice. Use both for sensitivity
+  analysis. See the "Two definitions of the spin-2 magnitude"
+  section above for the full rationale.
+* **Period bands tile by default** (``band_overlap_fraction=0.0``).
+  With overlap > 0, each per-period observable contributes to
+  multiple bands and continental aggregations across all bands
+  have correlated rows (the same period contributes to
+  neighbouring band rows). With ``band_overlap_fraction=0.5``,
+  the leftmost / rightmost bands extend slightly beyond
+  ``[0.01, 10000]`` s by design (the formula widens bands
+  symmetrically around their centres).
+* **Provenance metadata fields** recorded in the table's
+  ``metadata`` dict: ``mtpy_version``, ``decomposition_git_sha``,
+  ``timestamp_utc``, ``method_versions``, ``period_bands``
+  (JSON-encoded list), ``n_bands``, ``band_overlap_fraction``,
+  ``canonical_gauge``, ``rng_seed``, ``n_starts``,
+  ``bootstrap_n_replicates``, ``input_identifier``,
+  ``site_count``, ``failed_sites``, ``parallel``,
+  ``MJ_joint_rms_misfit``. Reproducibility requires reporting
+  all of these in publications.
+* **Default cross-method list expanded in F5** from
+  ``[GB, BCB, Lilley]`` to all six methods in
+  :data:`...cross_method.DEFAULT_METHODS`. Continental-table
+  rows now reflect a six-way cross-method comparison, not a
+  three-way one. Numerical values of the
+  ``cross_method_*_disagreement_deg`` columns are not directly
+  comparable to pre-F5 outputs.
+* **Cross-method disagreement columns changed in F4** from
+  per-band-median to per-period-pair RMS. Persisted
+  ObservableTables from before F4 are not numerically
+  comparable to post-F4 outputs and **should be regenerated**.
+* **Cross-method disagreement is symmetric across all method
+  pairs post-F4**; GB is no longer special. A site where
+  Lilley and BCB disagree but both agree with GB now shows
+  *higher* disagreement than pre-F4 (when only GB-vs-each
+  pairs contributed). This is by design.
+* **Twist / shear cross-method disagreement reduces to a single
+  pair (GB, BCB)** because only those two adapters produce
+  twist / shear; the column structure is the same as for strike
+  but the per-period RMS is a single-pair value.
+* **MJ_rms_misfit is a single per-site contribution from one
+  joint MJ fit, broadcast to every band-row of that site.**
+  Period-band-resolved MJ misfit is a Phase-2 enhancement; the
+  column repeats across band-rows of the same site by design.
+* **MJ_rms_misfit is NaN for single-site collections** —
+  single-site MJ ≡ single-site GB; the joint fit is meaningless
+  with one site (documented in F5).
+* **Joint MJ silently degrades on frequency-grid mismatch.**
+  Mixed-grid AusLAMP collections (EDL on log-base-10, LEMI on
+  power-of-2) fail
+  :func:`...mcneice_jones.decompose_mcneice_jones`'s joint
+  validator; the helper catches the exception and returns
+  ``MJ_rms_misfit = NaN`` and
+  ``metadata["MJ_joint_rms_misfit"] = NaN`` *without a
+  warning*. Until F9 surfaces this in metadata, **manually
+  check ``metadata["MJ_joint_rms_misfit"]`` for NaN before
+  trusting the MJ columns** when running on mixed-grid data.
+* **Bootstrap CIs are opt-in** (``bootstrap_n_replicates=0`` by
+  default; F6 promoted from Phase-2 deferred to Phase-1 enabled).
+  For tight per-site noise estimates use ``n=50+``. AusLAMP-scale
+  runtime: ~5 min sequential at ``n=0``; ~1.5 h on 16 cores at
+  ``n=50, parallel=True``; ~19 h sequential at ``n=50,
+  parallel=False`` (don't).
+* **Bootstrap-derived columns (F6)**: 30 columns added with
+  names ``<observable>_p05``, ``_p50``, ``_p95`` for each of
+  the 10 primary observables in :data:`BOOTSTRAP_OBSERVABLES`.
+  Schema width is now 68 (was 38 pre-F2). All CI columns are
+  ``NaN`` when ``bootstrap_n_replicates=0``.
+* **discordance_significance is signal-to-noise**
+  (``mean(disc) / std(disc, ddof=1)`` across bootstrap
+  replicates), **not** a formal p-value. Interpret a value of 3
+  as "~3-sigma" if you want a heuristic, but it's not a
+  statistical significance test.
+* **Tipper not bootstrapped, not pickled through parallel
+  path.** The magnetic-distortion-diagnostic Tipper component
+  therefore does not appear in CIs and is not exercised in
+  parallel mode (the worker rebuilds a fresh ``SimpleNamespace``
+  with ``Tipper=None``).
+* **Custom MT-object attributes are lost in parallel mode.**
+  The worker rebuilds from raw Z arrays + scalar geographic
+  coords. Production pipelines using extended MT subclasses
+  with custom attributes should use ``parallel=False`` or
+  pre-extract the attributes before the call.
+* **Per-site bootstrap sub-seed = base_seed + md5(station_id)[:4]**.
+  Identical station IDs get identical bootstrap noise
+  (intentional for reproducibility). Twin synthetic stations
+  in tests need varied IDs for independent bootstraps.
+* **dimensionality_concordant=False on clean 2-D-distorted
+  sites is expected** by physics, not a data flag (Caldwell
+  et al. 2004 — galvanic distortion is gauge-invisible to the
+  phase tensor; cross-reference
+  :mod:`...lilley_dimensionality`).
+* **Pipeline is composition only** — no decomposition logic in
+  this module. Limitations of the underlying methods (BCB's
+  band-averaged C, Lilley's full-grid strikes, etc.) propagate
+  here. Behaviour changes in those modules will appear in this
+  table without any code change in continental_observables.
 """
 
 from __future__ import annotations

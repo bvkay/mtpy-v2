@@ -180,6 +180,157 @@ algorithms. Validation has been performed against historical Fortran
 implementations (Strike, McNeice-Jones); see the project's
 documentation for tolerance specifications and the optimiser-gap
 analysis.
+
+Interpretation guide
+====================
+Cross-cutting items that affect how observables produced by this
+package should be read. Each paragraph links to the relevant
+module's "Caveats" section for the rigorous detail; this is the
+package-level summary that ``help(decomposition)`` surfaces.
+
+* **gamma_magnitude vs gamma_magnitude_periodwise.** Two ``|γ|``
+  columns are emitted by :func:`compute_collection_observables`
+  for each (site, band): ``gamma_magnitude`` is the spin-2
+  magnitude of the band-aggregate ``C`` tensor (internally
+  consistent with the strike / twist / shear in the same row);
+  ``gamma_magnitude_periodwise`` is the geometric mean of
+  per-period ``|γ|`` values within the band (robust to outlier
+  periods, decoupled from the angular-aggregation choice). Both
+  are valid; they answer different questions. Use both for
+  sensitivity analysis. See
+  :mod:`...continental_observables` for the rigorous
+  side-by-side definitions.
+
+* **cross_method_*_disagreement_deg semantics (post-F4).** The
+  three columns
+  ``cross_method_strike_disagreement_deg``,
+  ``cross_method_twist_disagreement_deg``,
+  ``cross_method_shear_disagreement_deg`` are per-period-pair
+  RMS aggregated to per-band (post-F4 — pre-F4 they were
+  per-band-median-of-medians). A value of 5° means **method
+  outputs typically differ by 5° at this site**; treat
+  continental aggregations stratified on this column with care
+  above ~10° (model invalidity dominates). The columns are
+  **per-band uncertainty estimates**, not central tendencies —
+  variograms on them describe the spatial scale of *model
+  trustworthiness variation*, not any underlying physical
+  signal (see :mod:`...spatial_coherence`).
+
+* **bootstrap_variance interpretation.** Two paths feed the
+  ``bootstrap_variance`` reference reported by
+  :func:`compute_coherence`:
+  the bootstrap-driven path (post-F6) reads ``<obs>_p05`` /
+  ``<obs>_p95`` columns directly; the inter-band fallback path
+  uses cross-band variance per site as an upper bound. The
+  fallback over-estimates noise (it absorbs genuine
+  frequency-dependence) — treat it as an upper bound, not a
+  tight estimate. The Phase-1 transition is to default to
+  ``compute_site_observables(bootstrap_n_replicates=50)`` on
+  production AusLAMP runs; the warning then does not fire.
+
+* **Period bands tile by default.** ``band_overlap_fraction=0.0``
+  is the default; the six AusLAMP-design-range bands span
+  ``[0.01, 10000]`` s with no overlap. With ``> 0`` overlap each
+  per-period observable contributes to multiple bands and the
+  long-format table has correlated rows. **Continental papers
+  must report which** ``n_bands`` and ``band_overlap_fraction``
+  were used — both travel in the table's ``metadata`` dict.
+
+* **dimensionality_concordant=False on clean 2-D-distorted
+  sites is expected**, not a data quality flag. Galvanic
+  distortion is gauge-invisible to the phase tensor (Caldwell
+  et al. 2004), so a 2-D + galvanic site is ``"2D"`` to Lilley
+  but a 3-D-flavoured case (3, 4, 6, 7) in Marti's WALDIM. The
+  resulting concordance flag reads ``False`` even on physically
+  clean sites; this is by physics, not data error.
+
+* **trust_score post-F7 is min-of-criteria, floor 0.05.** A row
+  is only as trustworthy as its weakest criterion (replacing
+  the pre-F7 geometric mean). Default sigmoid scale
+  ``max(0.1·|threshold|, 0.5)``. A score of 0.5 corresponds to
+  the weakest criterion at exactly its rule threshold;
+  ``apply_trust_filter(min_trust=0.5)`` is the canonical Paper-1
+  filter. Numerical values are not directly comparable to
+  pre-F7 outputs.
+
+* **Joint MJ silently NaN on mixed-grid collections.** The
+  joint :func:`...mcneice_jones.decompose_mcneice_jones` requires
+  identical frequency grids across sites; mixed-grid AusLAMP
+  collections (EDL log-base-10 + LEMI power-of-2) fail the
+  joint validator, the helper catches the exception, and
+  ``MJ_rms_misfit`` ends up ``NaN`` for every row plus
+  ``metadata["MJ_joint_rms_misfit"] = NaN`` *without a
+  warning*. **Manually check the metadata field before
+  trusting the MJ column** until F9 surfaces this in the
+  failed-step log.
+
+* **AusLAMP-scale runtime budgets** (1353 sites, 6 default
+  bands, ``n_starts=5``, 16-core workstation; order-of-magnitude
+  only):
+
+  * Default pipeline (``bootstrap_n_replicates=0``): ~5 min
+    sequential.
+  * Bootstrap ``n=50, parallel=True``: ~1.5 hours.
+  * Bootstrap ``n=50, parallel=False``: ~19 hours (don't).
+  * :func:`compute_coherence_all` on default observables:
+    ~60 s (variograms + 100-shuffle nulls).
+  * Stratification (:func:`stratify_table` +
+    :func:`stratification_summary`): ~5 s.
+
+* **Reproducibility.** Every :func:`compute_collection_observables`
+  call records ``mtpy_version``, ``decomposition_git_sha``,
+  ``timestamp_utc``, ``rng_seed``, and every kwarg in the
+  table's ``metadata``. Two same-seed runs with the same input
+  hash are bit-identical *except for the timestamp*. Parallel
+  and sequential runs at the same seed are also bit-identical
+  (per-site bootstrap RNG is seeded from a stable hash of
+  ``station_id`` + ``base_seed``).
+
+References
+==========
+Foundational citations for the decomposition methods, the phase
+tensor, and the dimensionality classifiers used by this package.
+The per-method module docstrings carry the full bibliographic
+detail; this is the consolidated package-level reference list.
+
+* **Bibby, Caldwell & Brown 2005 (GJI, 163, 915–930)** —
+  determinable and non-determinable parameters of galvanic
+  distortion in MT (BCB).
+* **Caldwell, Bibby & Brown 2004 (GJI, 158, 457–469)** —
+  the magnetotelluric phase tensor.
+* **Garcia & Jones 2002 (Methods Geochem. Geophys., 35,
+  235–250)** — 3-D regional MT decomposition (GJ).
+* **Garcia, Boerner & Pedersen 2003 (GJI, 154, 957–969)** —
+  electric and magnetic galvanic distortion in tensor CSAMT
+  (heuristic flag in :mod:`...magnetic_distortion_diagnostic`).
+* **Gomez-Treviño, Esparza & Romo 2018 (Earth, Planets and
+  Space, 70:35)** — invariant TE / TM resistivities. *Mark
+  exploratory*; see :mod:`...gomez_trevino` for the
+  field-validation caveat.
+* **Groom & Bailey 1989 (JGR, 94(B2), 1913–1925)** — original
+  parameterised distortion decomposition (GB).
+* **Lilley 1976/1993/1998/2018 (Geophysics / Exploration
+  Geophysics)** — Mohr-circle MT representation; 2018 paper
+  introduces the seven-invariant set.
+* **Lilley 2020 (Exploration Geophysics, 51(4), 401–421)** —
+  formal equivalence of the CBB phase tensor with Bahr's 1988
+  strike analysis (the basis for
+  :mod:`...lilley_dimensionality`).
+* **Marti, Queralt & Ledo 2009 (Computers & Geosciences, 35,
+  2295–2303)** — WALDIM dimensionality classifier; the
+  Weaver-Agarwal-Lilley 2000 invariants are the algebraic
+  foundation.
+* **McNeice & Jones 2001 (Geophysics, 66(1), 158–173)** —
+  multi-site joint GB decomposition (MJ).
+
+Notes
+-----
+The :func:`compute_collection_observables` pipeline is
+composition-only — every observable in the long-format table is
+computed by one of the per-method modules above; this package
+adds the band-level aggregation, the cross-method consolidation,
+the bootstrap CIs, and the spatial-coherence / trust-tier
+analyses on top.
 """
 
 from .common import (  # noqa: F401  -- private helpers re-exported for backward compatibility

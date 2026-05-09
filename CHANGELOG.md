@@ -595,6 +595,26 @@ benchmarking PR.
   limitations for every implemented method.
 - The package `__init__.py` docstring carries an at-a-glance
   method-selection guide for callers.
+- **Comprehensive caveat sweep (F8).** Every quirk flagged by
+  the F1–F7 implementation series is now findable via grep on
+  the package source — no external caveats document is
+  required to interpret outputs from
+  ``compute_collection_observables`` /
+  ``compute_coherence`` / ``stratify_table`` etc. Each module
+  gains a "Caveats" subsection at the end of its module
+  docstring with the full list (BCB band-averaged C, GJ
+  no-solution-on-single-site, MJ excluded from default,
+  WALDIM-vs-Lilley disagreement by design, period-band tile
+  default, two ``|γ|`` columns, post-F4 cross-method-disagreement
+  re-interpretation, joint-MJ silent NaN on mixed-grid input,
+  bootstrap costs, post-F7 ``trust_score`` semantic shift,
+  netCDF round-trip dtype handling, and more). The package-level
+  ``__init__.py`` adds an "Interpretation guide" section
+  surfacing the cross-cutting items
+  (``help(decomposition)`` shows it) and a consolidated
+  "References" list (BCB05, CBB04, GJ02, GBP03, GT18, GB89,
+  Lilley 1976/1993/1998/2018/2020, Marti09, MJ01).
+  Documentation-only PR — no code or test changes.
 
 ### Planned
 - Implement Bahr (1991) decomposition and class scheme.

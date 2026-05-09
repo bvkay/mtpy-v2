@@ -55,6 +55,34 @@ of Geophysics* 62(2), 119-127.
 Lilley, F. E. M. (2020). Magnetotellurics: the CBB or phase tensor
 and Bahr's 1988 analysis. *Exploration Geophysics* 51(4), 401-421.
 doi:10.1080/08123985.2020.1717333
+
+Caveats
+=======
+* **WALDIM and Lilley categories disagree by design** for
+  galvanically-distorted 2-D sites. Galvanic distortion is
+  gauge-invisible to the phase tensor (Caldwell et al. 2004), so
+  a 2-D + galvanic site is ``"2D"`` to Lilley but a 3-D-flavoured
+  case (3, 4, 6, 7) in Marti's WALDIM. **The disagreement is
+  expected, not a data quality flag**; the
+  :func:`compare_lilley_marti` helper makes this mapping
+  explicit and the
+  :data:`...continental_observables.OBSERVABLE_COLUMNS`
+  ``dimensionality_concordant`` column will read ``False`` on
+  clean 2-D-distorted sites for the same reason.
+* **3-D sites with non-symmetric Φ produce complex eigenvalues**;
+  :func:`eigenvector_strike` returns ``NaN`` in that case. The
+  classifier prioritises ``|β|`` for 3-D detection and treats
+  the NaN eigenvector-disagreement as a 3-D signature (mapped
+  to ``"3D-2D"`` when ``β`` is small).
+* **Configurable threshold defaults**:
+  :data:`BETA_2D_THRESHOLD_DEG` = 3.0,
+  :data:`BETA_1D_THRESHOLD_DEG` = 1.0,
+  :data:`ELL_1D_THRESHOLD` = 0.05. Reasonable but not measured
+  against ground truth. Sensitivity to threshold choice is part
+  of Paper 1's robustness analysis — pass kwargs to
+  :func:`classify_dimensionality` to vary them, and
+  :func:`...dimensionality_stratification.threshold_sensitivity`
+  to sweep stratification thresholds (those are different).
 """
 
 from __future__ import annotations

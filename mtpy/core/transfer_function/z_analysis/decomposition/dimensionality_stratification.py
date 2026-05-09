@@ -99,6 +99,59 @@ See Also
 :mod:`...continental_observables` : the long-format input table.
 :mod:`...spatial_coherence` : the analysis layer that consumes
     the trust-filtered table to test for spatial structure.
+
+Caveats
+=======
+* **Stratum priority is** ``excluded > high_trust > moderate_trust
+  > low_trust``. ``WALDIM_case == 1`` sites always land in
+  ``"excluded"`` even if they would otherwise satisfy all
+  high-trust criteria — exclusion is an absolute override.
+* **Excluded rules use ``"any"`` logic with a list-of-triples**
+  (because the same column can appear with multiple operators
+  — e.g. ``WALDIM_case == 1`` and ``WALDIM_case in [6, 7]``).
+  The other strata use ``"all"`` logic with a dict. Custom
+  rule sets must follow this asymmetry.
+* **trust_score uses min-of-criteria aggregation post-F7**
+  (replacing the pre-F7 geometric mean). A site is only as
+  trustworthy as its weakest criterion. **Numerical values
+  have changed from pre-F7 outputs and are not directly
+  comparable.** A row that scored 0.85 pre-F7 (geomean of one
+  weakish criterion against six strong ones) might score 0.5
+  post-F7 (the weakish one drives min-of-criteria). Re-tune any
+  threshold-based filter after the upgrade.
+* **Per-criterion score floor of 0.05** — the smallest
+  achievable ``trust_score`` is 0.05 (clipped via
+  :data:`_TRUST_SCORE_FLOOR`), not 0. The sub-0.05 range is
+  reserved for sentinel encodings (e.g. a future "data missing"
+  tier) and for ``NaN`` to remain unambiguous.
+* **Default sigmoid scale ``max(0.1·|threshold|, 0.5)``**
+  (post-F7 — the conventional half-life choice; restored from
+  the pre-F7 tightened ``max(0.05·|threshold|, 0.3)``). The
+  transition zone (score ∈ [0.1, 0.9]) spans roughly
+  ``±2 × scale`` units around the threshold. For the canonical
+  ``PT_abs_beta_deg < 3°`` rule (scale = 0.5°) the visible
+  transition is ~1° wide on a continental colour-scale map.
+* **Stratum assignment is row-by-row via** ``df.itertuples()``;
+  not vectorised. Acceptable for AusLAMP scale (< 5 s on a
+  6500-row table); larger tables (e.g. global aggregations)
+  should profile and consider vectorisation.
+* **threshold_sensitivity sweeps ``"all"``-logic strata only**
+  (raises :class:`ValueError` on ``"excluded"``). Sweeping the
+  exclusion thresholds (``PT_abs_beta_deg >= 6.0``, etc.)
+  requires rewriting the corresponding criterion as a ``"<"``
+  rule on a complementary stratum.
+* **apply_trust_filter does not preserve a ``_trust_score``
+  column** in its output — it computes scores internally and
+  drops them. To keep scores in the table, call
+  :func:`trust_score` row-wise separately and assign the result
+  as a new column before / after filtering.
+* **Default ``apply_trust_filter(min_trust=0.5)`` is a tighter
+  filter post-F7** than pre-F7. With min-of-criteria, a score
+  of 0.5 corresponds to *the weakest criterion at exactly its
+  rule threshold* (the sigmoid hits 0.5 at threshold by
+  construction). Pre-F7 the geomean smoothed weak criteria,
+  so 0.5 admitted rows that had several near-failing
+  criteria. Re-tune ``min_trust`` per analysis.
 """
 
 from __future__ import annotations

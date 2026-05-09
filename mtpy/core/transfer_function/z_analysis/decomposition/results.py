@@ -1330,6 +1330,37 @@ class ObservableTable:
     * a column missing from the file but required by the current
       schema raises :class:`ValueError` (the file is too old to
       use; re-write from the source).
+
+    Caveats
+    -------
+    * **:meth:`to_netcdf` / :meth:`from_netcdf` is the canonical,
+      round-trip-lossless serialisation path.** Round-trip
+      preserves every dtype hazard: nullable ``Int64`` (e.g.
+      ``WALDIM_case``), nullable ``boolean`` (e.g.
+      ``GB_mode_warning``), ``string`` with ``pd.NA`` (e.g.
+      ``Lilley_category``), and ``complex`` columns (paired
+      ``<col>_real`` / ``<col>_imag`` storage). :meth:`to_csv`
+      is one-way export only — it does *not* preserve nullable
+      dtypes — use it for human-readable inspection and
+      publication supplementary tables, not for round-tripping.
+      There is no ``from_csv``.
+    * **Schema-version stamped** in the
+      ``__schema_version`` netCDF attribute (currently ``"1"``).
+      Future schema changes should bump this; the loader
+      currently doesn't read it but the field is reserved.
+    * **String columns get a paired ``<col>__isna`` int8 mask**
+      in the netCDF for ``pd.NA`` round-tripping. The mask is
+      visible in raw netCDF inspection (``ncdump`` etc.) — it
+      is part of the on-disk format, not garbage; do not
+      delete it.
+    * **:meth:`from_netcdf` re-orders columns** to match
+      :data:`...continental_observables.OBSERVABLE_COLUMNS` (with
+      any extras appended at the end). Iteration order from the
+      raw file does not survive — use the schema list, not the
+      raw column order.
+    * **Extra columns in the netCDF emit a UserWarning**
+      (forward compatibility); **missing required columns raise
+      ValueError** (the file is too old to use).
     """
 
     dataframe: Any  # pandas.DataFrame; declared `Any` to avoid hard import
